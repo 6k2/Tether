@@ -1,0 +1,229 @@
+//! Interactive shell channel feeding a vt100 screen model.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use russh::ChannelMsg;
+use tokio::sync::mpsc;
+
+use super::connection::{Connection, Stage};
+
+pub const TERM_NAME: &str = "xterm-256color";
+/// Fallback scrollback; the live value comes from `settings.terminal.scrollback`.
+pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// Scrollback length for a new terminal, from settings.
+pub fn scrollback_lines() -> usize {
+    crate::settings::get().terminal.scrollback()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkState {
+    Connecting,
+    Connected,
+    Closed(String),
+    Failed(String),
+}
+
+impl LinkState {
+    pub fn is_live(&self) -> bool {
+        matches!(self, LinkState::Connected)
+    }
+}
+
+/// Captures OSC title changes and bells from the remote.
+#[derive(Default)]
+pub struct Events {
+    pub title: Option<String>,
+    pub bell_count: u64,
+    /// Working directory reported by the shell via OSC 7 (`file://host/path`), if it does.
+    pub cwd: Option<String>,
+}
+
+impl vt100::Callbacks for Events {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell_count += 1;
+    }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if let [b"7", uri, ..] = params {
+            self.cwd = osc7_path(uri);
+        }
+    }
+}
+
+/// `file://host/some%20dir` -> `/some dir`.
+pub fn osc7_path(uri: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(uri).ok()?;
+    let rest = text.strip_prefix("file://")?;
+    let path = &rest[rest.find('/')?..];
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()))
+            .flatten();
+        if let Some(b) = hex {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+pub struct TermShared {
+    pub parser: vt100::Parser<Events>,
+    pub state: LinkState,
+    /// Bumped on every output chunk so views can detect activity in background tabs.
+    pub generation: u64,
+    /// Connect progress shown while `state` is `Connecting`.
+    pub stage: Stage,
+    /// When the shell channel was opened (matches the remote shell's start time).
+    pub opened_at: Option<std::time::Instant>,
+}
+
+pub enum TermCmd {
+    Input(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Close,
+}
+
+#[derive(Clone)]
+pub struct TerminalHandle {
+    pub shared: Arc<Mutex<TermShared>>,
+    /// Random id exported to the remote shell as `LC_TETHER_ID` so we can find its
+    /// process (and working directory) later. Hex only: safe to embed in commands.
+    pub tag: String,
+    tx: mpsc::UnboundedSender<TermCmd>,
+}
+
+impl TerminalHandle {
+    pub fn new(rows: u16, cols: u16) -> (Self, mpsc::UnboundedReceiver<TermCmd>) {
+        let shared = TermShared {
+            parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback_lines(), Events::default()),
+            state: LinkState::Connecting,
+            generation: 0,
+            stage: Stage::Connecting,
+            opened_at: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        (Self { shared: Arc::new(Mutex::new(shared)), tag, tx }, rx)
+    }
+
+    pub fn send(&self, bytes: impl Into<Vec<u8>>) {
+        let _ = self.tx.send(TermCmd::Input(bytes.into()));
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let _ = self.tx.send(TermCmd::Resize { rows, cols });
+    }
+
+    pub fn close(&self) {
+        let _ = self.tx.send(TermCmd::Close);
+    }
+
+    pub fn set_state(&self, state: LinkState) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.state = state;
+        }
+    }
+
+    pub fn set_stage(&self, stage: Stage) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.stage = stage;
+        }
+    }
+
+    /// Client-side facts used to find this shell on the server (see `ssh::cwd`).
+    pub fn probe_facts(&self) -> (f64, u16, u16) {
+        self.shared
+            .lock()
+            .map(|s| {
+                let (rows, cols) = s.parser.screen().size();
+                (s.opened_at.map_or(0.0, |t| t.elapsed().as_secs_f64()), rows, cols)
+            })
+            .unwrap_or((0.0, 0, 0))
+    }
+}
+
+/// Drives the shell channel until it closes. `repaint` wakes the UI after output.
+pub async fn run_shell(
+    conn: Arc<Connection>,
+    term: TerminalHandle,
+    mut rx: mpsc::UnboundedReceiver<TermCmd>,
+    repaint: impl Fn() + Send + 'static,
+) -> Result<()> {
+    let (rows, cols) = term.shared.lock().map(|s| s.parser.screen().size()).unwrap_or((24, 80));
+    term.set_stage(Stage::Opening);
+    repaint();
+    let channel = conn.handle.channel_open_session().await?;
+    channel.request_pty(false, TERM_NAME, cols.into(), rows.into(), 0, 0, &[]).await?;
+    // Most servers accept LC_* (Debian/Ubuntu `AcceptEnv LANG LC_*`); harmless if refused.
+    let _ = channel.set_env(false, "LC_TETHER_ID", term.tag.clone()).await;
+    channel.request_shell(false).await?;
+    if let Ok(mut s) = term.shared.lock() {
+        s.opened_at = Some(std::time::Instant::now());
+        s.state = LinkState::Connected;
+    }
+    repaint();
+
+    let (mut read, write) = channel.split();
+    // Writes run on their own task so a large paste waiting on the remote window can't
+    // stop us from draining output (which is what would free that window).
+    let closed_by_user = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let closed_by_user = closed_by_user.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let sent = match cmd {
+                    TermCmd::Input(bytes) => write.data_bytes(bytes).await,
+                    TermCmd::Resize { rows, cols } => write.window_change(cols.into(), rows.into(), 0, 0).await,
+                    TermCmd::Close => {
+                        closed_by_user.store(true, Ordering::Relaxed);
+                        let _ = write.close().await;
+                        return;
+                    }
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+
+    // Keep reading after ExitStatus/Eof: trailing output may still arrive before Close.
+    let mut exit_code = None;
+    while let Some(msg) = read.wait().await {
+        match msg {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                if let Ok(mut s) = term.shared.lock() {
+                    s.parser.process(&data);
+                    s.generation = s.generation.wrapping_add(1);
+                }
+                repaint();
+            }
+            ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    writer.abort();
+    let reason = match exit_code {
+        _ if closed_by_user.load(Ordering::Relaxed) => "Closed".to_string(),
+        Some(code) => format!("Process exited with code {code}"),
+        None => "Connection closed".to_string(),
+    };
+    term.set_state(LinkState::Closed(reason));
+    repaint();
+    Ok(())
+}

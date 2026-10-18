@@ -1,0 +1,38 @@
+//! Import hosts from other SSH clients. Only connection details (name, host, port,
+//! user, key file path) are imported; passwords stay where they are.
+
+pub mod bitvise;
+pub mod openssh;
+
+use std::path::PathBuf;
+
+use crate::profile::{Profile, ProfileStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Bitvise,
+    OpenSsh,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Bitvise => "Bitvise",
+            Source::OpenSsh => "SSH config",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub source: Source,
+    pub origin: PathBuf,
+    pub profile: Profile,
+}
+
+impl Candidate {
+    /// Same user@host:port already saved.
+    pub fn exists_in(&self, store: &ProfileStore) -> bool {
+        store.profiles.iter().any(|p| p.host.eq_ignore_ascii_case(&self.profile.host) && p.port == self.profile.port && p.user == self.profile.user)
+    }
+}

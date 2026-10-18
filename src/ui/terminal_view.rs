@@ -1,0 +1,713 @@
+//! Renders a vt100 screen with egui's painter and turns input into bytes.
+//!
+//! Every visual knob (font size, line height, padding, cursor, bell, scrollbar)
+//! is read from `settings::get().terminal` each frame, so the Settings screen
+//! updates open terminals live.
+
+use eframe::egui::{self, Align2, Color32, CornerRadius, Event, EventFilter, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, text::LayoutJob};
+
+use super::keys;
+use super::loading::{self, ConnectInfo};
+use crate::keybindings::{self, Action};
+use crate::profile::Profile;
+use crate::settings::{self, CursorStyle, TerminalSettings};
+use crate::ssh::connection::Stage;
+use crate::ssh::terminal::{LinkState, TerminalHandle};
+use crate::theme;
+
+const BLINK_PERIOD: f64 = 1.1;
+const BELL_FLASH_SECS: f64 = 0.45;
+const SCROLLBAR_LINGER_SECS: f64 = 1.2;
+const SCROLLBAR_WIDTH: f32 = 4.0;
+/// Ctrl+wheel zoom is persisted once the wheel has been idle this long.
+const FONT_SAVE_DELAY: f64 = 0.6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Cell {
+    row: u16,
+    col: u16,
+}
+
+/// Cell metrics for a font size and line-height multiplier.
+#[derive(Debug, Clone, Copy)]
+pub struct Metrics {
+    pub cell_w: f32,
+    pub cell_h: f32,
+    /// Vertical offset of the glyphs inside a (taller) cell.
+    pub text_dy: f32,
+}
+
+pub fn metrics(ctx: &egui::Context, font: &FontId, line_height: f32) -> Metrics {
+    let (cell_w, glyph_h) = ctx.fonts_mut(|f| (f.glyph_width(font, 'M'), f.row_height(font)));
+    let cell_h = (glyph_h * line_height).round().max(1.0);
+    Metrics { cell_w, cell_h, text_dy: ((cell_h - glyph_h) * 0.5).round() }
+}
+
+pub struct TerminalView {
+    pub handle: TerminalHandle,
+    size: (u16, u16),
+    scroll: usize,
+    selection: Option<(Cell, Cell)>,
+    last_activity: f64,
+    wheel_acc: f32,
+    last_bell: u64,
+    bell_at: Option<f64>,
+    scrolled_at: f64,
+    font_dirty_at: Option<f64>,
+    /// UI time the current connect started (drives the connecting screen).
+    connecting_since: Option<f64>,
+    /// Stage shown while the connecting screen fades out.
+    last_stage: Stage,
+}
+
+#[derive(Default)]
+pub struct ViewOutput {
+    /// Bytes the user typed this frame (the app routes them, possibly broadcasting).
+    pub input: Vec<u8>,
+    pub reconnect: bool,
+}
+
+impl TerminalView {
+    pub fn new(handle: TerminalHandle) -> Self {
+        Self {
+            handle,
+            size: (0, 0),
+            scroll: 0,
+            selection: None,
+            last_activity: 0.0,
+            wheel_acc: 0.0,
+            last_bell: 0,
+            bell_at: None,
+            scrolled_at: f64::NEG_INFINITY,
+            font_dirty_at: None,
+            connecting_since: None,
+            last_stage: Stage::Connecting,
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, profile: &Profile) -> ViewOutput {
+        let accent = theme::hue_color(profile.hue);
+        let mut out = ViewOutput::default();
+        let cfg = settings::get().terminal;
+        let rect = ui.available_rect_before_wrap();
+        let id = ui.id().with("terminal");
+        let response = ui.interact(rect, id, Sense::click_and_drag());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Terminal"));
+        if response.clicked() || response.drag_started() {
+            response.request_focus();
+        }
+        let focused = response.has_focus();
+        // A modal (settings, dialogs) above us owns the keyboard even if we keep focus.
+        let layer = ui.layer_id();
+        let under_modal = ui.ctx().memory(|m| m.top_modal_layer()).is_some_and(|l| l != layer);
+        let keys_active = focused && !under_modal;
+        if keys_active {
+            ui.memory_mut(|m| m.set_focus_lock_filter(id, EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true }));
+        }
+        let now = ui.ctx().input(|i| i.time);
+        self.persist_font_when_idle(now);
+
+        let font = FontId::new(cfg.font_size(), FontFamily::Monospace);
+        let m = metrics(ui.ctx(), &font, cfg.line_height());
+        let inner = rect.shrink(cfg.padding());
+        let cols = ((inner.width() / m.cell_w).floor() as u16).max(2);
+        let rows = ((inner.height() / m.cell_h).floor() as u16).max(1);
+        self.apply_resize(rows, cols);
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::term_bg());
+
+        let shared_arc = self.handle.shared.clone();
+        let Ok(mut shared) = shared_arc.lock() else { return out };
+        let state = shared.state.clone();
+        let stage = shared.stage;
+        let bells = shared.parser.callbacks().bell_count;
+        let screen = shared.parser.screen_mut();
+        // Probe the history length: vt100 caps the offset at what it has stored.
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        screen.set_scrollback(self.scroll);
+        self.scroll = screen.scrollback();
+        let screen = shared.parser.screen();
+        let app_cursor = screen.application_cursor();
+        let bracketed = screen.bracketed_paste();
+        let alt_screen = screen.alternate_screen();
+
+        let to_cell = |p: Pos2| Cell {
+            row: (((p.y - inner.top()) / m.cell_h).floor().max(0.0) as u16).min(rows - 1),
+            col: (((p.x - inner.left()) / m.cell_w).round().max(0.0) as u16).min(cols),
+        };
+        let scroll_before = self.scroll;
+        self.handle_mouse(ui, &response, to_cell, m.cell_h, (alt_screen, app_cursor), &mut out);
+
+        let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        for row in 0..rows {
+            let y = inner.top() + row as f32 * m.cell_h;
+            paint_row(&painter, screen, row, cols, inner.left(), y, m, &font, sel);
+        }
+
+        if self.scroll == 0 && !screen.hide_cursor() {
+            self.paint_live_cursor(ui, &painter, screen, (inner, m, &font), &cfg, (id, focused));
+        }
+        drop(shared);
+
+        if response.drag_stopped()
+            && cfg.copy_on_select
+            && let Some(text) = self.selected_text().filter(|t| !t.is_empty())
+        {
+            ui.ctx().copy_text(text);
+        }
+        if bells != self.last_bell {
+            self.last_bell = bells;
+            if cfg.visual_bell {
+                self.bell_at = Some(now);
+            }
+        }
+        self.paint_bell(ui.ctx(), &painter, rect, now);
+
+        if keys_active {
+            self.handle_keys(ui, app_cursor, bracketed, &mut out);
+        }
+        if self.scroll != scroll_before {
+            self.scrolled_at = now;
+        }
+        if cfg.scrollbar && !alt_screen {
+            self.scrollbar(ui, rect, (history, rows as usize), now);
+        }
+        if self.scroll > 0 && self.scroll_pill(ui, rect) {
+            self.scroll = 0;
+        }
+
+        let ring = ui.ctx().animate_bool_with_time(id.with("focus"), focused, theme::anim_time(0.18));
+        if ring > 0.0 {
+            painter.rect_stroke(rect, CornerRadius::same(theme::RADIUS), Stroke::new(1.0, accent.gamma_multiply(0.45 * ring)), egui::StrokeKind::Inside);
+        }
+        self.connecting_screen(ui, rect, &state, stage, profile, now);
+        out.reconnect = state_overlay(ui, rect, &state);
+        if !out.input.is_empty() {
+            self.scroll = 0;
+            self.selection = None;
+            self.last_activity = now;
+        }
+        out
+    }
+
+    fn paint_live_cursor(
+        &self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        screen: &vt100::Screen,
+        (inner, m, font): (Rect, Metrics, &FontId),
+        cfg: &TerminalSettings,
+        (id, focused): (egui::Id, bool),
+    ) {
+        let (cr, cc) = screen.cursor_position();
+        let target = Pos2::new(inner.left() + cc as f32 * m.cell_w, inner.top() + cr as f32 * m.cell_h);
+        let ctx = ui.ctx();
+        let glide = theme::anim_time(0.06);
+        let x = ctx.animate_value_with_time(id.with("cx"), target.x, glide);
+        let y = ctx.animate_value_with_time(id.with("cy"), target.y, glide);
+        let cell = Rect::from_min_size(Pos2::new(x, y), Vec2::new(m.cell_w, m.cell_h));
+        let t = ctx.input(|i| i.time);
+        let blinking = focused && cfg.cursor_blink;
+        let visible = !blinking || ((t - self.last_activity) % BLINK_PERIOD) < BLINK_PERIOD * 0.6;
+        if visible {
+            let glyph = screen.cell(cr, cc).filter(|c| c.has_contents()).map(|c| c.contents().to_string());
+            paint_cursor(painter, cell, m.text_dy, cfg.cursor_style, focused, glyph.as_deref(), font);
+        }
+        if blinking {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// Full-pane connecting screen; appears only if the connect takes a moment and fades
+    /// out onto the live shell.
+    fn connecting_screen(&mut self, ui: &Ui, rect: Rect, state: &LinkState, stage: Stage, profile: &Profile, now: f64) {
+        let connecting = matches!(state, LinkState::Connecting);
+        let since = if connecting { *self.connecting_since.get_or_insert(now) } else { self.connecting_since.take().unwrap_or(now) };
+        if connecting {
+            self.last_stage = stage;
+        }
+        let elapsed = now - since;
+        let show = connecting && elapsed > loading::SHOW_AFTER_SECS;
+        if connecting && !show {
+            ui.ctx().request_repaint();
+        }
+        let t = ui.ctx().animate_bool_with_time(ui.id().with("connecting"), show, theme::anim_time(0.3));
+        if t <= 0.0 {
+            return;
+        }
+        ui.painter_at(rect).rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::term_bg().gamma_multiply(t));
+        let address = profile.address();
+        let info = ConnectInfo {
+            name: profile.display_name(),
+            address: &address,
+            hue: profile.hue,
+            stage: self.last_stage,
+            stages: loading::TERMINAL_STAGES,
+            elapsed,
+        };
+        loading::connect_screen(ui, rect, &info, t);
+    }
+
+    fn paint_bell(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect, now: f64) {
+        let Some(at) = self.bell_at else { return };
+        let k = 1.0 - ((now - at) / BELL_FLASH_SECS) as f32;
+        if k <= 0.0 {
+            self.bell_at = None;
+            return;
+        }
+        let k = k * k;
+        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::term_fg().gamma_multiply(0.06 * k));
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            CornerRadius::same(theme::RADIUS),
+            Stroke::new(1.5, theme::warn().gamma_multiply(0.7 * k)),
+            egui::StrokeKind::Inside,
+        );
+        ctx.request_repaint();
+    }
+
+    /// Thin overlay scrollbar: fades in while scrolling or when the pointer nears the edge.
+    fn scrollbar(&mut self, ui: &mut Ui, rect: Rect, (history, rows): (usize, usize), now: f64) {
+        if history == 0 {
+            return;
+        }
+        let track = Rect::from_min_max(Pos2::new(rect.right() - SCROLLBAR_WIDTH - 4.0, rect.top() + 6.0), Pos2::new(rect.right() - 4.0, rect.bottom() - 6.0));
+        let grab_zone = track.expand2(Vec2::new(5.0, 0.0));
+        let sb_id = ui.id().with("term_scrollbar");
+        let near = ui.ctx().pointer_hover_pos().is_some_and(|p| rect.contains(p) && p.x > rect.right() - 22.0);
+        let recent = now - self.scrolled_at < SCROLLBAR_LINGER_SECS;
+        let show = recent || near || ui.ctx().is_being_dragged(sb_id);
+        let alpha = ui.ctx().animate_bool_with_time(ui.id().with("term_sb_vis"), show, theme::anim_time(0.2));
+        if recent {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if alpha <= 0.0 {
+            return;
+        }
+        // Only grab the pointer while visible so edge-column selections still work otherwise.
+        let resp = ui.interact(grab_zone, sb_id, Sense::drag());
+        let (top_frac, len_frac) = thumb_span(self.scroll, history, rows);
+        let thumb_h = (track.height() * len_frac).max(24.0).min(track.height());
+        let travel = track.height() - thumb_h;
+        if resp.dragged()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            let frac = if travel > 0.0 { ((p.y - track.top() - thumb_h * 0.5) / travel).clamp(0.0, 1.0) } else { 1.0 };
+            self.scroll = ((1.0 - frac) * history as f32).round() as usize;
+            self.scrolled_at = now;
+        }
+        let thumb_top = track.top() + travel * top_frac;
+        let thumb = Rect::from_min_size(Pos2::new(track.left(), thumb_top), Vec2::new(track.width(), thumb_h));
+        let painter = ui.painter_at(rect);
+        let hot = resp.dragged() || resp.hovered();
+        painter.rect_filled(track, CornerRadius::same(3), theme::text_faint().gamma_multiply(0.12 * alpha));
+        let fill = if hot { theme::text_dim() } else { theme::text_faint() };
+        painter.rect_filled(thumb, CornerRadius::same(3), fill.gamma_multiply(0.85 * alpha));
+    }
+
+    /// "N lines up" pill; returns true when clicked (jump back to the live screen).
+    fn scroll_pill(&self, ui: &mut Ui, rect: Rect) -> bool {
+        let font = FontId::proportional(11.5);
+        let label = format!("{} line{} up", self.scroll, if self.scroll == 1 { "" } else { "s" });
+        let galley = ui.painter().layout_no_wrap(label, font, theme::text());
+        let size = Vec2::new(galley.size().x + 38.0, 24.0);
+        let pill = Rect::from_min_size(Pos2::new(rect.right() - size.x - 16.0, rect.top() + 10.0), size);
+        let resp = ui.interact(pill, ui.id().with("term_pill"), Sense::click()).on_hover_text("Back to the live screen");
+        let painter = ui.painter_at(rect);
+        let hover = ui.ctx().animate_bool_with_time(ui.id().with("term_pill_h"), resp.hovered(), theme::anim_time(0.12));
+        let fill = theme::surface_3().lerp_to_gamma(theme::accent_soft(), hover * 0.6);
+        painter.rect_filled(pill.translate(Vec2::new(0.0, 2.0)), CornerRadius::same(12), theme::shadow().gamma_multiply(0.35));
+        painter.rect(pill, CornerRadius::same(12), fill, Stroke::new(1.0, theme::border()), egui::StrokeKind::Inside);
+        // Down chevron: a click returns to the bottom.
+        let c = Pos2::new(pill.left() + 15.0, pill.center().y);
+        let stroke = Stroke::new(1.6, theme::accent());
+        painter.line_segment([c + Vec2::new(-4.0, -2.0), c + Vec2::new(0.0, 2.0)], stroke);
+        painter.line_segment([c + Vec2::new(0.0, 2.0), c + Vec2::new(4.0, -2.0)], stroke);
+        painter.galley(Pos2::new(pill.left() + 26.0, pill.center().y - galley.size().y * 0.5), galley, theme::text());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp.clicked()
+    }
+
+    fn apply_resize(&mut self, rows: u16, cols: u16) {
+        if self.size == (rows, cols) {
+            return;
+        }
+        self.size = (rows, cols);
+        if let Ok(mut s) = self.handle.shared.lock() {
+            s.parser.screen_mut().set_size(rows, cols);
+        }
+        self.handle.resize(rows, cols);
+    }
+
+    fn set_font_size(&mut self, size: f32, persist_now: bool) {
+        let size = size.clamp(TerminalSettings::FONT_MIN, TerminalSettings::FONT_MAX);
+        if persist_now {
+            let _ = settings::update(|s| s.terminal.font_size = size);
+            self.font_dirty_at = None;
+        } else {
+            settings::preview(|s| s.terminal.font_size = size);
+        }
+    }
+
+    fn persist_font_when_idle(&mut self, now: f64) {
+        if let Some(at) = self.font_dirty_at
+            && now - at > FONT_SAVE_DELAY
+        {
+            let _ = settings::save();
+            self.font_dirty_at = None;
+        }
+    }
+
+    fn handle_mouse(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        to_cell: impl Fn(Pos2) -> Cell,
+        cell_h: f32,
+        (alt_screen, app_cursor): (bool, bool),
+        out: &mut ViewOutput,
+    ) {
+        if response.drag_started() {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.selection = Some((to_cell(p), to_cell(p)));
+            }
+        } else if response.dragged() {
+            if let (Some(p), Some((start, _))) = (response.interact_pointer_pos(), self.selection) {
+                self.selection = Some((start, to_cell(p)));
+            }
+        } else if response.clicked() {
+            self.selection = None;
+        }
+
+        if !response.hovered() {
+            return;
+        }
+        let (wheel, zoom, ctrl, now) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.ctrl, i.time));
+        if ctrl && zoom != 1.0 {
+            let current = settings::get().terminal.font_size();
+            self.set_font_size(current * zoom, false);
+            self.font_dirty_at = Some(now);
+            return;
+        }
+        if wheel == 0.0 || ctrl {
+            return;
+        }
+        // Accumulate smooth deltas into whole lines.
+        self.wheel_acc += wheel;
+        let lines = (self.wheel_acc / cell_h).trunc();
+        if lines == 0.0 {
+            return;
+        }
+        self.wheel_acc -= lines * cell_h;
+        let n = lines.abs() as usize;
+        if alt_screen {
+            // Full-screen apps (less, vim) get arrow keys instead of scrollback.
+            let key = if lines > 0.0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown };
+            let seq = keys::encode(key, egui::Modifiers::NONE, app_cursor).unwrap_or_default();
+            for _ in 0..n {
+                out.input.extend_from_slice(&seq);
+            }
+        } else if lines > 0.0 {
+            self.scroll += n;
+        } else {
+            self.scroll = self.scroll.saturating_sub(n);
+        }
+    }
+
+    fn handle_keys(&mut self, ui: &Ui, app_cursor: bool, bracketed: bool, out: &mut ViewOutput) {
+        let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
+        for event in events {
+            match event {
+                Event::Text(t) => out.input.extend(keys::encode_text(&t, mods.alt && !mods.ctrl)),
+                Event::Paste(t) => out.input.extend(keys::encode_paste(&t, bracketed)),
+                Event::Copy => match self.selected_text() {
+                    Some(text) if !text.is_empty() => {
+                        ui.ctx().copy_text(text);
+                        self.selection = None;
+                    }
+                    _ => out.input.push(0x03),
+                },
+                Event::Cut => out.input.push(0x18),
+                Event::Key { key, pressed: true, modifiers, .. } => {
+                    if modifiers.shift && matches!(key, egui::Key::PageUp | egui::Key::PageDown) {
+                        let page = self.size.0.max(2) as usize - 1;
+                        self.scroll = if key == egui::Key::PageUp { self.scroll + page } else { self.scroll.saturating_sub(page) };
+                        continue;
+                    }
+                    let font = settings::get().terminal.font_size();
+                    let is = |a: Action| !keybindings::is_recording() && keybindings::binding(a).is_some_and(|b| b.matches(key, modifiers));
+                    if is(Action::FontBigger) {
+                        self.set_font_size(font + 1.0, true);
+                    } else if is(Action::FontSmaller) {
+                        self.set_font_size(font - 1.0, true);
+                    } else if is(Action::FontReset) {
+                        self.set_font_size(TerminalSettings::default().font_size, true);
+                    } else if let Some(bytes) = keys::encode(key, modifiers, app_cursor) {
+                        out.input.extend(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        if a == b {
+            return None;
+        }
+        let shared = self.handle.shared.lock().ok()?;
+        let text = shared.parser.screen().contents_between(a.row, a.col, b.row, b.col);
+        Some(text.trim_end().to_string())
+    }
+}
+
+/// Fraction of the track above the thumb and the thumb's share of the track,
+/// for `scroll` lines up out of `history` with `rows` visible.
+fn thumb_span(scroll: usize, history: usize, rows: usize) -> (f32, f32) {
+    let total = (history + rows).max(1) as f32;
+    let len = (rows as f32 / total).clamp(0.0, 1.0);
+    let top = if history == 0 { 1.0 } else { 1.0 - (scroll.min(history) as f32 / history as f32) };
+    (top, len)
+}
+
+/// Paints the cursor in one of the three styles. Shared with the settings preview.
+pub fn paint_cursor(painter: &egui::Painter, cell: Rect, text_dy: f32, style: CursorStyle, focused: bool, glyph: Option<&str>, font: &FontId) {
+    let colour = theme::term_cursor();
+    match (style, focused) {
+        (CursorStyle::Block, true) => {
+            painter.rect_filled(cell, CornerRadius::same(2), colour.gamma_multiply(0.9));
+            if let Some(g) = glyph {
+                painter.text(cell.min + Vec2::new(0.0, text_dy), Align2::LEFT_TOP, g, font.clone(), theme::term_bg());
+            }
+        }
+        (CursorStyle::Block, false) => {
+            let stroke = Stroke::new(1.0, colour.gamma_multiply(0.6));
+            painter.rect_stroke(cell, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+        }
+        (CursorStyle::Bar, _) => {
+            let w = (cell.width() * 0.14).clamp(1.5, 3.0);
+            let bar = Rect::from_min_size(cell.min, Vec2::new(w, cell.height()));
+            painter.rect_filled(bar, CornerRadius::same(1), colour.gamma_multiply(if focused { 1.0 } else { 0.5 }));
+        }
+        (CursorStyle::Underline, _) => {
+            let h = (cell.height() * 0.1).clamp(1.5, 3.0);
+            let line = Rect::from_min_max(Pos2::new(cell.left(), cell.bottom() - h), cell.max);
+            painter.rect_filled(line, CornerRadius::same(1), colour.gamma_multiply(if focused { 1.0 } else { 0.5 }));
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Style {
+    fg: Color32,
+    bg: Option<Color32>,
+    italic: bool,
+    underline: bool,
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut fg = match cell.fgcolor() {
+        vt100::Color::Default => theme::term_fg(),
+        vt100::Color::Idx(i) if cell.bold() && i < 8 => theme::indexed(i + 8),
+        vt100::Color::Idx(i) => theme::indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+    };
+    let mut bg = match cell.bgcolor() {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(theme::indexed(i)),
+        vt100::Color::Rgb(r, g, b) => Some(Color32::from_rgb(r, g, b)),
+    };
+    if cell.inverse() {
+        let new_bg = fg;
+        fg = bg.unwrap_or(theme::term_bg());
+        bg = Some(new_bg);
+    }
+    if cell.dim() {
+        fg = fg.gamma_multiply(0.6);
+    }
+    Style { fg, bg, italic: cell.italic(), underline: cell.underline() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_row(painter: &egui::Painter, screen: &vt100::Screen, row: u16, cols: u16, left: f32, y: f32, m: Metrics, font: &FontId, sel: Option<(Cell, Cell)>) {
+    let Metrics { cell_w, cell_h, text_dy } = m;
+    let mut job = LayoutJob::default();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    let flush = |job: &mut LayoutJob, run: &mut String, style: Option<Style>| {
+        if let Some(s) = style.filter(|_| !run.is_empty()) {
+            let mut fmt = egui::TextFormat::simple(font.clone(), s.fg);
+            fmt.italics = s.italic;
+            if s.underline {
+                fmt.underline = Stroke::new(1.0, s.fg);
+            }
+            job.append(run, 0.0, fmt);
+            run.clear();
+        }
+    };
+
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else { break };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = cell_style(cell);
+        let x = left + col as f32 * cell_w;
+        let width = if cell.is_wide() { 2.0 } else { 1.0 } * cell_w;
+        if let Some(bg) = style.bg {
+            painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h)), 0.0, bg);
+        }
+        if in_selection(sel, row, col) {
+            painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h)), 0.0, theme::term_selection());
+        }
+        if run_style != Some(style) {
+            flush(&mut job, &mut run, run_style);
+            run_style = Some(style);
+        }
+        let text = cell.contents();
+        run.push_str(if text.is_empty() { " " } else { text });
+    }
+    flush(&mut job, &mut run, run_style);
+    if !job.sections.is_empty() {
+        job.wrap.max_width = f32::INFINITY;
+        let galley = painter.layout_job(job);
+        painter.galley(Pos2::new(left, y + text_dy), galley, theme::term_fg());
+    }
+}
+
+fn in_selection(sel: Option<(Cell, Cell)>, row: u16, col: u16) -> bool {
+    let Some((a, b)) = sel else { return false };
+    if a == b || row < a.row || row > b.row {
+        return false;
+    }
+    let after_start = row > a.row || col >= a.col;
+    let before_end = row < b.row || col < b.col;
+    after_start && before_end
+}
+
+/// Connecting / failed / closed overlays. Returns true when "Reconnect" is clicked.
+fn state_overlay(ui: &mut Ui, rect: Rect, state: &LinkState) -> bool {
+    let id = ui.id().with("overlay");
+    // Connecting has its own full-pane screen (`connecting_screen`).
+    let visible = matches!(state, LinkState::Failed(_) | LinkState::Closed(_));
+    let t = ui.ctx().animate_bool_with_time(id, visible, theme::anim_time(0.25));
+    if t <= 0.0 {
+        return false;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::bg().gamma_multiply(0.72 * t));
+    let (title, detail, color, can_retry) = match state {
+        LinkState::Connecting => ("Connecting…", String::new(), theme::accent(), false),
+        LinkState::Failed(e) => ("Connection failed", e.clone(), theme::danger(), true),
+        LinkState::Closed(r) => ("Session ended", r.clone(), theme::text_dim(), true),
+        LinkState::Connected => ("", String::new(), theme::accent(), false),
+    };
+    let card = Rect::from_center_size(rect.center() + Vec2::new(0.0, 8.0 * (1.0 - t)), Vec2::new(360.0_f32.min(rect.width() - 24.0), 132.0));
+    let mut clicked = false;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(card));
+    child.set_opacity(t);
+    egui::Frame::new()
+        .fill(theme::surface_2())
+        .stroke(Stroke::new(1.0, theme::border()))
+        .corner_radius(12)
+        .inner_margin(16)
+        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: theme::shadow() })
+        .show(&mut child, |ui| {
+            ui.set_width(card.width() - 32.0);
+            ui.horizontal(|ui| {
+                if matches!(state, LinkState::Connecting) {
+                    ui.add(egui::Spinner::new().size(16.0).color(color));
+                } else {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.0, color);
+                }
+                ui.label(egui::RichText::new(title).strong().size(15.0));
+            });
+            if !detail.is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(detail).color(theme::text_dim()).size(12.0));
+            }
+            if can_retry {
+                ui.add_space(8.0);
+                clicked = ui.add(egui::Button::new("Reconnect").fill(theme::accent_soft())).clicked();
+            }
+        });
+    clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_spans_rows() {
+        let sel = Some((Cell { row: 1, col: 5 }, Cell { row: 3, col: 2 }));
+        assert!(!in_selection(sel, 1, 4));
+        assert!(in_selection(sel, 1, 5));
+        assert!(in_selection(sel, 2, 0));
+        assert!(in_selection(sel, 3, 1));
+        assert!(!in_selection(sel, 3, 2));
+        assert!(!in_selection(sel, 4, 0));
+        assert!(!in_selection(None, 1, 1));
+    }
+
+    #[test]
+    fn inverse_swaps_colors() {
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"\x1b[7mX");
+        let s = cell_style(p.screen().cell(0, 0).unwrap());
+        assert_eq!(s.fg, theme::term_bg());
+        assert_eq!(s.bg, Some(theme::term_fg()));
+    }
+
+    #[test]
+    fn bold_brightens_low_ansi() {
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"\x1b[1;31mX");
+        assert_eq!(cell_style(p.screen().cell(0, 0).unwrap()).fg, theme::ansi(9));
+    }
+
+    #[test]
+    fn renders_headless_with_history() {
+        let (handle, _rx) = TerminalHandle::new(24, 80);
+        if let Ok(mut s) = handle.shared.lock() {
+            s.state = LinkState::Connected;
+            for i in 0..200 {
+                s.parser.process(format!("\x1b[3{}mline {i}\x1b[0m\r\n", i % 8).as_bytes());
+            }
+            s.parser.process(b"\x07");
+        }
+        let mut view = TerminalView::new(handle);
+        view.scroll = 50;
+        let ctx = egui::Context::default();
+        for i in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                time: Some(i as f64 * 0.1),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                view.ui(ui, &Profile::new());
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(view.scroll, 50);
+        assert_eq!(view.last_bell, 1);
+        assert!(view.size.0 > 10 && view.size.1 > 40);
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_offset() {
+        assert_eq!(thumb_span(0, 100, 20), (1.0, 20.0 / 120.0));
+        assert_eq!(thumb_span(100, 100, 20).0, 0.0);
+        assert_eq!(thumb_span(50, 100, 20).0, 0.5);
+        assert_eq!(thumb_span(500, 100, 20).0, 0.0);
+        assert_eq!(thumb_span(0, 0, 20), (1.0, 1.0));
+    }
+}

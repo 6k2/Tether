@@ -4,7 +4,6 @@
 //! remote files in the built-in editor or the PC's default app (`sftp_open.rs`).
 
 use std::collections::HashSet;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,19 +16,24 @@ use eframe::egui::{self, CornerRadius, Id, PointerButton, Rect, Sense, Stroke, U
 mod dialogs;
 #[path = "sftp_open.rs"]
 mod open;
+#[path = "sftp_remote.rs"]
+mod remote;
+#[path = "sftp_session.rs"]
+mod session;
 
 use super::dir_cache::{self, SharedHostCache};
-use super::file_list::{self, DragPayload, ListAction, ListState, ROW_H, Row, Side};
+use super::file_list::{DragPayload, ListAction, ListState, Row, Side};
 use super::loading::{self, ConnectInfo};
 use super::nav_history::NavHistory;
 use super::path_complete;
 use super::path_field::{PathEvent, PathField, Suggest};
-use super::sftp_chrome::{drop_overlay, failed_card, icon_button, loading_bar, nav_buttons, pane_title, pill, toolbar};
+use super::sftp_chrome::{drop_overlay, icon_button, last_active_id, listing, loading_bar, nav_buttons, pane_title, pill, terminal_jump_button, toolbar};
 use super::sftp_data::{self as data, HistoryRecorder, cached, candidates, learn, list_local, list_rows, set};
+use super::sftp_status::{self as status, StatusAction};
 use super::toast::Toasts;
 use super::transfers_view;
 use crate::keybindings::{self, Action};
-use crate::profile::{Profile, secret, unix_now};
+use crate::profile::{Profile, unix_now};
 use crate::remote_edit::Watcher;
 use crate::settings;
 use crate::sftp_history::{self, KnownDirs};
@@ -40,6 +44,7 @@ use crate::ssh::terminal::TerminalHandle;
 use crate::ssh::transfer::{self, Direction, Progress, Transfer, TransferState};
 use crate::theme;
 use dialogs::Dialog;
+use session::{Link, RemoteState, Session};
 
 const HEADER_H: f32 = 22.0;
 const GAP: f32 = 8.0;
@@ -52,28 +57,6 @@ const MIN_PANE_W: f32 = 24.0;
 
 /// Distinguishes several SFTP tabs (even of the same host) for ids and drop routing.
 static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
-
-enum Link {
-    Connecting,
-    Ready(Arc<Sftp>),
-    Failed(String),
-}
-
-struct RemoteState {
-    link: Link,
-    cwd: String,
-    rows: Vec<Row>,
-    loading: bool,
-    error: Option<String>,
-    /// Bumped per listing request; results from older requests are discarded.
-    generation: u64,
-    nav: NavHistory<String>,
-    /// `rows` still belong to the previous folder while the new one loads (shown dimmed,
-    /// never blanked, so navigating doesn't flash an empty list).
-    stale: bool,
-    /// Connect progress while `link` is `Connecting`.
-    stage: Stage,
-}
 
 /// How a remote navigation moves through the back / forward history.
 enum NavOp {
@@ -133,8 +116,8 @@ pub struct SftpView {
     dialog: Option<Dialog>,
     /// Terminal of the same host shown next to this pane (set by the app each frame).
     linked_terminal: Option<TerminalHandle>,
-    /// Pool + toasts captured at connect, used for "go to terminal folder".
-    services: Arc<Mutex<Option<(Pool, Toasts)>>>,
+    /// Set by `connect`: what reconnects and "go to terminal folder" need.
+    session: Arc<Mutex<Option<Session>>>,
     /// Result of a pending terminal-folder lookup, consumed on the UI thread.
     jump: Arc<Mutex<Option<String>>>,
     jumping: Arc<AtomicBool>,
@@ -156,17 +139,7 @@ impl SftpView {
         let view_n = NEXT_VIEW.fetch_add(1, Ordering::Relaxed);
         let history_file = sftp_history::default_path();
         Self {
-            remote: Arc::new(Mutex::new(RemoteState {
-                link: Link::Connecting,
-                cwd: String::new(),
-                rows: Vec::new(),
-                loading: true,
-                error: None,
-                generation: 0,
-                nav: NavHistory::default(),
-                stale: false,
-                stage: Stage::Connecting,
-            })),
+            remote: Arc::new(Mutex::new(RemoteState::default())),
             cache: dir_cache::host_cache(profile.id),
             prefetching: Arc::default(),
             local_cwd: home,
@@ -196,7 +169,7 @@ impl SftpView {
             next_transfer: 0,
             dialog: None,
             linked_terminal: None,
-            services: Arc::default(),
+            session: Arc::default(),
             jump: Arc::default(),
             jumping: Arc::default(),
             watcher: Watcher::default(),
@@ -211,69 +184,19 @@ impl SftpView {
     }
 
     pub fn connect(&self, pool: Pool, secret: Option<String>, toasts: Toasts) {
-        set(&self.services, |s| *s = Some((pool.clone(), toasts.clone())));
-        let (state, profile, ctx, cache) = (self.remote.clone(), self.profile.clone(), self.ctx.clone(), self.cache.clone());
-        let recorder = self.recorder();
-        let (history, history_file, host) = (self.history.clone(), self.history_file.clone(), self.profile.id);
-        set(&state, |s| {
-            s.link = Link::Connecting;
-            s.loading = true;
-            s.error = None;
-            s.stage = Stage::Connecting;
-        });
-        self.rt.spawn(async move {
-            let stage = {
-                let (state, ctx) = (state.clone(), ctx.clone());
-                move |st: Stage| {
-                    set(&state, |s| s.stage = st);
-                    ctx.request_repaint();
-                }
-            };
-            let result = async {
-                if history.lock().map(|h| h.is_empty()).unwrap_or(false) {
-                    let loaded = sftp_history::load(&history_file, host);
-                    set(&history, |h| *h = loaded);
-                }
-                let conn = pool.get_staged(&profile, secret, &stage).await?;
-                if let Some(fp) = conn.learned_fingerprint.lock().ok().and_then(|mut f| f.take()) {
-                    toasts.info(format!("New host key trusted for {}\n{fp}", profile.host));
-                }
-                stage(Stage::Opening);
-                let sftp = Sftp::open(&conn).await?;
-                stage(Stage::Loading);
-                let resume_dir = settings::get().sftp.resume_last_dir;
-                let last = if resume_dir { history.lock().ok().and_then(|h| h.first().cloned()) } else { None };
-                let (cwd, rows) = match resume(&sftp, last.as_deref(), &cache, &state, &ctx).await {
-                    Some(found) => found,
-                    None => {
-                        let start = if profile.remote_start_dir.trim().is_empty() { "." } else { profile.remote_start_dir.trim() };
-                        let cwd = sftp.canonicalize(start).await?;
-                        show_cached(&cache, &cwd, &state, &ctx);
-                        let rows = list_rows(&sftp, &cwd).await?;
-                        (cwd, rows)
-                    }
-                };
-                anyhow::Ok((sftp, cwd, rows))
-            }
-            .await;
-            if let Ok((_, cwd, rows)) = &result {
-                learn(&cache, profile.id, cwd, rows, true);
-                recorder.record(cwd);
-            }
-            set(&state, |s| match result {
-                Ok((sftp, cwd, rows)) => {
-                    s.link = Link::Ready(sftp);
-                    s.cwd = cwd;
-                    s.rows = rows;
-                    s.loading = false;
-                }
-                Err(e) => {
-                    s.link = Link::Failed(format!("{e:#}"));
-                    s.loading = false;
-                }
-            });
-            ctx.request_repaint();
-        });
+        let session = Session {
+            pool,
+            toasts,
+            profile: self.profile.clone(),
+            state: self.remote.clone(),
+            cache: self.cache.clone(),
+            history: self.history.clone(),
+            recorder: Arc::new(self.recorder()),
+            ctx: self.ctx.clone(),
+            rt: self.rt.clone(),
+        };
+        session.start(secret);
+        set(&self.session, |s| *s = Some(session));
     }
 
     /// The app links a visible terminal of the same host; `None` hides the jump button.
@@ -281,42 +204,13 @@ impl SftpView {
         self.linked_terminal = terminal;
     }
 
-    /// Asks where the linked terminal is and navigates there (OSC 7 first, then /proc).
-    fn jump_to_terminal(&self) {
-        let Some(term) = self.linked_terminal.clone() else { return };
-        if let Some(cwd) = term.shared.lock().ok().and_then(|s| s.parser.callbacks().cwd.clone()) {
-            set(&self.jump, |j| *j = Some(cwd));
-            return;
-        }
-        let Some((pool, toasts)) = self.services.lock().ok().and_then(|s| s.clone()) else { return };
-        let (profile, jump, jumping, ctx) = (self.profile.clone(), self.jump.clone(), self.jumping.clone(), self.ctx.clone());
-        let (age_secs, rows, cols) = term.probe_facts();
-        jumping.store(true, Ordering::Relaxed);
-        self.rt.spawn(async move {
-            let found = async {
-                // The terminal's transport is normally live; the stored secret covers a
-                // dropped one instead of failing with "Password required".
-                let conn = pool.get(&profile, secret::get(profile.secret_id())).await?;
-                let probe = crate::ssh::cwd::Probe { tag: &term.tag, age_secs, rows, cols };
-                crate::ssh::cwd::terminal_cwd(&conn, probe).await
-            }
-            .await;
-            match found {
-                Ok(path) => set(&jump, |j| *j = Some(path)),
-                Err(e) => toasts.error(format!("{e:#}")),
-            }
-            jumping.store(false, Ordering::Relaxed);
-            ctx.request_repaint();
-        });
-    }
-
     pub fn is_ready(&self) -> bool {
-        self.remote.lock().map(|s| matches!(s.link, Link::Ready(_))).unwrap_or(false)
+        self.remote.lock().map(|s| matches!(s.link, Link::Ready { .. })).unwrap_or(false)
     }
 
     fn sftp(&self) -> Option<Arc<Sftp>> {
         match &self.remote.lock().ok()?.link {
-            Link::Ready(s) => Some(s.clone()),
+            Link::Ready { sftp, .. } => Some(sftp.clone()),
             _ => None,
         }
     }
@@ -331,179 +225,6 @@ impl SftpView {
 
     fn recorder(&self) -> HistoryRecorder {
         HistoryRecorder { file: self.history_file.clone(), host: self.profile.id, list: self.history.clone() }
-    }
-
-    // ---- remote ops ------------------------------------------------------------
-
-    /// Runs an op against the server, then re-lists the current directory.
-    fn remote_op<F, Fut>(&self, op: F)
-    where
-        F: FnOnce(Arc<Sftp>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<()>> + Send,
-    {
-        let Some(sftp) = self.sftp() else { return };
-        let (state, ctx, cache, host) = (self.remote.clone(), self.ctx.clone(), self.cache.clone(), self.profile.id);
-        let (mut generation, mut cwd) = (0, String::new());
-        set(&state, |s| {
-            s.loading = true;
-            s.generation += 1;
-            generation = s.generation;
-            cwd = s.cwd.clone();
-        });
-        self.rt.spawn(async move {
-            let op_result = op(sftp.clone()).await;
-            let listed = list_rows(&sftp, &cwd).await;
-            if let Ok(rows) = &listed {
-                learn(&cache, host, &cwd, rows, false);
-            }
-            set(&state, |s| {
-                if s.generation != generation {
-                    return;
-                }
-                s.loading = false;
-                s.error = op_result.err().map(|e| format!("{e:#}"));
-                s.stale = false;
-                match listed {
-                    Ok(rows) if s.cwd == cwd => s.rows = rows,
-                    Ok(_) => {}
-                    Err(e) => s.error = Some(format!("{e:#}")),
-                }
-            });
-            ctx.request_repaint();
-        });
-    }
-
-    /// Navigates at once (cached rows, or an empty list, under the new path) and loads the
-    /// fresh listing in the background; a failure restores the previous folder and history.
-    fn remote_go(&mut self, op: NavOp) {
-        let Some(sftp) = self.sftp() else { return };
-        let visited = !matches!(op, NavOp::Reload);
-        let cache = self.cache.clone();
-        let mut plan = None;
-        set(&self.remote, |s| {
-            let before = (s.cwd.clone(), s.rows.clone(), s.nav.clone());
-            let target = match op {
-                NavOp::Visit(p) => {
-                    let abs = if p.starts_with('/') { p } else { sftp::join(&s.cwd, &p) };
-                    let target = path_complete::normalize_remote(&abs);
-                    s.nav.visit(s.cwd.clone(), &target);
-                    target
-                }
-                NavOp::Back => match s.nav.back(s.cwd.clone()) {
-                    Some(t) => t,
-                    None => return,
-                },
-                NavOp::Forward => match s.nav.forward(s.cwd.clone()) {
-                    Some(t) => t,
-                    None => return,
-                },
-                NavOp::Reload => s.cwd.clone(),
-            };
-            if target != s.cwd {
-                match cached(&cache, &target) {
-                    Some(rows) => {
-                        s.rows = rows;
-                        s.stale = false;
-                    }
-                    None => s.stale = !s.rows.is_empty(),
-                }
-                s.cwd = target.clone();
-            }
-            s.loading = true;
-            s.error = None;
-            s.generation += 1;
-            plan = Some((target, s.generation, before));
-        });
-        let Some((target, generation, (prev_cwd, prev_rows, prev_nav))) = plan else { return };
-        if visited {
-            self.remote_list.clear();
-        }
-        let (state, ctx, host, recorder) = (self.remote.clone(), self.ctx.clone(), self.profile.id, self.recorder());
-        self.rt.spawn(async move {
-            let canonical = sftp.canonicalize(&target).await.unwrap_or(target);
-            let listed = list_rows(&sftp, &canonical).await;
-            if let Ok(rows) = &listed {
-                learn(&cache, host, &canonical, rows, visited);
-                if visited {
-                    recorder.record(&canonical);
-                }
-            }
-            set(&state, |s| {
-                if s.generation != generation {
-                    return;
-                }
-                s.loading = false;
-                s.stale = false;
-                match listed {
-                    Ok(rows) => {
-                        s.cwd = canonical;
-                        s.rows = rows;
-                    }
-                    Err(e) => {
-                        s.error = Some(format!("{e:#}"));
-                        if visited {
-                            (s.cwd, s.rows, s.nav) = (prev_cwd, prev_rows, prev_nav);
-                        }
-                    }
-                }
-            });
-            ctx.request_repaint();
-        });
-    }
-
-    fn remote_navigate(&mut self, path: String) {
-        self.remote_go(NavOp::Visit(path));
-    }
-
-    /// Lists `dir` in the background (for suggestions) unless it is cached or in flight.
-    fn remote_prefetch(&self, dir: String) {
-        if !dir.starts_with('/') {
-            return;
-        }
-        let dir = path_complete::normalize_remote(&dir);
-        if self.cache.lock().map(|c| c.listings.contains(&dir)).unwrap_or(true) {
-            return;
-        }
-        let Some(sftp) = self.sftp() else { return };
-        if !self.prefetching.lock().map(|mut p| p.insert(dir.clone())).unwrap_or(false) {
-            return;
-        }
-        let (cache, inflight, ctx, host) = (self.cache.clone(), self.prefetching.clone(), self.ctx.clone(), self.profile.id);
-        self.rt.spawn(async move {
-            if let Ok(rows) = list_rows(&sftp, &dir).await {
-                learn(&cache, host, &dir, &rows, false);
-            }
-            set(&inflight, |p| {
-                p.remove(&dir);
-            });
-            ctx.request_repaint();
-        });
-    }
-
-    /// Supplies the remote path field with a directory listing for Tab completion:
-    /// the current rows, the host cache, or (no cached data) a live listing.
-    fn remote_completion_listing(&mut self, dir: String, cwd: &str, rows: &[Row]) {
-        if dir == cwd || path_complete::listing_dir(cwd, path_complete::REMOTE) == dir {
-            self.remote_path.provide_listing(dir, candidates(rows));
-            return;
-        }
-        if let Some(rows) = cached(&self.cache, &path_complete::normalize_remote(&dir)) {
-            self.remote_path.provide_listing(dir, candidates(&rows));
-            return;
-        }
-        let Some(sftp) = self.sftp() else {
-            self.remote_path.listing_failed(&dir);
-            return;
-        };
-        let (slot, ctx, cache, host) = (self.completion.clone(), self.ctx.clone(), self.cache.clone(), self.profile.id);
-        self.rt.spawn(async move {
-            let listed = list_rows(&sftp, &dir).await.ok();
-            if let Some(rows) = &listed {
-                learn(&cache, host, &path_complete::normalize_remote(&dir), rows, false);
-            }
-            set(&slot, |s| *s = Some((dir, listed.map(|rows| candidates(&rows)))));
-            ctx.request_repaint();
-        });
     }
 
     // ---- local ops -------------------------------------------------------------
@@ -654,13 +375,16 @@ impl SftpView {
         }
         let (remote_state, local_dirty, ctx, pipeline) = (self.remote.clone(), self.local_dirty.clone(), self.ctx.clone(), self.profile.pipeline_kb);
         let (cache, host) = (self.cache.clone(), self.profile.id);
-        let remote_cwd = self.remote_cwd();
+        let (remote_cwd, session) = (self.remote_cwd(), self.session());
         self.rt.spawn(async move {
             let result = transfer::run(sftp.clone(), direction, local, remote, pipeline, progress.clone()).await;
             let final_state = match result {
                 Ok(()) => TransferState::Done,
                 Err(_) if progress.is_cancelled() => TransferState::Cancelled,
-                Err(e) => TransferState::Failed(format!("{e:#}")),
+                Err(e) => match Self::triage(session.as_ref(), &sftp, e) {
+                    Some(msg) => TransferState::Failed(msg),
+                    None => TransferState::Failed("Connection lost — send it again once reconnected".into()),
+                },
             };
             set(&state, |s| *s = final_state);
             set(&finished, |f| *f = Some(Instant::now()));
@@ -683,7 +407,8 @@ impl SftpView {
 
     // ---- UI ----------------------------------------------------------------------
 
-    pub fn ui(&mut self, ui: &mut Ui) -> bool {
+    /// Draws the view; the returned action asks the app to reconnect or close the tab.
+    pub fn ui(&mut self, ui: &mut Ui) -> StatusAction {
         self.poll_open();
         self.poll_local();
         if let Some(path) = self.jump.lock().ok().and_then(|mut j| j.take()) {
@@ -692,7 +417,7 @@ impl SftpView {
         if self.local_dirty.load(Ordering::Relaxed) {
             self.refresh_local();
         }
-        let mut reconnect = false;
+        let mut action = StatusAction::default();
         let base = self.base_id();
         let has_transfers = self.transfers.lock().map(|t| !t.is_empty()).unwrap_or(false);
         let t = ui.ctx().animate_bool_with_time(base.with("tx_panel"), has_transfers, 0.25);
@@ -712,21 +437,9 @@ impl SftpView {
             self.pane(ui, rect, Side::Local, fade);
         }
         if let Some((rect, fade)) = remote_rect {
-            let failed = self.remote.lock().ok().and_then(|s| match &s.link {
-                Link::Failed(e) => Some(e.clone()),
-                _ => None,
-            });
-            match failed {
-                Some(err) => {
-                    // The next connect starts its own "connecting" timer.
-                    self.connecting_since = None;
-                    reconnect = failed_card(ui, rect, &err);
-                }
-                None => {
-                    self.pane(ui, rect, Side::Remote, fade);
-                    self.connecting_screen(ui, rect);
-                }
-            }
+            self.pane(ui, rect, Side::Remote, fade);
+            self.connecting_screen(ui, rect);
+            action = self.status_overlay(ui, rect);
         }
 
         if t > 0.0 {
@@ -739,13 +452,43 @@ impl SftpView {
         }
         self.dialogs(ui.ctx());
         ui.allocate_rect(full, Sense::hover());
-        reconnect
+        action
+    }
+
+    /// The reconnect banner or the failure card over the remote pane.
+    fn status_overlay(&mut self, ui: &mut Ui, rect: Rect) -> StatusAction {
+        let base = self.base_id();
+        let (banner, failure) = self
+            .remote
+            .lock()
+            .map(|s| match &s.link {
+                Link::Reconnecting { attempt } => (Some((status::reconnect_text(*attempt, session::MAX_ATTEMPTS), s.stage)), None),
+                // A manual reconnect over a listing keeps it visible under the banner.
+                Link::Connecting if !s.rows.is_empty() => (Some(("Reconnecting…".to_string(), s.stage)), None),
+                Link::Failed(f) => (None, Some(f.clone())),
+                _ => (None, None),
+            })
+            .unwrap_or_default();
+        let banner_t = ui.ctx().animate_bool_with_time(base.with("banner"), banner.is_some(), theme::anim_time(0.25));
+        let card_t = ui.ctx().animate_bool_with_time(base.with("failure"), failure.is_some(), theme::anim_time(0.25));
+        let mut action = StatusAction::default();
+        if let Some((text, stage)) = &banner {
+            action = status::reconnect_banner(ui, rect, text, &format!("{}…", stage.label()), banner_t);
+        }
+        if let Some(f) = &failure {
+            // The next connect starts its own "connecting" timer.
+            self.connecting_since = None;
+            action = status::failure_card(ui, rect, f.title, &f.message, &f.detail, card_t);
+        }
+        action
     }
 
     /// Covers the remote pane while the session connects (only if that takes a moment),
     /// then fades away onto the listing.
     fn connecting_screen(&mut self, ui: &Ui, rect: Rect) {
-        let (connecting, stage) = self.remote.lock().map(|s| (matches!(s.link, Link::Connecting), s.stage)).unwrap_or((false, Stage::Connecting));
+        // With a listing on screen (manual reconnect) the slim banner shows progress instead.
+        let (connecting, stage) =
+            self.remote.lock().map(|s| (matches!(s.link, Link::Connecting) && s.rows.is_empty(), s.stage)).unwrap_or((false, Stage::Connecting));
         let now = ui.input(|i| i.time);
         let since = if connecting { *self.connecting_since.get_or_insert(now) } else { self.connecting_since.take().unwrap_or(now) };
         let elapsed = now - since;
@@ -1007,6 +750,8 @@ impl Drop for SftpView {
     /// Closing the pane stops its transfers instead of letting them fail mid-file later, and
     /// stops watching files opened with system apps (their temp copies are deleted).
     fn drop(&mut self) {
+        // Stops the session watcher and any reconnect loop of this view.
+        set(&self.remote, |s| s.epoch += 1);
         self.watcher.stop_all();
         if let Ok(list) = self.transfers.lock() {
             for t in list.iter() {
@@ -1014,80 +759,4 @@ impl Drop for SftpView {
             }
         }
     }
-}
-
-/// Tries the folder the last session ended in; `None` (use the start folder instead)
-/// when there is none or it no longer exists.
-async fn resume(sftp: &Sftp, last: Option<&str>, cache: &SharedHostCache, state: &Arc<Mutex<RemoteState>>, ctx: &egui::Context) -> Option<(String, Vec<Row>)> {
-    let cwd = sftp.canonicalize(last?).await.ok()?;
-    show_cached(cache, &cwd, state, ctx);
-    let rows = list_rows(sftp, &cwd).await.ok()?;
-    Some((cwd, rows))
-}
-
-/// Shows the last known listing of `cwd` at once while the fresh one loads.
-fn show_cached(cache: &SharedHostCache, cwd: &str, state: &Arc<Mutex<RemoteState>>, ctx: &egui::Context) {
-    if let Some(rows) = cached(cache, cwd) {
-        set(state, |s| {
-            s.cwd = cwd.to_string();
-            s.rows = rows;
-        });
-        ctx.request_repaint();
-    }
-}
-
-/// The file table, plus skeleton rows while a first listing loads. Rows of the previous
-/// folder (`stale`) stay visible, dimmed and inert, until the new listing arrives.
-fn listing(ui: &mut Ui, id: Id, side: Side, rows: &[Row], list: &mut ListState, transfer_label: &str, (stale, loading): (bool, bool)) -> Vec<ListAction> {
-    let dim = ui.ctx().animate_bool_with_time(id.with("stale"), stale, theme::anim_time(0.15));
-    let skeleton = ui.ctx().animate_bool_with_time(id.with("skeleton"), loading && rows.is_empty(), theme::anim_time(0.2));
-    let area = ui.available_rect_before_wrap();
-    let actions = ui
-        .scope(|ui| {
-            ui.multiply_opacity(1.0 - 0.55 * dim);
-            if stale {
-                ui.disable();
-            }
-            file_list::show(ui, side, rows, list, transfer_label)
-        })
-        .inner;
-    if skeleton > 0.0 {
-        let body = Rect::from_min_max(area.min + Vec2::new(0.0, file_list::HEADER_H + ROW_H), area.max);
-        loading::skeleton_rows(ui, body, ROW_H, skeleton);
-    }
-    if stale { Vec::new() } else { actions }
-}
-
-/// Memory key holding the `view_n` of the SFTP view the pointer was last over.
-fn last_active_id() -> Id {
-    Id::new("sftp_last_active_view")
-}
-
-/// Small painted "terminal prompt -> folder" button; spins while the lookup runs.
-fn terminal_jump_button(ui: &mut Ui, busy: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), egui::Sense::click());
-    let resp = resp.on_hover_text("Go to the folder of the terminal next to this pane");
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Go to terminal folder"));
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    let p = ui.painter();
-    if t > 0.0 {
-        p.rect_filled(rect, egui::CornerRadius::same(6), theme::surface_3().gamma_multiply(t));
-    }
-    let col = theme::text_dim().lerp_to_gamma(theme::accent(), t);
-    let stroke = egui::Stroke::new(1.5, col);
-    let box_ = egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 12.0));
-    p.rect_stroke(box_, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
-    if busy {
-        let a = ui.input(|i| i.time) as f32 * 6.0;
-        let c = box_.center();
-        p.line_segment([c, c + egui::vec2(a.cos(), a.sin()) * 4.0], stroke);
-        ui.ctx().request_repaint();
-    } else {
-        // ">_" prompt glyph drawn with lines.
-        let o = box_.left_top() + egui::vec2(3.5, 3.0);
-        p.line_segment([o, o + egui::vec2(3.0, 3.0)], stroke);
-        p.line_segment([o + egui::vec2(3.0, 3.0), o + egui::vec2(0.0, 6.0)], stroke);
-        p.line_segment([o + egui::vec2(5.0, 6.5), o + egui::vec2(9.0, 6.5)], stroke);
-    }
-    resp.clicked() && !busy
 }

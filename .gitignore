@@ -2,3 +2,5 @@
 *.tmp
 .env
 .DS_Store
+/installer/Output
+.claude/

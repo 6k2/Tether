@@ -216,6 +216,9 @@ pub enum Icon {
     Check,
     Gear,
     Keyboard,
+    Key,
+    Server,
+    Plus,
 }
 
 /// Frameless icon button (e.g. the gear that opens Settings in the top bar).
@@ -302,6 +305,24 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 }
             }
             p.line_segment([at(0.3, 0.66), at(0.7, 0.66)], s);
+        }
+        Icon::Key => {
+            let ring = at(0.3, 0.5);
+            p.circle_stroke(ring, r.width() * 0.22, s);
+            p.line_segment([at(0.52, 0.5), at(0.96, 0.5)], s);
+            p.line_segment([at(0.84, 0.5), at(0.84, 0.72)], s);
+            p.line_segment([at(0.66, 0.5), at(0.66, 0.66)], s);
+        }
+        Icon::Server => {
+            for (top, bottom) in [(0.1, 0.45), (0.55, 0.9)] {
+                p.rect_stroke(Rect::from_min_max(at(0.06, top), at(0.94, bottom)), CornerRadius::same(2), s, StrokeKind::Middle);
+                p.circle_filled(at(0.24, (top + bottom) / 2.0), w * 0.7, c);
+                p.line_segment([at(0.5, (top + bottom) / 2.0), at(0.78, (top + bottom) / 2.0)], s);
+            }
+        }
+        Icon::Plus => {
+            p.line_segment([at(0.5, 0.1), at(0.5, 0.9)], s);
+            p.line_segment([at(0.1, 0.5), at(0.9, 0.5)], s);
         }
         Icon::Check => {
             p.add(egui::Shape::line(vec![at(0.12, 0.52), at(0.4, 0.78), at(0.88, 0.24)], s));

@@ -1,16 +1,23 @@
 //! Host editor modal: a header that previews the host, then General / Connection /
-//! Authentication cards with inline validation, a collapsible Advanced section and a
-//! "Test connection" button that runs a real handshake in the background.
+//! Authentication section cards with stacked labels, tall inputs and inline validation,
+//! a collapsible Advanced card and a sticky footer with "Test connection" (a real
+//! handshake in the background), Cancel and Save. Enter saves, Esc closes.
+
+mod auth;
+#[cfg(test)]
+mod shots;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align, Align2, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use egui::collapsing_header::CollapsingState;
 use uuid::Uuid;
 
 use super::autocomplete::AutoField;
+use super::form::{self, Kind};
 use super::loading;
-use super::settings_widgets as w;
+use super::settings_widgets::{self as w, Icon};
 use super::suggest;
 use crate::folders::FolderStore;
 use crate::keystore::KeyStore;
@@ -18,8 +25,9 @@ use crate::profile::{AuthMethod, MAX_PIPELINE_KB, MIN_PIPELINE_KB, Profile, secr
 use crate::ssh::connection::Stage;
 use crate::theme;
 
-const WIDTH: f32 = 500.0;
-const FIELD_W: f32 = 300.0;
+const MAX_WIDTH: f32 = 680.0;
+const PAD: i8 = 24;
+const PORT_W: f32 = 112.0;
 /// Accent presets offered next to the hue slider.
 const SWATCHES: [f32; 8] = [150.0, 200.0, 220.0, 265.0, 300.0, 340.0, 20.0, 45.0];
 
@@ -52,6 +60,8 @@ pub struct ProfileEditor {
     auth_tab: AuthTab,
     /// Name typed for a folder to create on save.
     new_folder: Option<String>,
+    /// The port as typed (validated into `profile.port`).
+    port_text: String,
     users: Vec<String>,
     hosts: Vec<String>,
     user_ac: AutoField,
@@ -87,6 +97,7 @@ impl ProfileEditor {
             AuthMethod::Key { .. } => AuthTab::File,
         };
         Self {
+            port_text: profile.port.to_string(),
             profile,
             secret: String::new(),
             show_secret: false,
@@ -125,22 +136,34 @@ impl ProfileEditor {
 
     pub fn show(&mut self, ctx: &egui::Context, folders: &FolderStore, keys: &KeyStore) -> EditorOutcome {
         let mut outcome = EditorOutcome::Open;
-        let modal = egui::Modal::new(egui::Id::new("profile_editor")).show(ctx, |ui| {
-            ui.set_width(WIDTH);
-            ui.spacing_mut().item_spacing.y = 6.0;
-            self.header(ui);
-            ui.add_space(10.0);
-            egui::ScrollArea::vertical().max_height(ctx.content_rect().height() - 200.0).auto_shrink([false, true]).show(ui, |ui| {
-                w::card(ui, Some("General"), |ui| self.general(ui, folders));
-                ui.add_space(8.0);
-                w::card(ui, Some("Connection"), |ui| self.connection(ui));
-                ui.add_space(8.0);
-                w::card(ui, Some("Authentication"), |ui| self.auth(ui, keys, &mut outcome));
-                ui.add_space(4.0);
-                egui::CollapsingHeader::new(RichText::new("Advanced").color(theme::text_dim())).show(ui, |ui| self.advanced(ui));
+        let screen = ctx.content_rect();
+        let width = (screen.width() - 48.0).clamp(480.0, MAX_WIDTH);
+        let frame = egui::Frame::new().fill(theme::surface()).stroke(Stroke::new(1.0, theme::border())).corner_radius(16).shadow(egui::Shadow {
+            offset: [0, 18],
+            blur: 48,
+            spread: 0,
+            color: theme::shadow(),
+        });
+        let modal = egui::Modal::new(egui::Id::new("profile_editor")).frame(frame).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new().inner_margin(Margin { left: PAD, right: 18, top: 20, bottom: 18 }).show(ui, |ui| self.header(ui, &mut outcome));
+            form::rule(ui);
+            let body_h = (screen.height() - 250.0).max(240.0);
+            egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin::symmetric(PAD, 20)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    form::section(ui, Some(Icon::Folder), "General", "How the host shows up in the sidebar", |ui| self.general(ui, folders));
+                    ui.add_space(14.0);
+                    form::section(ui, Some(Icon::Server), "Connection", "Where to connect and as whom", |ui| self.connection(ui));
+                    ui.add_space(14.0);
+                    self.auth_section(ui, keys, &mut outcome);
+                    ui.add_space(14.0);
+                    self.advanced(ui);
+                });
             });
-            ui.add_space(10.0);
-            self.footer(ui, keys, &mut outcome);
+            form::rule(ui);
+            egui::Frame::new().inner_margin(Margin::symmetric(PAD, 16)).show(ui, |ui| self.footer(ui, keys, &mut outcome));
         });
         if modal.should_close() && matches!(outcome, EditorOutcome::Open) {
             outcome = EditorOutcome::Cancel;
@@ -148,37 +171,47 @@ impl ProfileEditor {
         outcome
     }
 
-    /// Live preview: avatar in the host colour, name and address.
-    fn header(&self, ui: &mut Ui) {
+    /// Live preview: avatar in the host colour, name and address, close button.
+    fn header(&self, ui: &mut Ui, outcome: &mut EditorOutcome) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
         let p = ui.painter();
         let accent = theme::hue_color(self.profile.hue);
-        let avatar = Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 4.0), Vec2::splat(40.0));
-        p.rect_filled(avatar, CornerRadius::same(10), accent.gamma_multiply(0.22));
+        let avatar = Rect::from_min_size(rect.left_top(), Vec2::splat(48.0));
+        p.rect_filled(avatar, CornerRadius::same(12), accent.gamma_multiply(0.2));
+        p.rect_stroke(avatar, CornerRadius::same(12), Stroke::new(1.0, accent.gamma_multiply(0.45)), egui::StrokeKind::Inside);
         let name = self.profile.display_name();
         let initial = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "+".into());
-        p.text(avatar.center(), Align2::CENTER_CENTER, initial, FontId::proportional(18.0), accent);
+        p.text(avatar.center(), Align2::CENTER_CENTER, initial, FontId::proportional(20.0), accent);
+        let x = avatar.right() + 14.0;
         let title = if self.is_new { "New host" } else { "Edit host" };
-        p.text(Pos2::new(avatar.right() + 12.0, avatar.top() + 11.0), Align2::LEFT_CENTER, title, FontId::proportional(18.0), theme::text());
+        p.text(Pos2::new(x, avatar.top() + 14.0), Align2::LEFT_CENTER, title, FontId::proportional(19.0), theme::text());
         let sub = if self.profile.host.trim().is_empty() { "Fill in the address below".to_string() } else { self.profile.address() };
-        p.text(Pos2::new(avatar.right() + 12.0, avatar.bottom() - 9.0), Align2::LEFT_CENTER, sub, FontId::monospace(11.5), theme::text_faint());
+        p.text(Pos2::new(x, avatar.bottom() - 11.0), Align2::LEFT_CENTER, sub, FontId::monospace(12.0), theme::text_dim());
+        let close = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.top() + 16.0), Vec2::splat(30.0));
+        if ui.scope_builder(egui::UiBuilder::new().max_rect(close), |ui| w::close_button(ui, 30.0, false)).inner.on_hover_text("Close (Esc)").clicked() {
+            *outcome = EditorOutcome::Cancel;
+        }
     }
 
     fn general(&mut self, ui: &mut Ui, folders: &FolderStore) {
-        field(ui, "Label", None, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.profile.name).hint_text("My server").desired_width(FIELD_W));
+        let half = (ui.available_width() - form::GAP) / 2.0;
+        form::row2(ui, half, |ui, lw, rw| {
+            form::field(ui, lw, "Label", None, Some("Optional — the host name is used otherwise"), |ui| {
+                form::text(ui, &mut self.profile.name, "My server", lw, false);
+            });
+            form::field(ui, rw, "Folder", None, None, |ui| self.folder_picker(ui, folders, rw));
         });
-        field(ui, "Folder", None, |ui| self.folder_picker(ui, folders));
     }
 
-    fn folder_picker(&mut self, ui: &mut Ui, folders: &FolderStore) {
+    fn folder_picker(&mut self, ui: &mut Ui, folders: &FolderStore, width: f32) {
         if let Some(name) = &mut self.new_folder {
-            let cancel = ui
-                .horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(name).hint_text("New folder name").desired_width(FIELD_W - 64.0));
-                    ui.small_button("Cancel").clicked()
-                })
-                .inner;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                form::text(ui, name, "New folder name", width - 42.0, false);
+                cancel = w::close_button(ui, 36.0, false).on_hover_text("Pick an existing folder").clicked();
+            });
+            form::note(ui, "Created when you save", false);
             if cancel {
                 self.new_folder = None;
             }
@@ -188,33 +221,54 @@ impl ProfileEditor {
             Some(_) => folders.path_of(self.profile.folder.unwrap_or_default()),
             None => "Top level".into(),
         };
-        egui::ComboBox::from_id_salt("editor_folder").selected_text(current).width(FIELD_W).show_ui(ui, |ui| {
-            ui.selectable_value(&mut self.profile.folder, None, "Top level");
+        let mut pick = None;
+        let mut create = false;
+        let chosen = self.profile.folder;
+        form::select(ui, egui::Id::new("editor_folder"), width, &current, |ui| {
+            if form::option(ui, "Top level", None, chosen.is_none()).clicked() {
+                pick = Some(None);
+            }
             for (id, depth) in folders.flattened() {
                 let name = folders.get(id).map(|f| f.name.as_str()).unwrap_or_default();
-                ui.selectable_value(&mut self.profile.folder, Some(id), format!("{}📁 {name}", "    ".repeat(depth)));
+                if form::option(ui, &format!("{}{name}", "      ".repeat(depth)), None, chosen == Some(id)).clicked() {
+                    pick = Some(Some(id));
+                }
             }
-            ui.separator();
-            if ui.selectable_label(false, "+ New folder…").clicked() {
-                self.new_folder = Some(String::new());
+            ui.add_space(4.0);
+            form::rule(ui);
+            ui.add_space(4.0);
+            if form::option(ui, "+  New folder…", None, false).clicked() {
+                create = true;
             }
         });
+        if let Some(f) = pick {
+            self.profile.folder = f;
+        }
+        if create {
+            self.new_folder = Some(String::new());
+        }
     }
 
     fn connection(&mut self, ui: &mut Ui) {
         let host_err = self.tried_save && self.profile.host.trim().is_empty();
         let user_err = self.tried_save && self.profile.user.trim().is_empty();
+        let port_err = self.port_error();
         let (hosts, users) = (&self.hosts, &self.users);
+        let (host_ac, user_ac) = (&mut self.host_ac, &mut self.user_ac);
         let p = &mut self.profile;
-        field(ui, "Host", host_err.then_some("Host is required"), |ui| {
-            ui.horizontal(|ui| {
-                let out = self.host_ac.show(
-                    ui,
-                    &mut p.host,
-                    |t| egui::TextEdit::singleline(t).hint_text("example.com or user@host:port").desired_width(FIELD_W - 76.0),
-                    |q| suggest::rank_words(q, hosts, suggest::SUGGEST_LIMIT),
-                    egui::Order::Tooltip,
-                );
+        let port_text = &mut self.port_text;
+        form::row2(ui, PORT_W, |ui, w, port_w| {
+            let help = "Tip: paste user@host:port to fill everything";
+            form::field(ui, w, "Host", host_err.then_some("Host is required"), Some(help), |ui| {
+                let out = form::framed(ui, host_err, |ui| {
+                    host_ac.show(
+                        ui,
+                        &mut p.host,
+                        |t| form::style_edit(egui::TextEdit::singleline(t).hint_text("example.com or 10.0.0.5"), w),
+                        |q| suggest::rank_words(q, hosts, suggest::SUGGEST_LIMIT),
+                        egui::Order::Tooltip,
+                    )
+                });
                 // Pasting `user@host:port` fills all three fields.
                 if out.changed()
                     && p.host.contains('@')
@@ -223,139 +277,94 @@ impl ProfileEditor {
                     p.host = q.host;
                     p.user = q.user;
                     p.port = q.port;
-                }
-                ui.add(egui::DragValue::new(&mut p.port).range(1..=65535).prefix("port "));
-            });
-        });
-        field(ui, "Username", user_err.then_some("Username is required"), |ui| {
-            self.user_ac.show(
-                ui,
-                &mut p.user,
-                |t| egui::TextEdit::singleline(t).hint_text("root").desired_width(FIELD_W),
-                |q| suggest::rank_words(q, users, suggest::SUGGEST_LIMIT),
-                egui::Order::Tooltip,
-            );
-        });
-    }
-
-    fn auth(&mut self, ui: &mut Ui, keys: &KeyStore, outcome: &mut EditorOutcome) {
-        let before = self.auth_tab;
-        ui.horizontal(|ui| {
-            w::segmented(ui, &mut self.auth_tab, &[(AuthTab::Password, "Password"), (AuthTab::Managed, "Saved key"), (AuthTab::File, "Key file")]);
-        });
-        if self.auth_tab != before {
-            self.secret.clear();
-            self.profile.auth = match self.auth_tab {
-                AuthTab::Password => AuthMethod::Password,
-                AuthTab::Managed => AuthMethod::Managed { key: keys.keys.first().map(|k| k.id).unwrap_or_default() },
-                AuthTab::File => AuthMethod::Key { path: default_key_path() },
-            };
-            self.has_saved_secret = !self.is_new && secret::get(self.profile.secret_id()).is_some();
-        }
-        ui.add_space(6.0);
-        match self.auth_tab {
-            AuthTab::Password => self.secret_field(ui, "Password", ""),
-            AuthTab::Managed => self.managed_key(ui, keys, outcome),
-            AuthTab::File => {
-                let missing = self.tried_save && matches!(&self.profile.auth, AuthMethod::Key { path } if path.as_os_str().is_empty());
-                if let AuthMethod::Key { path } = &mut self.profile.auth {
-                    field(ui, "Key file", missing.then_some("Choose a private key file"), |ui| {
-                        ui.horizontal(|ui| {
-                            let mut text = path.display().to_string();
-                            if ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W - 70.0)).changed() {
-                                *path = PathBuf::from(text);
-                            }
-                            if ui.button("Browse…").clicked()
-                                && let Some(f) = rfd::FileDialog::new().set_title("Choose private key").pick_file()
-                            {
-                                *path = f;
-                            }
-                        });
-                    });
-                }
-                self.secret_field(ui, "Passphrase", "optional");
-            }
-        }
-    }
-
-    fn managed_key(&mut self, ui: &mut Ui, keys: &KeyStore, outcome: &mut EditorOutcome) {
-        if keys.keys.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("No saved keys yet.").color(theme::text_dim()));
-                if w::primary_button(ui, "+ Generate a key").clicked() {
-                    *outcome = EditorOutcome::GenerateKey;
-                }
-                if w::ghost_button(ui, "Import…", theme::text()).clicked() {
-                    *outcome = EditorOutcome::ManageKeys;
+                    *port_text = q.port.to_string();
                 }
             });
-            return;
-        }
-        let AuthMethod::Managed { key } = &mut self.profile.auth else { return };
-        if keys.get(*key).is_none() {
-            *key = keys.keys[0].id;
-        }
-        let selected = keys.get(*key).map(|k| format!("{}  ·  {}", k.name, k.algorithm)).unwrap_or_default();
-        let mut changed = false;
-        field(ui, "Key", None, |ui| {
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("editor_key").selected_text(selected).width(FIELD_W - 92.0).show_ui(ui, |ui| {
-                    for k in &keys.keys {
-                        let label = format!("{}{}  ·  {}", if k.encrypted { "🔒 " } else { "" }, k.name, k.algorithm);
-                        changed |= ui.selectable_value(key, k.id, label).on_hover_text(&k.fingerprint).changed();
-                    }
-                });
-                if ui.button("+").on_hover_text("Generate a new key").clicked() {
-                    *outcome = EditorOutcome::GenerateKey;
-                }
-                if ui.button("Manage").clicked() {
-                    *outcome = EditorOutcome::ManageKeys;
+            form::field(ui, port_w, "Port", port_err.then_some("1 – 65535"), None, |ui| {
+                if form::text(ui, port_text, "22", port_w, port_err).changed() {
+                    port_text.retain(|c| c.is_ascii_digit());
+                    port_text.truncate(5);
+                    p.port = port_text.parse().unwrap_or(0);
                 }
             });
         });
-        if changed {
-            self.secret.clear();
-            self.has_saved_secret = secret::get(self.profile.secret_id()).is_some();
-        }
-        let id = self.profile.secret_id();
-        if let Some(k) = keys.get(id) {
-            ui.label(RichText::new(&k.fingerprint).monospace().size(11.0).color(theme::text_faint()));
-            if k.encrypted {
-                self.secret_field(ui, "Passphrase", "asked when connecting if left blank");
-            }
-        }
-    }
-
-    fn secret_field(&mut self, ui: &mut Ui, label: &str, hint: &str) {
-        let hint = if self.has_saved_secret { "•••••• saved — leave blank to keep" } else { hint };
-        field(ui, label, None, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.secret).password(!self.show_secret).hint_text(hint).desired_width(FIELD_W - 34.0));
-                let eye = if self.show_secret { "🙈" } else { "👁" };
-                if ui.add(egui::Button::new(eye).frame(false)).on_hover_text("Show / hide").clicked() {
-                    self.show_secret = !self.show_secret;
-                }
+        ui.add_space(8.0);
+        let width = ui.available_width();
+        form::field(ui, width, "Username", user_err.then_some("Username is required"), None, |ui| {
+            form::framed(ui, user_err, |ui| {
+                user_ac.show(
+                    ui,
+                    &mut p.user,
+                    |t| form::style_edit(egui::TextEdit::singleline(t).hint_text("root"), width),
+                    |q| suggest::rank_words(q, users, suggest::SUGGEST_LIMIT),
+                    egui::Order::Tooltip,
+                )
             });
         });
     }
 
+    fn port_error(&self) -> bool {
+        self.profile.port == 0 && (self.tried_save || !self.port_text.is_empty())
+    }
+
+    /// Collapsible card with the rarely changed settings.
     fn advanced(&mut self, ui: &mut Ui) {
+        let id = egui::Id::new("editor_advanced");
+        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let openness = state.openness(ui.ctx());
+        egui::Frame::new()
+            .fill(form::card_fill())
+            .stroke(Stroke::new(1.0, theme::border().gamma_multiply(0.8)))
+            .corner_radius(12)
+            .inner_margin(Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let top = ui.cursor().min;
+                form::section_header(ui, Some(Icon::Gear), "Advanced", "Start folder, SFTP speed and colour", |ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    form::paint_chevron(ui.painter(), r.center(), openness, theme::text_dim());
+                });
+                let header = Rect::from_min_max(top, Pos2::new(ui.max_rect().right(), ui.cursor().min.y));
+                let resp = ui.interact(header, id.with("header"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    state.toggle(ui);
+                }
+                state.show_body_unindented(ui, |ui| {
+                    ui.add_space(14.0);
+                    self.advanced_body(ui);
+                });
+            });
+    }
+
+    fn advanced_body(&mut self, ui: &mut Ui) {
         let p = &mut self.profile;
-        field(ui, "Remote start dir", None, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut p.remote_start_dir).hint_text("home (when there is no last folder)").desired_width(FIELD_W));
+        let width = ui.available_width();
+        form::field(ui, width, "Remote start folder", None, Some("Used when there's no last folder to resume"), |ui| {
+            form::text(ui, &mut p.remote_start_dir, "home folder", width, false);
         });
-        field(ui, "SFTP pipeline", None, |ui| {
-            ui.add(egui::Slider::new(&mut p.pipeline_kb, MIN_PIPELINE_KB..=MAX_PIPELINE_KB).logarithmic(true).suffix(" KB"))
-                .on_hover_text("Bytes kept in flight per file (Bitvise-style). Raise on high-latency links.");
-        });
-        field(ui, "Colour", None, |ui| {
+        ui.add_space(10.0);
+        form::field(ui, width, "SFTP pipeline", None, Some("Data kept in flight per file. Raise it on high-latency links."), |ui| {
             ui.horizontal(|ui| {
+                let mut kb = p.pipeline_kb as f32;
+                let spec =
+                    w::SliderSpec { min: MIN_PIPELINE_KB as f32, max: MAX_PIPELINE_KB as f32, step: 0.0, log: true, format: &|v| format!("{} KB", v.round()) };
+                if w::slider_with_value(ui, &mut kb, &spec).changed() {
+                    p.pipeline_kb = (kb.round() as u32).clamp(MIN_PIPELINE_KB, MAX_PIPELINE_KB);
+                }
+            });
+        });
+        ui.add_space(10.0);
+        form::field(ui, width, "Colour", None, None, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 for hue in SWATCHES {
-                    if swatch(ui, hue, (p.hue - hue).abs() < 1.0).clicked() {
+                    if swatch(ui, hue, (p.hue - hue).abs() < 1.0).on_hover_text("Use this colour").clicked() {
                         p.hue = hue;
                     }
                 }
-                ui.add(egui::Slider::new(&mut p.hue, 0.0..=359.0).show_value(false));
+                ui.add_space(8.0);
+                let spec = w::SliderSpec { min: 0.0, max: 359.0, step: 1.0, log: false, format: &|v| format!("{v:.0}°") };
+                w::slider(ui, &mut p.hue, &spec).on_hover_text("Any hue");
             });
         });
     }
@@ -363,44 +372,58 @@ impl ProfileEditor {
     fn footer(&mut self, ui: &mut Ui, keys: &KeyStore, outcome: &mut EditorOutcome) {
         let state = self.test.lock().map(|s| s.clone()).unwrap_or(TestState::Idle);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
             let running = matches!(state, TestState::Running(_));
-            let test = ui.add_enabled(!running, egui::Button::new("Test connection").min_size(Vec2::new(120.0, 30.0)));
-            if test.clicked() {
-                match self.validated(keys) {
-                    Ok(()) => {
-                        let secret = (!self.secret.is_empty()).then(|| self.secret.clone()).or_else(|| secret::get(self.profile.secret_id()));
-                        *outcome = EditorOutcome::Test(Box::new(self.profile.clone()), secret, self.test.clone());
-                    }
-                    Err(e) => {
-                        if let Ok(mut s) = self.test.lock() {
-                            *s = TestState::Failed(e);
-                        }
-                    }
-                }
+            if form::button(ui, "Test connection", Kind::Secondary, !running).on_hover_text("Connect and log in once, without saving").clicked() {
+                self.start_test(keys, outcome);
             }
             test_status(ui, &state);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let save = ui.add(
-                    egui::Button::new(RichText::new("Save").color(Color32::WHITE).strong())
-                        .fill(theme::accent().gamma_multiply(0.85))
-                        .min_size(Vec2::new(90.0, 30.0)),
-                );
-                let save = save.on_hover_text("Ctrl+Enter");
-                if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(84.0, 30.0))).clicked() {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let save = form::button(ui, "Save", Kind::Primary, true).on_hover_text("Enter");
+                if form::button(ui, "Cancel", Kind::Ghost, true).on_hover_text("Esc").clicked() {
                     *outcome = EditorOutcome::Cancel;
                 }
-                if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
-                    self.tried_save = true;
-                    if self.validated(keys).is_ok() {
-                        let secret = (!self.secret.is_empty()).then(|| self.secret.clone());
-                        let new_folder = self.new_folder.clone().filter(|n| !n.trim().is_empty());
-                        *outcome = EditorOutcome::Save(Box::new(SaveRequest { profile: self.profile.clone(), secret, new_folder }));
-                    }
+                if matches!(state, TestState::Idle) && ui.available_width() > 190.0 {
+                    form::hints(ui, &[("Enter", "save"), ("Esc", "close")]);
+                }
+                if save.clicked() || self.enter_pressed(ui) {
+                    self.save(keys, outcome);
                 }
             });
         });
         if let TestState::Failed(e) = &state {
-            ui.add(egui::Label::new(RichText::new(e).size(11.5).color(theme::danger())).wrap());
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(RichText::new(e).size(12.0).color(theme::danger())).wrap());
+        }
+    }
+
+    /// Plain (or Ctrl+) Enter saves, unless a suggestion list or dropdown is taking it.
+    fn enter_pressed(&self, ui: &Ui) -> bool {
+        let busy = self.host_ac.is_open() || self.user_ac.is_open() || egui::Popup::is_any_open(ui.ctx());
+        !busy && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift && !i.modifiers.alt)
+    }
+
+    fn start_test(&mut self, keys: &KeyStore, outcome: &mut EditorOutcome) {
+        match self.validated(keys) {
+            Ok(()) => {
+                let secret = (!self.secret.is_empty()).then(|| self.secret.clone()).or_else(|| secret::get(self.profile.secret_id()));
+                *outcome = EditorOutcome::Test(Box::new(self.profile.clone()), secret, self.test.clone());
+            }
+            Err(e) => {
+                self.tried_save = true;
+                if let Ok(mut s) = self.test.lock() {
+                    *s = TestState::Failed(e);
+                }
+            }
+        }
+    }
+
+    fn save(&mut self, keys: &KeyStore, outcome: &mut EditorOutcome) {
+        self.tried_save = true;
+        if self.validated(keys).is_ok() {
+            let secret = (!self.secret.is_empty()).then(|| self.secret.clone());
+            let new_folder = self.new_folder.clone().filter(|n| !n.trim().is_empty());
+            *outcome = EditorOutcome::Save(Box::new(SaveRequest { profile: self.profile.clone(), secret, new_folder }));
         }
     }
 
@@ -415,29 +438,15 @@ impl ProfileEditor {
     }
 }
 
-/// Label column + control, with an optional error line under the control.
-fn field(ui: &mut Ui, label: &str, error: Option<&str>, control: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(110.0, 24.0), Sense::hover());
-        let col = if error.is_some() { theme::danger() } else { theme::text_dim() };
-        ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), col);
-        ui.vertical(|ui| {
-            control(ui);
-            if let Some(e) = error {
-                ui.label(RichText::new(e).size(11.0).color(theme::danger()));
-            }
-        });
-    });
-}
-
 fn swatch(ui: &mut Ui, hue: f32, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || selected, theme::anim_time(0.1));
     let p = ui.painter();
-    p.circle_filled(rect.center(), 6.5 + h, theme::hue_color(hue));
     if selected {
-        p.circle_stroke(rect.center(), 9.0, Stroke::new(1.5, theme::text()));
+        p.circle_stroke(rect.center(), 12.0, Stroke::new(2.0, theme::hue_color(hue)));
     }
+    p.circle_filled(rect.center(), 8.0 + 1.0 * h, theme::hue_color(hue));
     resp
 }
 
@@ -447,10 +456,12 @@ fn test_status(ui: &mut Ui, state: &TestState) {
         TestState::Running(stage) => {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
             loading::mini_spinner(ui, rect.center(), 6.0, theme::accent());
-            ui.label(RichText::new(format!("{}…", stage.label())).size(12.0).color(theme::text_dim()));
+            ui.label(RichText::new(format!("{}…", stage.label())).size(12.5).color(theme::text_dim()));
         }
         TestState::Ok(ms) => {
-            ui.label(RichText::new(format!("✔ Connected in {ms} ms")).size(12.0).color(theme::accent()));
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            w::paint_icon(ui.painter(), rect.shrink(2.0), Icon::Check, theme::accent());
+            ui.label(RichText::new(format!("Connected in {ms} ms")).size(12.5).color(theme::accent()));
         }
     }
 }
@@ -475,6 +486,7 @@ mod tests {
         e.profile.auth = AuthMethod::Managed { key: Uuid::new_v4() };
         assert!(e.validated(&keys).is_err(), "unknown managed key");
         assert_eq!(e.profile.port, crate::profile::DEFAULT_PORT);
+        assert_eq!(e.port_text, crate::profile::DEFAULT_PORT.to_string());
     }
 
     #[test]
@@ -484,5 +496,16 @@ mod tests {
         e.use_key(id);
         assert_eq!(e.auth_tab, AuthTab::Managed);
         assert_eq!(e.profile.auth, AuthMethod::Managed { key: id });
+    }
+
+    #[test]
+    fn empty_port_is_an_error_only_when_typed_or_saving() {
+        let mut e = ProfileEditor::new(Profile::new(), true);
+        assert!(!e.port_error());
+        e.profile.port = 0;
+        e.port_text.clear();
+        assert!(!e.port_error(), "not yet");
+        e.tried_save = true;
+        assert!(e.port_error());
     }
 }

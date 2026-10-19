@@ -1,9 +1,10 @@
 //! Small presentational pieces of the SFTP view: titles, toolbar buttons, pane toggles,
-//! the Explorer drop overlay and the connection-failed card.
+//! the Explorer drop overlay, the file table wrapper and the terminal-folder button.
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Id, Rect, Sense, Stroke, Ui, Vec2};
 
-use super::file_list::ListAction;
+use super::file_list::{self, ListAction, ListState, ROW_H, Row, Side};
+use super::loading;
 use crate::theme;
 
 pub fn pane_title(ui: &mut Ui, text: &str, color: Color32) {
@@ -123,18 +124,58 @@ pub fn drop_overlay(ui: &Ui, rect: Rect, cwd: &str, t: f32) {
     p.galley(c + Vec2::new(-galley.size().x / 2.0, 20.0), galley, theme::accent());
 }
 
-pub fn failed_card(ui: &mut Ui, rect: Rect, err: &str) -> bool {
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-    let mut clicked = false;
-    egui::Frame::new().fill(theme::surface()).corner_radius(theme::RADIUS).inner_margin(16.0).show(&mut child, |ui| {
-        ui.set_min_size(rect.size() - Vec2::splat(32.0));
-        ui.vertical_centered(|ui| {
-            ui.add_space(rect.height() * 0.3);
-            ui.label(egui::RichText::new("SFTP connection failed").strong().color(theme::danger()));
-            ui.label(egui::RichText::new(err).color(theme::text_dim()).size(12.0));
-            ui.add_space(8.0);
-            clicked = ui.button("⟳  Reconnect").clicked();
-        });
-    });
-    clicked
+/// The file table, plus skeleton rows while a first listing loads. Rows of the previous
+/// folder (`stale`) stay visible, dimmed and inert, until the new listing arrives.
+pub fn listing(ui: &mut Ui, id: Id, side: Side, rows: &[Row], list: &mut ListState, transfer_label: &str, (stale, loading): (bool, bool)) -> Vec<ListAction> {
+    let dim = ui.ctx().animate_bool_with_time(id.with("stale"), stale, theme::anim_time(0.15));
+    let skeleton = ui.ctx().animate_bool_with_time(id.with("skeleton"), loading && rows.is_empty(), theme::anim_time(0.2));
+    let area = ui.available_rect_before_wrap();
+    let actions = ui
+        .scope(|ui| {
+            ui.multiply_opacity(1.0 - 0.55 * dim);
+            if stale {
+                ui.disable();
+            }
+            file_list::show(ui, side, rows, list, transfer_label)
+        })
+        .inner;
+    if skeleton > 0.0 {
+        let body = Rect::from_min_max(area.min + Vec2::new(0.0, file_list::HEADER_H + ROW_H), area.max);
+        loading::skeleton_rows(ui, body, ROW_H, skeleton);
+    }
+    if stale { Vec::new() } else { actions }
+}
+
+/// Memory key holding the `view_n` of the SFTP view the pointer was last over.
+pub fn last_active_id() -> Id {
+    Id::new("sftp_last_active_view")
+}
+
+/// Small painted "terminal prompt -> folder" button; spins while the lookup runs.
+pub fn terminal_jump_button(ui: &mut Ui, busy: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), egui::Sense::click());
+    let resp = resp.on_hover_text("Go to the folder of the terminal next to this pane");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Go to terminal folder"));
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let p = ui.painter();
+    if t > 0.0 {
+        p.rect_filled(rect, egui::CornerRadius::same(6), theme::surface_3().gamma_multiply(t));
+    }
+    let col = theme::text_dim().lerp_to_gamma(theme::accent(), t);
+    let stroke = egui::Stroke::new(1.5, col);
+    let box_ = egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 12.0));
+    p.rect_stroke(box_, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    if busy {
+        let a = ui.input(|i| i.time) as f32 * 6.0;
+        let c = box_.center();
+        p.line_segment([c, c + egui::vec2(a.cos(), a.sin()) * 4.0], stroke);
+        ui.ctx().request_repaint();
+    } else {
+        // ">_" prompt glyph drawn with lines.
+        let o = box_.left_top() + egui::vec2(3.5, 3.0);
+        p.line_segment([o, o + egui::vec2(3.0, 3.0)], stroke);
+        p.line_segment([o + egui::vec2(3.0, 3.0), o + egui::vec2(0.0, 6.0)], stroke);
+        p.line_segment([o + egui::vec2(5.0, 6.5), o + egui::vec2(9.0, 6.5)], stroke);
+    }
+    resp.clicked() && !busy
 }

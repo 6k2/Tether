@@ -16,4 +16,5 @@ pub mod ssh;
 pub mod theme;
 pub mod themes;
 pub mod ui;
+pub mod updater;
 pub mod workspace;

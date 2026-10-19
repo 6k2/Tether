@@ -1,5 +1,10 @@
 //! Host list: quick connect, search, a folder tree (drag hosts and folders around,
 //! collapse with animation, rename in place), an "Archived" drawer and saved workspaces.
+//! Right-click anywhere (empty space, a folder, a host, a workspace) for its actions.
+
+mod menu;
+mod paint;
+mod workspaces;
 
 use eframe::egui::{self, Align2, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use egui::collapsing_header::CollapsingState;
@@ -11,6 +16,11 @@ use crate::folders::{Folder, FolderStore};
 use crate::keybindings::{self, Action};
 use crate::profile::{Profile, ProfileStore};
 use crate::theme;
+use menu::host_menu;
+pub use paint::logo;
+use paint::{Glyph, badge, chevron, folder_icon, glyph_button, mini_button, new_split_button, plus, section_header};
+pub use workspaces::WorkspaceInfo;
+use workspaces::WorkspacePanel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OpenKind {
@@ -29,7 +39,10 @@ pub enum SidebarAction {
     Delete(Uuid),
     ForgetHostKey(Uuid),
     QuickConnect(Profile),
-    SaveWorkspace,
+    /// Save the open layout under this name (replacing one with the same name).
+    SaveWorkspace(String),
+    OverwriteWorkspace(String),
+    RenameWorkspace(String, String),
     RestoreWorkspace(String),
     DeleteWorkspace(String),
     /// Create a folder (inside the given one) and start renaming it.
@@ -41,6 +54,8 @@ pub enum SidebarAction {
     MoveHost(Uuid, Option<Uuid>),
     MoveFolder(Uuid, Option<Uuid>),
     Archive(Uuid, bool),
+    /// Archive every host in this folder and its sub-folders.
+    ArchiveFolder(Uuid),
     SetArchiveOpen(bool),
     OpenKeys,
     Import,
@@ -57,7 +72,9 @@ enum Drag {
 pub struct SidebarData<'a> {
     pub store: &'a ProfileStore,
     pub folders: &'a FolderStore,
-    pub workspaces: &'a [String],
+    pub workspaces: &'a [WorkspaceInfo],
+    /// Whether any tab is open (there is a layout to save).
+    pub has_tabs: bool,
     pub is_live: &'a dyn Fn(Uuid) -> bool,
 }
 
@@ -71,6 +88,7 @@ pub struct Sidebar {
     renaming: Option<(Uuid, String)>,
     focus_quick: bool,
     focus_search: bool,
+    workspaces: WorkspacePanel,
 }
 
 impl Default for Sidebar {
@@ -83,6 +101,7 @@ impl Default for Sidebar {
             renaming: None,
             focus_quick: false,
             focus_search: false,
+            workspaces: WorkspacePanel::default(),
         }
     }
 }
@@ -124,7 +143,7 @@ impl Sidebar {
         }
         ui.add_space(10.0);
 
-        let bottom_h = 40.0 + data.workspaces.len().min(5) as f32 * 26.0;
+        let bottom_h = self.workspaces.height(data.workspaces);
         egui::ScrollArea::vertical().max_height(ui.available_height() - bottom_h).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if data.store.profiles.is_empty() && data.folders.folders.is_empty() {
@@ -138,17 +157,23 @@ impl Sidebar {
             if new_host_row(ui) {
                 actions.push(SidebarAction::New(None));
             }
-            // Leftover space takes drops to the top level.
+            // Leftover space takes drops to the top level and offers "New…" on right-click.
             let rest = ui.available_rect_before_wrap();
             if rest.height() > 4.0 {
-                let resp = ui.allocate_rect(rest, Sense::hover());
+                let resp = ui.allocate_rect(rest, Sense::click());
                 drop_target(ui, &resp, None, &mut actions, data);
+                resp.context_menu(|ui| self.background_menu(ui, &mut actions));
             }
         });
         drag_ghost(ui, data);
 
-        workspaces(ui, data.workspaces, &mut actions);
+        self.workspaces.show(ui, data.workspaces, data.has_tabs, &mut actions);
         actions
+    }
+
+    /// Starts the inline "Save current layout as…" field.
+    pub fn save_workspace(&mut self) {
+        self.workspaces.start_save();
     }
 
     fn title_row(&mut self, ui: &mut Ui, actions: &mut Vec<SidebarAction>) {
@@ -156,30 +181,14 @@ impl Sidebar {
             logo(ui, 18.0);
             ui.label(egui::RichText::new("tether").size(17.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if glyph_button(ui, Glyph::Plus, &keybindings::hint("New host", Action::NewHost)).clicked() {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let more = glyph_button(ui, Glyph::More, "More");
+                egui::Popup::menu(&more).show(|ui| self.background_menu(ui, actions));
+                let (main, caret) = new_split_button(ui);
+                if main.on_hover_text(keybindings::hint("New host", Action::NewHost)).clicked() {
                     actions.push(SidebarAction::New(None));
                 }
-                if glyph_button(ui, Glyph::NewFolder, &keybindings::hint("New folder", Action::NewFolder)).clicked() {
-                    actions.push(SidebarAction::NewFolder(None));
-                }
-                let more = glyph_button(ui, Glyph::More, "More");
-                egui::Popup::menu(&more).show(|ui| {
-                    ui.set_min_width(190.0);
-                    if ui.button("🔑  Key manager").clicked() {
-                        actions.push(SidebarAction::OpenKeys);
-                    }
-                    if ui.button("⬇  Import hosts…").clicked() {
-                        actions.push(SidebarAction::Import);
-                    }
-                    ui.separator();
-                    if ui.button("▸  Collapse all folders").clicked() {
-                        actions.push(SidebarAction::CollapseAll(true));
-                    }
-                    if ui.button("▾  Expand all folders").clicked() {
-                        actions.push(SidebarAction::CollapseAll(false));
-                    }
-                });
+                egui::Popup::menu(&caret).show(|ui| self.new_menu(ui, actions));
             });
         });
     }
@@ -222,6 +231,7 @@ impl Sidebar {
         let active = data.store.profiles.iter().filter(|p| !p.archived).count();
         let header = section_header(ui, "HOSTS", active, None);
         drop_target(ui, &header, None, actions, data);
+        header.context_menu(|ui| self.background_menu(ui, actions));
         ui.add_space(2.0);
         self.contents(ui, data, None, 0, actions);
 
@@ -252,7 +262,7 @@ impl Sidebar {
             state.set_open(!f.collapsed);
         }
         let count = count_hosts(data, f.id);
-        let header = self.folder_header(ui, f, depth, state.openness(ui.ctx()), count, actions);
+        let header = self.folder_header(ui, f, data, depth, state.openness(ui.ctx()), actions);
         if header.clicked() && self.renaming.as_ref().is_none_or(|(r, _)| *r != f.id) {
             state.set_open(f.collapsed);
             actions.push(SidebarAction::SetCollapsed(f.id, !f.collapsed));
@@ -270,7 +280,8 @@ impl Sidebar {
         });
     }
 
-    fn folder_header(&mut self, ui: &mut Ui, f: &Folder, depth: usize, openness: f32, count: usize, actions: &mut Vec<SidebarAction>) -> egui::Response {
+    fn folder_header(&mut self, ui: &mut Ui, f: &Folder, data: &SidebarData, depth: usize, openness: f32, actions: &mut Vec<SidebarAction>) -> egui::Response {
+        let count = count_hosts(data, f.id);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), FOLDER_H), Sense::click_and_drag());
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, &f.name));
         if resp.drag_started() {
@@ -331,33 +342,13 @@ impl Sidebar {
                 actions.push(SidebarAction::New(Some(f.id)));
             }
             let more = mini_button(ui, resp.id.with("more"), Pos2::new(rect.right() - 13.0, rect.center().y), Glyph::More, hover, "Folder actions");
-            egui::Popup::menu(&more).show(|ui| self.folder_menu(ui, f, actions));
+            egui::Popup::menu(&more).show(|ui| self.folder_menu(ui, f, data, actions));
         }
         if hover > 0.5 && ui.input(|i| i.key_pressed(egui::Key::F2)) {
             self.renaming = Some((f.id, f.name.clone()));
         }
-        resp.context_menu(|ui| self.folder_menu(ui, f, actions));
+        resp.context_menu(|ui| self.folder_menu(ui, f, data, actions));
         resp
-    }
-
-    fn folder_menu(&mut self, ui: &mut Ui, f: &Folder, actions: &mut Vec<SidebarAction>) {
-        ui.set_min_width(180.0);
-        if ui.button("+  New host here").clicked() {
-            actions.push(SidebarAction::New(Some(f.id)));
-        }
-        if ui.button("📁  New subfolder").clicked() {
-            actions.push(SidebarAction::NewFolder(Some(f.id)));
-        }
-        ui.separator();
-        if ui.button("✏  Rename").clicked() {
-            self.renaming = Some((f.id, f.name.clone()));
-        }
-        if f.parent.is_some() && ui.button("⤴  Move to top level").clicked() {
-            actions.push(SidebarAction::MoveFolder(f.id, None));
-        }
-        if ui.button(egui::RichText::new("🗑  Delete folder").color(theme::danger())).on_hover_text("Its hosts and sub-folders move up a level").clicked() {
-            actions.push(SidebarAction::DeleteFolder(f.id));
-        }
     }
 
     fn archive(&mut self, ui: &mut Ui, data: &SidebarData, archived: Vec<&Profile>, actions: &mut Vec<SidebarAction>) {
@@ -520,32 +511,6 @@ fn drag_ghost(ui: &Ui, data: &SidebarData) {
     painter.galley(Pos2::new(rect.left() + 26.0, rect.center().y - galley.size().y / 2.0), galley, theme::text());
 }
 
-/// "HOSTS · 12" row; with `openness` it is a collapsible header with a chevron.
-fn section_header(ui: &mut Ui, title: &str, count: usize, openness: Option<f32>) -> egui::Response {
-    let sense = if openness.is_some() { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), sense);
-    let p = ui.painter();
-    let mut x = rect.left() + 2.0;
-    if let Some(o) = openness {
-        let hover = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), theme::anim_time(0.12));
-        chevron(p, Pos2::new(x + 5.0, rect.center().y), o, theme::text_faint().lerp_to_gamma(theme::text(), hover));
-        x += 14.0;
-    }
-    let galley = p.layout_no_wrap(title.to_string(), FontId::proportional(10.5), theme::text_faint());
-    let w = galley.size().x;
-    p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, theme::text_faint());
-    if count > 0 {
-        p.text(
-            Pos2::new(x + w + 6.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            count.to_string(),
-            FontId::proportional(10.5),
-            theme::text_faint().gamma_multiply(0.7),
-        );
-    }
-    resp
-}
-
 fn empty_folder(ui: &mut Ui, depth: usize) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
     let x = rect.left() + depth as f32 * INDENT + 40.0;
@@ -556,44 +521,6 @@ fn empty_folder(ui: &mut Ui, depth: usize) {
         FontId::proportional(11.5),
         theme::text_faint().gamma_multiply(0.8),
     );
-}
-
-fn workspaces(ui: &mut Ui, names: &[String], actions: &mut Vec<SidebarAction>) {
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("WORKSPACES").size(10.5).strong().color(theme::text_faint()));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new("💾").frame(false)).on_hover_text("Save current layout as workspace").clicked() {
-                actions.push(SidebarAction::SaveWorkspace);
-            }
-        });
-    });
-    egui::ScrollArea::vertical().id_salt("ws").max_height(130.0).show(ui, |ui| {
-        for name in names {
-            let r = ui.add(egui::Button::new(format!("›  {name}")).frame(false));
-            if r.clicked() {
-                actions.push(SidebarAction::RestoreWorkspace(name.clone()));
-            }
-            r.context_menu(|ui| {
-                if ui.button(egui::RichText::new("🗑  Delete workspace").color(theme::danger())).clicked() {
-                    actions.push(SidebarAction::DeleteWorkspace(name.clone()));
-                }
-            });
-        }
-    });
-}
-
-/// The tether mark: two linked rounded diamonds.
-pub fn logo(ui: &mut Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let p = ui.painter();
-    let c = rect.center();
-    let r = size * 0.32;
-    for (dx, color) in [(-size * 0.14, theme::accent()), (size * 0.14, theme::blue())] {
-        let center = c + Vec2::new(dx, 0.0);
-        let pts = vec![center + Vec2::new(0.0, -r), center + Vec2::new(r, 0.0), center + Vec2::new(0.0, r), center + Vec2::new(-r, 0.0)];
-        p.add(egui::Shape::convex_polygon(pts, color.gamma_multiply(0.18), Stroke::new(size * 0.08, color)));
-    }
 }
 
 /// Dashed "add host" row at the end of the list; fills with the accent on hover.
@@ -697,134 +624,4 @@ fn host_row(ui: &mut Ui, p: &Profile, live: bool, depth: usize, path: Option<&st
     }
     resp.context_menu(|ui| host_menu(ui, p, data, actions));
     resp
-}
-
-fn host_menu(ui: &mut Ui, p: &Profile, data: &SidebarData, actions: &mut Vec<SidebarAction>) {
-    ui.set_min_width(200.0);
-    if ui.button("⌨  Open terminal").clicked() {
-        actions.push(SidebarAction::Open(p.id, OpenKind::Terminal));
-    }
-    if ui.button("📁  Open SFTP").clicked() {
-        actions.push(SidebarAction::Open(p.id, OpenKind::Sftp));
-    }
-    if ui.button("🗗  Terminal + SFTP").clicked() {
-        actions.push(SidebarAction::Open(p.id, OpenKind::Both));
-    }
-    ui.separator();
-    if ui.button("✏  Edit").clicked() {
-        actions.push(SidebarAction::Edit(p.id));
-    }
-    if ui.button("⧉  Duplicate").clicked() {
-        actions.push(SidebarAction::Duplicate(p.id));
-    }
-    ui.menu_button("📂  Move to", |ui| {
-        ui.set_min_width(180.0);
-        if ui.add_enabled(p.folder.is_some(), egui::Button::new("Top level")).clicked() {
-            actions.push(SidebarAction::MoveHost(p.id, None));
-        }
-        let tree = data.folders.flattened();
-        if !tree.is_empty() {
-            ui.separator();
-        }
-        for (id, depth) in tree {
-            let name = data.folders.get(id).map(|f| f.name.as_str()).unwrap_or_default();
-            let label = format!("{}{name}", "    ".repeat(depth));
-            if ui.add_enabled(p.folder != Some(id), egui::Button::new(label)).clicked() {
-                actions.push(SidebarAction::MoveHost(p.id, Some(id)));
-            }
-        }
-    });
-    let (label, archive) = if p.archived { ("📤  Unarchive", false) } else { ("📥  Archive", true) };
-    if ui.button(label).clicked() {
-        actions.push(SidebarAction::Archive(p.id, archive));
-    }
-    ui.separator();
-    if ui.button("🔑  Forget host key").on_hover_text("Use after the server was reinstalled; the next connect re-learns its key").clicked() {
-        actions.push(SidebarAction::ForgetHostKey(p.id));
-    }
-    if ui.button(egui::RichText::new("🗑  Delete").color(theme::danger())).clicked() {
-        actions.push(SidebarAction::Delete(p.id));
-    }
-}
-
-// ---- painted bits ---------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-enum Glyph {
-    Plus,
-    NewFolder,
-    More,
-}
-
-fn paint_glyph(p: &egui::Painter, c: Pos2, g: Glyph, col: egui::Color32) {
-    let s = Stroke::new(1.5, col);
-    match g {
-        Glyph::Plus => plus(p, c, 5.0, s),
-        Glyph::More => {
-            for dx in [-5.0, 0.0, 5.0] {
-                p.circle_filled(c + Vec2::new(dx, 0.0), 1.5, col);
-            }
-        }
-        Glyph::NewFolder => {
-            let r = Rect::from_center_size(c + Vec2::new(-1.0, 0.5), Vec2::new(13.0, 10.0));
-            folder_icon(p, r, 0.0, col);
-            plus(p, Pos2::new(r.right() + 1.0, r.bottom() - 1.0), 2.8, Stroke::new(1.4, col));
-        }
-    }
-}
-
-fn glyph_button(ui: &mut Ui, g: Glyph, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-    let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), theme::anim_time(0.1));
-    if h > 0.0 {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), theme::surface_3().gamma_multiply(h));
-    }
-    paint_glyph(ui.painter(), rect.center(), g, theme::text_dim().lerp_to_gamma(theme::text(), h));
-    resp.on_hover_text(tip)
-}
-
-fn mini_button(ui: &mut Ui, id: Id, c: Pos2, g: Glyph, alpha: f32, tip: &str) -> egui::Response {
-    let rect = Rect::from_center_size(c, Vec2::splat(20.0));
-    let resp = ui.interact(rect, id, Sense::click()).on_hover_text(tip);
-    let bg = if resp.hovered() { theme::surface_3() } else { theme::surface_2() };
-    ui.painter().rect_filled(rect, CornerRadius::same(5), bg.gamma_multiply(alpha));
-    paint_glyph(ui.painter(), c, g, theme::text().gamma_multiply(alpha));
-    resp
-}
-
-fn plus(p: &egui::Painter, c: Pos2, r: f32, s: Stroke) {
-    p.line_segment([c - Vec2::new(r, 0.0), c + Vec2::new(r, 0.0)], s);
-    p.line_segment([c - Vec2::new(0.0, r), c + Vec2::new(0.0, r)], s);
-}
-
-/// Chevron rotating from "▸" (0) to "▾" (1).
-fn chevron(p: &egui::Painter, c: Pos2, openness: f32, col: egui::Color32) {
-    let a = openness * std::f32::consts::FRAC_PI_2;
-    let rot = |v: Vec2| Vec2::new(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos());
-    let pts = [Vec2::new(-1.8, -3.6), Vec2::new(2.2, 0.0), Vec2::new(-1.8, 3.6)].map(|v| c + rot(v));
-    p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.5, col)));
-}
-
-/// Folder outline; the flap lifts as it opens.
-fn folder_icon(p: &egui::Painter, r: Rect, openness: f32, col: egui::Color32) {
-    let at = |x: f32, y: f32| Pos2::new(r.left() + x * r.width(), r.top() + y * r.height());
-    let s = Stroke::new(1.4, col);
-    p.rect_filled(Rect::from_min_max(at(0.0, 0.25), at(1.0, 1.0)), CornerRadius::same(2), col.gamma_multiply(0.16));
-    p.add(egui::Shape::line(vec![at(0.0, 0.95), at(0.0, 0.05), at(0.38, 0.05), at(0.5, 0.22), at(1.0, 0.22), at(1.0, 0.95), at(0.0, 0.95)], s));
-    if openness > 0.0 {
-        let lift = 0.25 * openness;
-        p.add(egui::Shape::line(
-            vec![at(0.0, 0.95), at(0.12 + lift * 0.2, 0.45 - lift * 0.3), at(1.0 + lift * 0.1, 0.45 - lift * 0.3), at(1.0, 0.95)],
-            Stroke::new(1.4, col.gamma_multiply(openness)),
-        ));
-    }
-}
-
-fn badge(p: &egui::Painter, right_center: Pos2, n: usize, alpha: f32) {
-    let text = n.to_string();
-    let galley = p.layout_no_wrap(text, FontId::proportional(10.5), theme::text_faint());
-    let w = galley.size().x + 10.0;
-    let rect = Rect::from_center_size(right_center - Vec2::new(w / 2.0 - 4.0, 0.0), Vec2::new(w, 16.0));
-    p.rect_filled(rect, CornerRadius::same(8), theme::surface_3().gamma_multiply(0.7 * alpha));
-    p.galley(rect.center() - galley.size() / 2.0, galley, theme::text_faint().gamma_multiply(alpha));
 }

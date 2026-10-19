@@ -448,6 +448,8 @@ fn about(ui: &mut Ui, s: &mut Settings, st: &mut SectionState) {
         }
     });
     ui.add_space(CARD_GAP);
+    super::update_banner::about_card(ui, s);
+    ui.add_space(CARD_GAP);
     w::card(ui, Some("Keyboard shortcuts"), |ui| {
         ui.label(RichText::new("Change any of them under Keyboard.").size(11.5).color(theme::text_dim()));
         for (i, action) in ABOUT_SHORTCUTS.iter().enumerate() {

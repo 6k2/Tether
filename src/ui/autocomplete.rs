@@ -119,6 +119,11 @@ impl AutoField {
         Self { id, list: Vec::new(), computed_for: None, sel: None, open: false, popup_rect: None }
     }
 
+    /// True while the suggestion list is showing (Enter belongs to it then).
+    pub fn is_open(&self) -> bool {
+        self.open && !self.list.is_empty()
+    }
+
     fn ghost(&self, text: &str) -> Option<String> {
         self.list.get(self.sel.unwrap_or(0)).and_then(|s| suggest::word_ghost(text, s))
     }

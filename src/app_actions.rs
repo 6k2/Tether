@@ -46,11 +46,17 @@ impl TetherApp {
                 self.save_profiles();
                 self.request_open(p, crate::ui::sidebar::OpenKind::Terminal, ctx);
             }
-            SidebarAction::SaveWorkspace => self.save_workspace = Some(String::new()),
+            SidebarAction::SaveWorkspace(name) => self.store_workspace(name, "saved"),
+            SidebarAction::OverwriteWorkspace(name) => self.store_workspace(name, "updated"),
+            SidebarAction::RenameWorkspace(from, to) => match self.workspaces.rename(&from, &to) {
+                Ok(()) => self.toasts.success(format!("Workspace renamed to “{}”", to.trim())),
+                Err(e) => self.toasts.error(format!("{e:#}")),
+            },
             SidebarAction::RestoreWorkspace(name) => self.restore_workspace(&name, ctx),
-            SidebarAction::DeleteWorkspace(name) => {
-                let _ = self.workspaces.remove(&name);
-            }
+            SidebarAction::DeleteWorkspace(name) => match self.workspaces.remove(&name) {
+                Ok(()) => self.toasts.info(format!("Workspace “{name}” deleted")),
+                Err(e) => self.toasts.error(format!("{e:#}")),
+            },
             SidebarAction::NewFolder(parent) => self.new_folder(parent),
             SidebarAction::RenameFolder(id, name) => {
                 self.folders.rename(id, &name);
@@ -104,6 +110,18 @@ impl TetherApp {
                 }
                 self.save_profiles();
             }
+            SidebarAction::ArchiveFolder(id) => {
+                let mut ids = self.folders.descendants(id);
+                ids.insert(id);
+                let mut moved = 0;
+                for p in self.store.profiles.iter_mut().filter(|p| !p.archived && p.folder.is_some_and(|f| ids.contains(&f))) {
+                    p.archived = true;
+                    moved += 1;
+                }
+                self.save_profiles();
+                let name = self.folders.get(id).map(|f| f.name.clone()).unwrap_or_default();
+                self.toasts.info(format!("{moved} host{} from “{name}” archived", if moved == 1 { "" } else { "s" }));
+            }
             SidebarAction::SetArchiveOpen(open) => {
                 self.folders.archive_open = open;
                 self.save_folders();
@@ -120,6 +138,22 @@ impl TetherApp {
     }
 
     /// Creates "New folder" inside `parent` and lets the sidebar rename it in place.
+    /// Saves the open layout as workspace `name` ("Last session" stays app-managed).
+    fn store_workspace(&mut self, name: String, verb: &str) {
+        let name = name.trim().to_string();
+        if name.is_empty() || name == crate::workspace::LAST_SESSION {
+            return;
+        }
+        let Some(layout) = self.layout_specs() else {
+            self.toasts.info("Open a terminal or SFTP tab first: there is no layout to save");
+            return;
+        };
+        match self.workspaces.put(name.clone(), Some(layout)) {
+            Ok(()) => self.toasts.success(format!("Workspace “{name}” {verb}")),
+            Err(e) => self.toasts.error(format!("{e:#}")),
+        }
+    }
+
     pub(super) fn new_folder(&mut self, parent: Option<Uuid>) {
         let id = self.folders.create("New folder", parent);
         if let Some(p) = parent {

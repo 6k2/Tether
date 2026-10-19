@@ -18,7 +18,11 @@ A personal project: the split-pane workspace of Termius plus the SFTP speed of B
 
 ## Install
 
+Download `Tether-Setup-<version>.exe` from [Releases](https://github.com/izLoki/Tether/releases) and run it. No admin rights needed. It adds Start menu and desktop shortcuts. Tether checks for new releases on startup and installs them in one click (*Settings → About → Updates*). Running a newer installer also upgrades in place.
+
 Windows is the main target. Other platforms compile, but they are untested.
+
+### Build from source
 
 ```sh
 git clone https://github.com/izLoki/Tether
@@ -34,6 +38,8 @@ Requires Rust 1.85+ (edition 2024).
 cargo test                               # unit + headless UI tests (screenshots in target/ui-shots/)
 TETHER_E2E=1 cargo test -- --test-threads=1   # against a real server, see tests/e2e_ssh.rs
 ```
+
+To cut a release, bump `version` in `Cargo.toml`, commit, then run `git tag v0.1.2 && git push --tags`. GitHub Actions builds the installer (`installer/tether.iss`, Inno Setup) and publishes it with its `.sha256` and a portable exe. The icon comes from `python assets/make_icon.py`.
 
 Config lives in `%APPDATA%\tether\tether\config\`. Set `TETHER_CONFIG_DIR` to move it.
 

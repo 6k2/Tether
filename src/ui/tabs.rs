@@ -181,8 +181,12 @@ impl egui_dock::TabViewer for Viewer {
                 }
             }
             TabBody::Sftp(view) => {
-                if view.ui(ui) {
+                let out = view.ui(ui);
+                if out.reconnect {
                     self.reconnect.push(tab.uid);
+                }
+                if out.close {
+                    commands::push(AppCommand::CloseTab(tab.uid));
                 }
             }
             TabBody::Editor(view) => {

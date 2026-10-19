@@ -86,8 +86,8 @@ impl Detacher {
             drops.push((None, d));
         }
         if let Some(inner) = main_inner {
-            for (tabs, rect) in take_outside_surfaces(main, content) {
-                self.spawn(tabs, rect.translate(inner.min.to_vec2()));
+            for (tabs, outer) in take_outside_surfaces(ctx, main, content, inner) {
+                self.spawn(tabs, outer);
             }
         }
         let mut closed = Vec::new();
@@ -328,28 +328,54 @@ fn track_drag(ctx: &egui::Context, dock: &DockState<Tab>, dock_id: Id, track: &m
     None
 }
 
-/// Floating dock windows of the main dock that sit mostly outside the app, with their rects.
-fn take_outside_surfaces(main: &mut DockState<Tab>, content: Rect) -> Vec<(Vec<Tab>, Rect)> {
-    let outside: Vec<(SurfaceIndex, Rect)> = main
+/// Floating dock windows of the main dock dragged out of the app, with their outer rects
+/// in screen space. Floating windows left only partly off the app are moved back in.
+///
+/// egui_dock 0.21 never fills `WindowState::rect()` / `dragged()` (they stay
+/// `Rect::NOTHING` / false), so the rect is read from the egui area behind the window.
+fn take_outside_surfaces<T>(ctx: &egui::Context, main: &mut DockState<T>, content: Rect, inner: Rect) -> Vec<(Vec<T>, Rect)> {
+    let (down, released, pointer) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released(), i.pointer.latest_pos()));
+    if down {
+        return Vec::new(); // decide once the drag ends: no flicker mid-drag
+    }
+    let released_at = pointer.filter(|_| released);
+    let windows: Vec<(SurfaceIndex, Rect)> = main
         .iter_surfaces_indexed()
-        .filter_map(|(i, s)| match s {
-            Surface::Window(_, state) if !state.dragged() && geom::outside_fraction(state.rect(), content) >= geom::DETACH_OUTSIDE_FRACTION => {
-                Some((i, state.rect()))
-            }
-            _ => None,
-        })
+        .filter(|(_, s)| matches!(s, Surface::Window(..)))
+        .filter_map(|(i, _)| ctx.memory(|m| m.area_rect(floating_area_id(i))).map(|r| (i, r)))
         .collect();
-    outside
-        .into_iter()
-        .rev()
-        .filter_map(|(i, rect)| match main.remove_surface(i)? {
-            Surface::Window(mut tree, _) => Some((tree_tabs(&mut tree), rect)),
-            _ => None,
-        })
-        .collect()
+    let mut out = Vec::new();
+    // Highest index first, so removing a surface doesn't shift the ones still to visit.
+    for (i, rect) in windows.into_iter().rev() {
+        match geom::floating_verdict(rect, content, released_at) {
+            geom::FloatVerdict::Keep => {}
+            geom::FloatVerdict::PullBack(pos) => {
+                if let Some(state) = main.get_window_state_mut(i) {
+                    state.set_position(pos);
+                }
+            }
+            geom::FloatVerdict::Detach => {
+                let outer = match released_at {
+                    // Dropped by hand: the native title bar lands under the pointer.
+                    Some(p) => geom::spawn_rect(inner.min + p.to_vec2(), rect.size()),
+                    None => rect.translate(inner.min.to_vec2()),
+                };
+                if let Some(Surface::Window(mut tree, _)) = main.remove_surface(i) {
+                    out.push((tree_tabs(&mut tree), outer));
+                }
+            }
+        }
+    }
+    out
 }
 
-fn tree_tabs(tree: &mut Tree<Tab>) -> Vec<Tab> {
+/// The egui area id egui_dock gives the floating window of surface `i`
+/// (`format!("window {surf_index:?}")` in its `show_window_surface`).
+fn floating_area_id(i: SurfaceIndex) -> Id {
+    Id::new(format!("window {i:?}"))
+}
+
+fn tree_tabs<T>(tree: &mut Tree<T>) -> Vec<T> {
     let mut out = Vec::new();
     for node in tree.iter_mut() {
         if let Node::Leaf(leaf) = node {
@@ -367,4 +393,109 @@ fn dock_tabs(mut dock: DockState<Tab>) -> Vec<Tab> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{Event, PointerButton, RawInput, pos2};
+
+    use super::*;
+
+    const SCREEN: Vec2 = vec2(800.0, 600.0);
+    /// Where the app's client area sits on the (virtual) desktop.
+    const INNER_MIN: Pos2 = pos2(100.0, 50.0);
+
+    struct Viewer;
+
+    impl TabViewer for Viewer {
+        type Tab = String;
+        fn id(&mut self, tab: &mut String) -> Id {
+            Id::new(tab.as_str())
+        }
+        fn title(&mut self, tab: &mut String) -> egui::WidgetText {
+            tab.as_str().into()
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, tab: &mut String) {
+            ui.label(tab.as_str());
+        }
+    }
+
+    /// One app frame: the dock with the app's floating-window bounds, then the detach pass.
+    fn frame(ctx: &egui::Context, dock: &mut DockState<String>, events: Vec<Event>) -> Vec<(Vec<String>, Rect)> {
+        let content = Rect::from_min_size(Pos2::ZERO, SCREEN);
+        let raw = RawInput { screen_rect: Some(content), events, ..Default::default() };
+        let mut out = Vec::new();
+        let mut full = ctx.run_ui(raw, |ui| {
+            DockArea::new(dock).window_bounds(geom::floating_bounds(ui.ctx().content_rect())).show_inside(ui, &mut Viewer);
+            out = take_outside_surfaces(ui.ctx(), dock, content, Rect::from_min_size(INNER_MIN, SCREEN));
+        });
+        // No renderer consumes the font atlas here; dropping a non-empty delta panics.
+        full.textures_delta.clear();
+        out
+    }
+
+    fn dock_with_window(pos: Pos2) -> (DockState<String>, SurfaceIndex) {
+        let mut dock = DockState::new(vec!["main".to_string()]);
+        let i = dock.add_window(vec!["float".to_string()]);
+        dock.get_window_state_mut(i).unwrap().set_position(pos).set_size(vec2(300.0, 200.0));
+        (dock, i)
+    }
+
+    fn window_count(dock: &DockState<String>) -> usize {
+        dock.iter_surfaces().filter(|s| matches!(s, Surface::Window(..))).count()
+    }
+
+    #[test]
+    fn floating_window_reads_its_real_rect_and_stays_inside() {
+        let ctx = egui::Context::default();
+        let (mut dock, i) = dock_with_window(pos2(200.0, 150.0));
+        for _ in 0..3 {
+            assert!(frame(&ctx, &mut dock, vec![]).is_empty());
+        }
+        let rect = ctx.memory(|m| m.area_rect(floating_area_id(i))).expect("egui_dock's window area id changed");
+        assert!((rect.min - pos2(200.0, 150.0)).length() < 1.0, "{rect:?}");
+        assert_eq!(window_count(&dock), 1);
+    }
+
+    #[test]
+    fn floating_window_moved_mostly_off_the_app_becomes_native() {
+        let ctx = egui::Context::default();
+        // Before the bounds fix egui clamped this back inside the app.
+        let (mut dock, _) = dock_with_window(pos2(650.0, 150.0));
+        let mut spawned = Vec::new();
+        for _ in 0..3 {
+            spawned.extend(frame(&ctx, &mut dock, vec![]));
+        }
+        assert_eq!(spawned.len(), 1, "exactly one native window");
+        let (tabs, outer) = &spawned[0];
+        assert_eq!(tabs, &vec!["float".to_string()]);
+        assert!((outer.min - (INNER_MIN + vec2(650.0, 150.0))).length() < 1.0, "screen space: {outer:?}");
+        assert_eq!(window_count(&dock), 0);
+        assert_eq!(dock.iter_all_tabs().count(), 1);
+    }
+
+    #[test]
+    fn floating_window_dragged_out_detaches_only_on_release() {
+        let ctx = egui::Context::default();
+        let (mut dock, i) = dock_with_window(pos2(300.0, 150.0));
+        for _ in 0..3 {
+            frame(&ctx, &mut dock, vec![]);
+        }
+        let rect = ctx.memory(|m| m.area_rect(floating_area_id(i))).unwrap();
+        // Grab the empty end of the tab bar.
+        let mut at = pos2(rect.max.x - 20.0, rect.min.y + 10.0);
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&ctx, &mut dock, vec![Event::PointerMoved(at)]);
+        frame(&ctx, &mut dock, vec![button(at, true)]);
+        for _ in 0..12 {
+            at += vec2(50.0, 0.0);
+            assert!(frame(&ctx, &mut dock, vec![Event::PointerMoved(at)]).is_empty(), "nothing happens mid-drag");
+        }
+        let moved = ctx.memory(|m| m.area_rect(floating_area_id(i))).unwrap();
+        assert!(moved.min.x > rect.min.x + 300.0, "the window followed the pointer past the edge: {moved:?}");
+        let spawned = frame(&ctx, &mut dock, vec![button(at, false)]);
+        assert_eq!(spawned.len(), 1);
+        assert!(spawned[0].1.contains(INNER_MIN + at.to_vec2()), "pointer on the new window's title bar");
+        assert_eq!(window_count(&dock), 0);
+    }
 }

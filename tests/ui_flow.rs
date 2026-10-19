@@ -16,8 +16,16 @@ const PROFILES: &str = r#"[
  {"id":"33333333-3333-4333-8333-333333333333","name":"db-replica","group":"Production","host":"10.0.4.40","port":22,"user":"postgres","auth":"Password","hue":30,"pipeline_kb":4096,"remote_start_dir":"","last_used":0}
 ]"#;
 
+const WORKSPACES: &str = r#"{
+ "Last session": {"Leaf": [{"profile_id": "11111111-1111-4111-8111-111111111111", "kind": "Terminal"}]},
+ "Production": {"Split": {"side_by_side": true, "fraction": 0.5,
+   "first": {"Leaf": [{"profile_id": "22222222-2222-4222-8222-222222222222", "kind": "Terminal"}]},
+   "second": {"Leaf": [{"profile_id": "33333333-3333-4333-8333-333333333333", "kind": "Sftp"}, {"profile_id": "22222222-2222-4222-8222-222222222222", "kind": "Sftp"}]}}}
+}"#;
+
 fn harness(config: &std::path::Path) -> Harness<'static, TetherApp> {
     std::fs::write(config.join("profiles.json"), PROFILES).unwrap();
+    std::fs::write(config.join("workspaces.json"), WORKSPACES).unwrap();
     // SAFETY: tests in this file run single-threaded (one #[test] touches the env at a time).
     unsafe { std::env::set_var("TETHER_CONFIG_DIR", config) };
     Harness::builder().with_size(egui::vec2(1360.0, 820.0)).with_max_steps(10_000).wgpu().build_eframe(|cc| TetherApp::new(cc).expect("app init"))
@@ -87,10 +95,68 @@ fn ui_flows() {
     h.get_by_label("Production");
     h.get_by_label("Lab");
 
+    sidebar_menus(&mut h);
+
     if std::env::var_os("TETHER_E2E").is_none() {
         return;
     }
     connected_flow(&mut h);
+}
+
+/// Right-click menus on folders, hosts and workspaces, the "New" dropdown and the
+/// inline "save workspace" field.
+fn sidebar_menus(h: &mut Harness<'_, TetherApp>) {
+    h.get_by_label("Workspace Production").hover();
+    h.run_steps(10);
+    shot(h, "06-sidebar-workspaces");
+
+    h.get_by_label("Production").click_secondary();
+    h.run_steps(10);
+    h.get_by_label_contains("New subfolder");
+    shot(h, "07-folder-menu");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
+
+    h.get_by_label("db-replica").click_secondary();
+    h.run_steps(10);
+    h.get_by_label_contains("Connect terminal");
+    shot(h, "08-host-menu");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
+
+    // Right-click on the empty space below the hosts.
+    let empty = egui::pos2(130.0, 560.0);
+    h.hover_at(empty);
+    h.run_steps(2);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: empty, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        h.run_steps(1);
+    }
+    h.run_steps(10);
+    h.get_by_label_contains("Search hosts");
+    h.get_by_label_contains("Key manager");
+    shot(h, "08b-background-menu");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
+
+    h.get_by_label("New menu").click();
+    h.run_steps(10);
+    h.get_by_label_contains("Import hosts");
+    shot(h, "09-new-menu");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
+
+    h.get_by_label("Workspace Production").click_secondary();
+    h.run_steps(10);
+    h.get_by_label_contains("Overwrite with current layout");
+    shot(h, "10-workspace-menu");
+    h.get_by_label_contains("Delete…").click();
+    h.run_steps(10);
+    h.get_by_label("Delete workspace?");
+    shot(h, "11-workspace-delete");
+    h.get_by_label("Cancel").click();
+    h.run_steps(10);
+    h.get_by_label("Workspace Production");
 }
 
 const TEST_PROFILE: &str = "11111111-1111-4111-8111-111111111111";

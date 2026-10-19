@@ -1,0 +1,64 @@
+name: Release
+
+# Cut a release:  bump `version` in Cargo.toml, commit, then
+#   git tag v0.1.2 && git push --tags
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $crate = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tag -ne $crate) { throw "Tag v$tag does not match Cargo.toml version $crate" }
+          "version=$crate" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --lib
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} installer\tether.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Checksums
+        id: files
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $setup = "installer\Output\Tether-Setup-$v.exe"
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  Tether-Setup-$v.exe" | Out-File -Encoding ascii -NoNewline "$setup.sha256"
+          Copy-Item target\release\tether.exe "tether-$v-portable.exe"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Tether v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            installer/Output/Tether-Setup-${{ steps.version.outputs.version }}.exe
+            installer/Output/Tether-Setup-${{ steps.version.outputs.version }}.exe.sha256
+            tether-${{ steps.version.outputs.version }}-portable.exe

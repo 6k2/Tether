@@ -19,6 +19,48 @@ const TITLE_PROBE_DY: f32 = 16.0;
 /// Where the pointer ends up inside a freshly detached window (roughly on its title bar).
 const GRAB_OFFSET: Vec2 = vec2(70.0, 14.0);
 pub const MIN_WINDOW: Vec2 = vec2(420.0, 260.0);
+/// How far past the app edge in-app floating dock windows may be dragged. egui_dock
+/// clamps them to its window bounds (the app by default), so they could never leave.
+const FLOAT_SLACK: f32 = 8192.0;
+/// A pointer released this close to a floating window was dragging it.
+const GRAB_SLOP: f32 = 32.0;
+
+/// Bounds for the main dock's floating windows: far beyond the app, so they can be
+/// dragged out of it (and then become native windows).
+pub fn floating_bounds(content: Rect) -> Rect {
+    content.expand(FLOAT_SLACK)
+}
+
+/// What to do with an in-app floating dock window once no drag is in progress.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FloatVerdict {
+    Keep,
+    /// Turn it into a native window.
+    Detach,
+    /// Partly off the app but not enough to detach: move it back to this position.
+    PullBack(Pos2),
+}
+
+/// `rect` is the floating window and `content` the app area (same space); `released_at`
+/// is the pointer position when the button was released this frame.
+pub fn floating_verdict(rect: Rect, content: Rect, released_at: Option<Pos2>) -> FloatVerdict {
+    if !rect.is_positive() || !rect.is_finite() {
+        return FloatVerdict::Keep;
+    }
+    let dropped_outside = released_at.is_some_and(|p| !content.contains(p) && rect.expand(GRAB_SLOP).contains(p));
+    if dropped_outside || outside_fraction(rect, content) >= DETACH_OUTSIDE_FRACTION {
+        return FloatVerdict::Detach;
+    }
+    if content.contains_rect(rect) {
+        return FloatVerdict::Keep;
+    }
+    // A window bigger than the app aligns with its top-left corner.
+    let clamp = |v: f32, lo: f32, hi: f32| if hi < lo { lo } else { v.clamp(lo, hi) };
+    FloatVerdict::PullBack(pos2(
+        clamp(rect.min.x, content.min.x, content.max.x - rect.width()),
+        clamp(rect.min.y, content.min.y, content.max.y - rect.height()),
+    ))
+}
 
 /// Share of `rect` (0..=1) that lies outside `bounds`. Degenerate rects count as inside.
 pub fn outside_fraction(rect: Rect, bounds: Rect) -> f32 {
@@ -178,6 +220,39 @@ mod tests {
         assert!(r.contains(p));
         assert_eq!(r.size(), MIN_WINDOW);
         assert!(p.y - r.min.y < 30.0);
+    }
+
+    #[test]
+    fn floating_window_dropped_outside_detaches() {
+        let app = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+        let w = Rect::from_min_size(pos2(800.0, 100.0), vec2(300.0, 200.0));
+        assert!(outside_fraction(w, app) < DETACH_OUTSIDE_FRACTION);
+        // Released with the pointer on it past the right edge: detach, though only a third is out.
+        assert_eq!(floating_verdict(w, app, Some(pos2(1050.0, 110.0))), FloatVerdict::Detach);
+        // Mostly outside: detach even without a release this frame.
+        let far = Rect::from_min_size(pos2(950.0, 100.0), vec2(300.0, 200.0));
+        assert_eq!(floating_verdict(far, app, None), FloatVerdict::Detach);
+    }
+
+    #[test]
+    fn floating_window_inside_stays_and_unrelated_releases_are_ignored() {
+        let app = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+        let w = Rect::from_min_size(pos2(100.0, 100.0), vec2(300.0, 200.0));
+        assert_eq!(floating_verdict(w, app, None), FloatVerdict::Keep);
+        // A release outside the app far from the window says nothing about it.
+        assert_eq!(floating_verdict(w, app, Some(pos2(1200.0, 300.0))), FloatVerdict::Keep);
+        assert_eq!(floating_verdict(Rect::NOTHING, app, Some(pos2(-5.0, 0.0))), FloatVerdict::Keep);
+    }
+
+    #[test]
+    fn floating_window_slightly_out_is_pulled_back() {
+        let app = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+        let w = Rect::from_min_size(pos2(-40.0, 550.0), vec2(300.0, 200.0));
+        assert!(outside_fraction(w, app) < DETACH_OUTSIDE_FRACTION);
+        assert_eq!(floating_verdict(w, app, None), FloatVerdict::PullBack(pos2(0.0, 500.0)));
+        let huge = Rect::from_min_size(pos2(-10.0, 0.0), vec2(1100.0, 200.0));
+        assert_eq!(floating_verdict(huge, app, None), FloatVerdict::PullBack(pos2(0.0, 0.0)));
+        assert!(floating_bounds(app).contains_rect(w.translate(vec2(2000.0, 0.0))));
     }
 
     #[test]

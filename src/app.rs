@@ -28,7 +28,7 @@ use crate::ui::key_manager::KeyManager;
 use crate::ui::settings_view::SettingsView;
 use crate::ui::settings_widgets::{Icon, icon_button};
 use crate::ui::sftp_view::SftpView;
-use crate::ui::sidebar::{OpenKind, Sidebar, SidebarData};
+use crate::ui::sidebar::{OpenKind, Sidebar, SidebarData, WorkspaceInfo};
 use crate::ui::tabs::{Tab, TabBody, Viewer};
 use crate::ui::terminal_view::TerminalView;
 use crate::ui::toast::Toasts;
@@ -64,7 +64,6 @@ pub struct TetherApp {
     key_manager: Option<KeyManager>,
     prompt: Option<Prompt>,
     confirm_delete: Option<Uuid>,
-    save_workspace: Option<String>,
     toasts: Toasts,
     last_layout: Vec<(Uuid, TabKind)>,
     live_profiles: HashSet<Uuid>,
@@ -88,6 +87,7 @@ impl TetherApp {
         let dir = config_dir();
         crate::settings::init(dir.join("settings.json"));
         crate::themes::apply_saved(&cc.egui_ctx);
+        crate::updater::check_on_startup(&cc.egui_ctx);
         let toasts = Toasts::default();
         let mut store = ProfileStore::load(dir.join("profiles.json")).unwrap_or_else(|e| {
             toasts.error(format!("Could not read profiles: {e:#}"));
@@ -123,7 +123,6 @@ impl TetherApp {
             key_manager: None,
             prompt: None,
             confirm_delete: None,
-            save_workspace: None,
             toasts,
             last_layout: Vec::new(),
             live_profiles: HashSet::new(),
@@ -319,6 +318,26 @@ impl TetherApp {
         workspace::capture(&self.dock, |t: &Tab| t.is_persistable().then(|| t.spec()))
     }
 
+    /// Saved layouts as the sidebar shows them (tab count and host names).
+    fn workspace_infos(&self) -> Vec<WorkspaceInfo> {
+        self.workspaces
+            .names()
+            .into_iter()
+            .filter_map(|name| {
+                let tabs = self.workspaces.get(&name)?.tabs();
+                let mut hosts: Vec<String> = Vec::new();
+                for spec in &tabs {
+                    if let Some(p) = self.store.get(spec.profile_id)
+                        && !hosts.iter().any(|h| h == p.display_name())
+                    {
+                        hosts.push(p.display_name().to_string());
+                    }
+                }
+                Some(WorkspaceInfo { name, tabs: tabs.len(), hosts })
+            })
+            .collect()
+    }
+
     fn restore_workspace(&mut self, name: &str, ctx: &egui::Context) {
         let Some(layout) = self.workspaces.get(name).cloned() else { return };
         let restored = workspace::rebuild(&layout, &mut |spec| {
@@ -455,6 +474,7 @@ impl TetherApp {
                     {
                         self.broadcast = !self.broadcast;
                     }
+                    crate::ui::update_banner::top_bar(ui);
                     let hint = [(Action::SplitRight, "split"), (Action::SplitDown, "split down"), (Action::OpenSftp, "files")]
                         .iter()
                         .filter_map(|(a, what)| keybindings::binding(*a).map(|b| format!("{} {what}", b.label())))
@@ -468,10 +488,11 @@ impl TetherApp {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 10 });
-        let names = self.workspaces.names();
+        let workspaces = self.workspace_infos();
         let pool = self.pool.clone();
         let is_live = move |id| pool.has_live(id);
-        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &names, is_live: &is_live };
+        let has_tabs = self.layout_specs().is_some();
+        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live };
         let sidebar = &mut self.sidebar;
         let actions = egui::Panel::left("sidebar")
             .resizable(true)
@@ -499,6 +520,8 @@ impl TetherApp {
             crate::ui::tabs::apply_commands(&mut self.dock, self.rt.handle(), ui.ctx());
             DockArea::new(&mut self.dock)
                 .style(style)
+                // Floating windows may leave the app: `Detacher` turns them into native windows.
+                .window_bounds(crate::ui::detach_geom::floating_bounds(ui.ctx().content_rect()))
                 .show_add_buttons(false)
                 .show_leaf_collapse_buttons(false)
                 .show_leaf_close_all_buttons(false)
@@ -563,7 +586,6 @@ impl TetherApp {
         self.import_modal(ctx);
         self.prompt_modal(ctx);
         self.delete_modal(ctx);
-        self.workspace_modal(ctx);
     }
 
     fn import_modal(&mut self, ctx: &egui::Context) {
@@ -652,33 +674,6 @@ impl TetherApp {
         });
         if close || modal.should_close() {
             self.confirm_delete = None;
-        }
-    }
-
-    fn workspace_modal(&mut self, ctx: &egui::Context) {
-        let Some(name) = &mut self.save_workspace else { return };
-        let (mut save, mut close) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("ws_save")).show(ctx, |ui| {
-            ui.set_width(300.0);
-            ui.heading("Save workspace");
-            let r = ui.add(egui::TextEdit::singleline(name).hint_text("e.g. production").desired_width(f32::INFINITY));
-            r.request_focus();
-            save |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ui.horizontal(|ui| {
-                save |= ui.button("Save").clicked();
-                close |= ui.button("Cancel").clicked();
-            });
-        });
-        if save && !name.trim().is_empty() && name.trim() != LAST_SESSION {
-            let n = name.trim().to_string();
-            match self.workspaces.put(n.clone(), self.layout_specs()) {
-                Ok(()) => self.toasts.success(format!("Workspace “{n}” saved")),
-                Err(e) => self.toasts.error(format!("{e:#}")),
-            }
-            close = true;
-        }
-        if close || modal.should_close() {
-            self.save_workspace = None;
         }
     }
 }

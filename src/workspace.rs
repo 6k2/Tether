@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use egui_dock::{DockState, Node, NodeIndex, Tree};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,6 +39,20 @@ pub enum Layout<T> {
         first: Box<Layout<T>>,
         second: Box<Layout<T>>,
     },
+}
+
+impl<T> Layout<T> {
+    /// Every tab, in tree order.
+    pub fn tabs(&self) -> Vec<&T> {
+        match self {
+            Layout::Leaf(tabs) => tabs.iter().collect(),
+            Layout::Split { first, second, .. } => {
+                let mut out = first.tabs();
+                out.extend(second.tabs());
+                out
+            }
+        }
+    }
 }
 
 /// Captures the main surface of a dock as a plain tree.
@@ -141,6 +155,27 @@ impl Workspaces {
         write_json_atomic(&self.path, &self.map)
     }
 
+    /// Renames a saved workspace. "Last session" is managed by the app and can't be a
+    /// source or target; an existing name is never overwritten.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let to = to.trim();
+        if from == LAST_SESSION || to == LAST_SESSION {
+            bail!("“{LAST_SESSION}” is kept automatically and can't be renamed");
+        }
+        if to.is_empty() {
+            bail!("The name can't be empty");
+        }
+        if from == to {
+            return Ok(());
+        }
+        if self.map.contains_key(to) {
+            bail!("A workspace named “{to}” already exists");
+        }
+        let layout = self.map.remove(from).ok_or_else(|| anyhow!("Workspace “{from}” no longer exists"))?;
+        self.map.insert(to.to_string(), layout);
+        write_json_atomic(&self.path, &self.map)
+    }
+
     pub fn remove(&mut self, name: &str) -> Result<()> {
         self.map.remove(name);
         write_json_atomic(&self.path, &self.map)
@@ -192,6 +227,32 @@ mod tests {
         let ws = Workspaces::load(path);
         assert_eq!(ws.names(), vec![LAST_SESSION.to_string(), "dev".to_string()]);
         assert_eq!(ws.get("dev"), capture(&dock, |t| Some(t.clone())).as_ref());
+    }
+
+    #[test]
+    fn rename_moves_the_layout_and_refuses_clashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ws.json");
+        let (_, dock) = sample();
+        let mut ws = Workspaces::load(path.clone());
+        ws.put("dev".into(), capture(&dock, |t| Some(t.clone()))).unwrap();
+        ws.put("prod".into(), capture(&dock, |t| Some(t.clone()))).unwrap();
+        ws.put(LAST_SESSION.into(), capture(&dock, |t| Some(t.clone()))).unwrap();
+        assert!(ws.rename("dev", "prod").is_err(), "never overwrites");
+        assert!(ws.rename("dev", "  ").is_err());
+        assert!(ws.rename(LAST_SESSION, "kept").is_err());
+        assert!(ws.rename("dev", LAST_SESSION).is_err());
+        ws.rename("dev", " staging ").unwrap();
+        let ws = Workspaces::load(path);
+        assert_eq!(ws.names(), vec![LAST_SESSION.to_string(), "prod".to_string(), "staging".to_string()]);
+    }
+
+    #[test]
+    fn layout_lists_every_tab_in_order() {
+        let (_, dock) = sample();
+        let layout = capture(&dock, |t| Some(t.clone())).unwrap();
+        let kinds: Vec<TabKind> = layout.tabs().iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, vec![TabKind::Terminal, TabKind::Terminal, TabKind::Terminal, TabKind::Sftp]);
     }
 
     #[test]

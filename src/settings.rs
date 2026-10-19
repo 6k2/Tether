@@ -133,6 +133,19 @@ impl Default for SftpSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct UpdateSettings {
+    /// Ask GitHub for a newer release when tether starts (release builds only).
+    pub check_on_startup: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { check_on_startup: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EditorSettings {
     pub font_size: f32,
     pub tab_size: usize,
@@ -158,6 +171,7 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub sftp: SftpSettings,
     pub editor: EditorSettings,
+    pub updates: UpdateSettings,
     /// Lower-case extension (no dot) -> how double-click opens it. Missing = `default_open`.
     pub open_with: BTreeMap<String, OpenWith>,
     pub default_open: OpenWith,

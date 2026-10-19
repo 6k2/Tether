@@ -156,18 +156,19 @@ pub fn show(ui: &mut Ui, area: CodeArea<'_>) -> CodeOutput {
     let char_w = ui.fonts_mut(|f| f.glyph_width(&look.font, '0'));
     let gutter_w = if line_numbers { (digits as f32 * char_w + GUTTER_PAD).min(MAX_GUTTER) } else { NO_GUTTER };
 
+    let prev_cursor = egui::TextEdit::load_state(ui.ctx(), id).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index.0);
     let backdrop = ui.painter().add(Shape::Noop);
     let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, wrap_width: f32| {
         let job = layout_job(ui, buf.as_str(), look, wrap_width);
         ui.fonts_mut(|f| f.layout_job(job))
     };
     let width = if look.wrap { ui.available_width() } else { f32::INFINITY };
+    let margin = egui::Margin { left: gutter_w as i8, right: 12, top: 6, bottom: 6 };
     let out = egui::TextEdit::multiline(text)
         .id(id)
         .font(look.font.clone())
         .code_editor()
-        .frame(egui::Frame::NONE)
-        .margin(egui::Margin { left: gutter_w as i8, right: 12, top: 6, bottom: 6 })
+        .frame(egui::Frame::new().inner_margin(margin))
         .desired_width(width)
         .min_size(ui.available_size())
         .layouter(&mut layouter)
@@ -208,11 +209,19 @@ pub fn show(ui: &mut Ui, area: CodeArea<'_>) -> CodeOutput {
     if line_numbers || gutter_w > 0.0 {
         paint_gutter(ui, galley, origin, clip, gutter_w, &row_lines, cursor_line, line_numbers, &look.font);
     }
+    let has_focus = out.response.has_focus();
+    let cursor_idx = cursor.map(|c| c.index.0);
     if let Some(sel) = &select {
         let r = galley.pos_from_cursor(CCursor::new(sel.start)).translate(origin.to_vec2());
         ui.scroll_to_rect(r.expand2(egui::vec2(gutter_w + 40.0, 40.0)), Some(egui::Align::Center));
+    } else if has_focus
+        && (out.response.changed() || cursor_idx != prev_cursor)
+        && let Some(c) = cursor
+    {
+        let r = galley.pos_from_cursor(c).translate(origin.to_vec2());
+        let clear = Rect::from_min_max(pos2(r.min.x - gutter_w, r.min.y), pos2(r.max.x + 12.0, r.max.y));
+        ui.scroll_to_rect(clear, None);
     }
-    let has_focus = out.response.has_focus();
     CodeOutput {
         changed: out.response.changed(),
         has_focus,

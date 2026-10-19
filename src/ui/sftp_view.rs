@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use eframe::egui::{self, CornerRadius, Id, PointerButton, Rect, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, CornerRadius, Event, Id, Key, PointerButton, Rect, Sense, Stroke, Ui, Vec2};
 
 #[path = "sftp_dialogs.rs"]
 mod dialogs;
@@ -43,20 +43,31 @@ use crate::ssh::sftp::{self, Sftp};
 use crate::ssh::terminal::TerminalHandle;
 use crate::ssh::transfer::{self, Direction, Progress, Transfer, TransferState};
 use crate::theme;
-use dialogs::Dialog;
+use dialogs::{Dialog, TransferItem};
 use session::{Link, RemoteState, Session};
 
 const HEADER_H: f32 = 22.0;
 const GAP: f32 = 8.0;
 const PANE_ANIM: f32 = 0.22;
-/// Room on the path row for the toolbar icons (and the upload button).
-const PATH_ROW_RESERVE: f32 = 96.0;
-const EXTRA_ICON_W: f32 = 28.0;
+const TOOLBAR_W: f32 = 88.0;
+const EXTRA_ICON_W: f32 = 32.0;
 /// Panes narrower than this (mid-animation) are not drawn.
 const MIN_PANE_W: f32 = 24.0;
 
 /// Distinguishes several SFTP tabs (even of the same host) for ids and drop routing.
 static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+
+/// Internal SFTP clipboard populated by `Ctrl+C` / `Copy` inside an SFTP pane.
+#[derive(Clone)]
+struct SftpClipboard {
+    from: Side,
+    local_dir: PathBuf,
+    remote_dir: String,
+    names: Vec<String>,
+    os_seq: u32,
+}
+
+static SFTP_CLIPBOARD: LazyLock<Mutex<Option<SftpClipboard>>> = LazyLock::new(|| Mutex::new(None));
 
 /// How a remote navigation moves through the back / forward history.
 enum NavOp {
@@ -114,6 +125,9 @@ pub struct SftpView {
     transfers: Arc<Mutex<Vec<Transfer>>>,
     next_transfer: u64,
     dialog: Option<Dialog>,
+    /// Tracks whether `Ctrl+V` was already handled on key-down (`Event::Paste` / `Key::V`),
+    /// so the `Key::V` release fallback for `CF_HDROP` never double-pastes.
+    paste_v_down: bool,
     /// Terminal of the same host shown next to this pane (set by the app each frame).
     linked_terminal: Option<TerminalHandle>,
     /// Set by `connect`: what reconnects and "go to terminal folder" need.
@@ -168,6 +182,7 @@ impl SftpView {
             transfers: Arc::default(),
             next_transfer: 0,
             dialog: None,
+            paste_v_down: false,
             linked_terminal: None,
             session: Arc::default(),
             jump: Arc::default(),
@@ -327,8 +342,7 @@ impl SftpView {
     // ---- transfers -------------------------------------------------------------
 
     fn start_transfer(&mut self, direction: Direction, names: Vec<String>) {
-        let Some(sftp) = self.sftp() else { return };
-        if names.is_empty() {
+        if self.sftp().is_none() || names.is_empty() {
             return;
         }
         // Without a visible local pane there is no implied destination: ask for one.
@@ -337,23 +351,176 @@ impl SftpView {
             self.local_navigate(dir);
         }
         let remote_cwd = self.remote_cwd();
+        let mut items = Vec::with_capacity(names.len());
         for name in names {
             if direction == Direction::Download && !transfer::is_safe_local_name(&name) {
                 self.local_error = Some(format!("Refusing unsafe remote file name {name:?}"));
                 continue;
             }
             let (local, remote) = (self.local_cwd.join(&name), sftp::join(&remote_cwd, &name));
-            self.spawn_transfer(sftp.clone(), direction, local, remote, name);
+            items.push(TransferItem { local, remote, name });
         }
+        self.queue_transfers(direction, items);
     }
 
     fn upload_paths(&mut self, paths: Vec<PathBuf>) {
-        let Some(sftp) = self.sftp() else { return };
+        if self.sftp().is_none() || paths.is_empty() {
+            return;
+        }
         let remote_cwd = self.remote_cwd();
+        let mut items = Vec::with_capacity(paths.len());
         for path in paths {
             let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
             let remote = sftp::join(&remote_cwd, &name);
-            self.spawn_transfer(sftp.clone(), Direction::Upload, path, remote, name);
+            items.push(TransferItem { local: path, remote, name });
+        }
+        self.queue_transfers(Direction::Upload, items);
+    }
+
+    fn download_from_dir(&mut self, remote_dir: &str, names: Vec<String>) {
+        if self.sftp().is_none() || names.is_empty() {
+            return;
+        }
+        if !self.show_local {
+            let Some(dir) = rfd::FileDialog::new().set_directory(&self.local_cwd).pick_folder() else { return };
+            self.local_navigate(dir);
+        }
+        let mut items = Vec::with_capacity(names.len());
+        for name in names {
+            if !transfer::is_safe_local_name(&name) {
+                self.local_error = Some(format!("Refusing unsafe remote file name {name:?}"));
+                continue;
+            }
+            let (local, remote) = (self.local_cwd.join(&name), sftp::join(remote_dir, &name));
+            items.push(TransferItem { local, remote, name });
+        }
+        self.queue_transfers(Direction::Download, items);
+    }
+
+    /// Checks whether any item in `items` would replace an existing file/folder at the
+    /// destination. If so, opens a single confirmation modal listing all conflicts.
+    fn queue_transfers(&mut self, direction: Direction, items: Vec<TransferItem>) {
+        if items.is_empty() {
+            return;
+        }
+        let conflicts = match direction {
+            Direction::Upload => {
+                let remote_rows = self.remote.lock().map(|s| s.rows.clone()).unwrap_or_default();
+                transfer_conflicts(direction, &items, &self.local_rows, &remote_rows)
+            }
+            Direction::Download => transfer_conflicts(direction, &items, &self.local_rows, &[]),
+        };
+        if conflicts.is_empty() {
+            self.spawn_transfers(direction, items);
+        } else {
+            self.dialog = Some(Dialog::Replace { direction, items, conflicts });
+        }
+    }
+
+    fn spawn_transfers(&mut self, direction: Direction, items: Vec<TransferItem>) {
+        let Some(sftp) = self.sftp() else { return };
+        for item in items {
+            self.spawn_transfer(sftp.clone(), direction, item.local, item.remote, item.name);
+        }
+    }
+
+    fn copy_selection(&self, side: Side, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        set(&SFTP_CLIPBOARD, |slot| {
+            *slot = Some(SftpClipboard {
+                from: side,
+                local_dir: self.local_cwd.clone(),
+                remote_dir: self.remote_cwd(),
+                names,
+                os_seq: clipboard_seq(),
+            });
+        });
+    }
+
+    fn paste_files(&mut self, pasted_text: Option<&str>) {
+        let current_seq = clipboard_seq();
+        let internal = SFTP_CLIPBOARD.lock().ok().and_then(|s| s.clone());
+        if let Some(clip) = &internal
+            && clip.os_seq == current_seq
+        {
+            self.paste_internal(clip);
+            return;
+        }
+        let os_files = clipboard_files(pasted_text);
+        if !os_files.is_empty() {
+            self.upload_paths(os_files);
+            return;
+        }
+        if let Some(clip) = &internal {
+            self.paste_internal(clip);
+        }
+    }
+
+    fn paste_internal(&mut self, clip: &SftpClipboard) {
+        match clip.from {
+            Side::Local => {
+                let paths: Vec<PathBuf> = clip.names.iter().map(|n| clip.local_dir.join(n)).collect();
+                self.upload_paths(paths);
+            }
+            Side::Remote => {
+                self.download_from_dir(&clip.remote_dir, clip.names.clone());
+            }
+        }
+    }
+
+    /// Handles `Ctrl+V` / `Event::Paste` when no text input or modal is active.
+    /// On Windows, `egui-winit` swallows `Ctrl+V` key-down when `CF_HDROP` (files) is on
+    /// the clipboard without text, but still emits `Key::V` release (`pressed: false`).
+    fn check_paste(&mut self, ui: &Ui, full: Rect) {
+        let path_focused = ui.memory(|m| m.has_focus(self.local_path.id()) || m.has_focus(self.remote_path.id()));
+        let blocked = self.dialog.is_some() || path_focused || ui.ctx().egui_wants_keyboard_input() || ui.ctx().any_popup_open();
+        let active_view = ui.rect_contains_pointer(full)
+            || self.local_list.has_focus()
+            || self.remote_list.has_focus()
+            || ui.ctx().data(|d| d.get_temp::<u64>(last_active_id())).is_none_or(|id| id == self.view_n);
+        if blocked || !active_view {
+            ui.ctx().input(|i| {
+                for e in &i.events {
+                    match e {
+                        Event::Paste(_) | Event::Key { key: Key::V, pressed: true, .. } => self.paste_v_down = true,
+                        Event::Key { key: Key::V, pressed: false, .. } => self.paste_v_down = false,
+                        _ => {}
+                    }
+                }
+            });
+            return;
+        }
+        let mut paste_trigger: Option<Option<String>> = None;
+        ui.ctx().input_mut(|i| {
+            i.events.retain(|e| match e {
+                Event::Paste(text) => {
+                    self.paste_v_down = true;
+                    paste_trigger = Some(Some(text.clone()));
+                    false
+                }
+                Event::Key { key: Key::V, pressed: true, modifiers, .. }
+                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt =>
+                {
+                    self.paste_v_down = true;
+                    paste_trigger = Some(None);
+                    false
+                }
+                Event::Key { key: Key::V, pressed: false, modifiers, .. }
+                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt =>
+                {
+                    if !std::mem::replace(&mut self.paste_v_down, false) {
+                        paste_trigger = Some(None);
+                        return false;
+                    }
+                    true
+                }
+                _ => true,
+            });
+        });
+        if let Some(pasted_text) = paste_trigger {
+            self.paste_files(pasted_text.as_deref());
         }
     }
 
@@ -450,6 +617,7 @@ impl SftpView {
                 transfers_view::show(&mut child, &mut list);
             }
         }
+        self.check_paste(ui, full);
         self.dialogs(ui.ctx());
         ui.allocate_rect(full, Sense::hover());
         action
@@ -632,7 +800,14 @@ impl SftpView {
             if back || forward {
                 self.local_step(back);
             }
-            let width = (ui.available_width() - PATH_ROW_RESERVE).max(80.0);
+            let space = (ui.available_width() - TOOLBAR_W).max(0.0);
+            if space > 0.0 {
+                ui.add_space(space);
+            }
+            toolbar(ui, &mut actions, "Upload selected", "⬆", !self.local_list.selected.is_empty());
+        });
+        ui.horizontal(|ui| {
+            let width = ui.available_width().max(80.0);
             let known = &self.local_known;
             let rank = |q: &str| data::rank_local(known, q);
             let events = self.local_path.show(ui, &cwd, None, width, Some(Suggest { version: self.local_version, rank: &rank }));
@@ -647,7 +822,6 @@ impl SftpView {
                     PathEvent::Prefetch(_) => {}
                 }
             }
-            toolbar(ui, &mut actions, "Upload selected", "⬆", !self.local_list.selected.is_empty());
         });
         loading_bar(ui, self.base_id().with("local_loading"), self.local_loading);
         if let Some(e) = &self.local_error {
@@ -678,8 +852,23 @@ impl SftpView {
             if back || forward {
                 self.step(Side::Remote, back);
             }
-            let extra = if self.show_local { 1.0 } else { 2.0 } * EXTRA_ICON_W;
-            let width = (ui.available_width() - PATH_ROW_RESERVE - extra).max(80.0);
+            let extra_buttons = usize::from(self.linked_terminal.is_some()) + usize::from(!self.show_local);
+            let right_w = TOOLBAR_W + extra_buttons as f32 * EXTRA_ICON_W;
+            let space = (ui.available_width() - right_w).max(0.0);
+            if space > 0.0 {
+                ui.add_space(space);
+            }
+            if self.linked_terminal.is_some() && terminal_jump_button(ui, self.jumping.load(Ordering::Relaxed)) {
+                self.jump_to_terminal();
+            }
+            toolbar(ui, &mut actions, "Download selected", "⬇", !self.remote_list.selected.is_empty());
+            if !self.show_local && icon_button(ui, "⬆", "Upload files…") {
+                let picked = rfd::FileDialog::new().set_directory(&self.local_cwd).pick_files().unwrap_or_default();
+                self.upload_paths(picked);
+            }
+        });
+        ui.horizontal(|ui| {
+            let width = ui.available_width().max(80.0);
             let events = {
                 let cache = self.cache.clone();
                 let guard = cache.lock().ok();
@@ -693,14 +882,6 @@ impl SftpView {
                     PathEvent::NeedListing(dir) => self.remote_completion_listing(dir, &cwd, &rows),
                     PathEvent::Prefetch(dir) => self.remote_prefetch(dir),
                 }
-            }
-            if self.linked_terminal.is_some() && terminal_jump_button(ui, self.jumping.load(Ordering::Relaxed)) {
-                self.jump_to_terminal();
-            }
-            toolbar(ui, &mut actions, "Download selected", "⬇", !self.remote_list.selected.is_empty());
-            if !self.show_local && icon_button(ui, "⬆", "Upload files…") {
-                let picked = rfd::FileDialog::new().set_directory(&self.local_cwd).pick_files().unwrap_or_default();
-                self.upload_paths(picked);
             }
         });
         loading_bar(ui, self.base_id().with("remote_loading"), loading || self.is_opening());
@@ -735,6 +916,8 @@ impl SftpView {
             (Side::Remote, ListAction::Up) => self.remote_navigate(sftp::parent(&self.remote_cwd())),
             (Side::Local, ListAction::Transfer(n)) => self.start_transfer(Direction::Upload, n),
             (Side::Remote, ListAction::Transfer(n)) => self.start_transfer(Direction::Download, n),
+            (_, ListAction::Copy(names)) => self.copy_selection(side, names),
+            (_, ListAction::Paste) => self.paste_files(None),
             (Side::Local, ListAction::Refresh) => self.refresh_local(),
             (Side::Remote, ListAction::Refresh) => self.remote_go(NavOp::Reload),
             (_, ListAction::NewFolder) => self.dialog = Some(Dialog::NewFolder { side, name: String::new() }),
@@ -744,6 +927,111 @@ impl SftpView {
             (Side::Remote, ListAction::CopyPath(n)) => ctx.copy_text(sftp::join(&self.remote_cwd(), &n)),
         }
     }
+}
+
+/// Returns the deduplicated list of file/folder names in `items` that already exist at the destination.
+fn transfer_conflicts(direction: Direction, items: &[TransferItem], local_rows: &[Row], remote_rows: &[Row]) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    for item in items {
+        let exists = match direction {
+            Direction::Upload => remote_rows.iter().any(|r| r.name == item.name),
+            Direction::Download => local_rows.iter().any(|r| r.name == item.name) || item.local.exists(),
+        };
+        if exists && !conflicts.contains(&item.name) {
+            conflicts.push(item.name.clone());
+        }
+    }
+    conflicts
+}
+
+/// Reads file paths from the OS clipboard (`CF_HDROP` on Windows) or from pasted text paths.
+fn clipboard_files(pasted_text: Option<&str>) -> Vec<PathBuf> {
+    let files = os_clipboard_files();
+    if !files.is_empty() {
+        return files;
+    }
+    pasted_text.map(parse_clipboard_paths).unwrap_or_default()
+}
+
+fn parse_clipboard_paths(text: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cleaned = trimmed.strip_prefix("file:///").or_else(|| trimmed.strip_prefix("file://")).unwrap_or(trimmed);
+        let path = PathBuf::from(cleaned);
+        if !path.is_absolute() || !path.exists() {
+            return Vec::new();
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+#[cfg(windows)]
+fn clipboard_seq() -> u32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+#[cfg(not(windows))]
+fn clipboard_seq() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+fn os_clipboard_files() -> Vec<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const CF_HDROP: u32 = 15;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn OpenClipboard(new_owner: *mut core::ffi::c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> *mut core::ffi::c_void;
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn DragQueryFileW(hdrop: *mut core::ffi::c_void, file: u32, buf: *mut u16, cch: u32) -> u32;
+    }
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 || OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let handle = GetClipboardData(CF_HDROP);
+        if !handle.is_null() {
+            let count = DragQueryFileW(handle, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+            for i in 0..count {
+                let len = DragQueryFileW(handle, i, std::ptr::null_mut(), 0);
+                if len > 0 {
+                    let mut buf = vec![0u16; (len + 1) as usize];
+                    let read = DragQueryFileW(handle, i, buf.as_mut_ptr(), len + 1);
+                    if read > 0 {
+                        buf.truncate(read as usize);
+                        let path = PathBuf::from(OsString::from_wide(&buf));
+                        if !path.as_os_str().is_empty() {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+#[cfg(not(windows))]
+fn os_clipboard_files() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 impl Drop for SftpView {
@@ -758,5 +1046,26 @@ impl Drop for SftpView {
                 t.progress.cancel();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn dummy_row(name: &str) -> Row {
+        Row { name: name.into(), is_dir: false, is_link: false, size: 10, mtime: 0 }
+    }
+
+    #[test]
+    fn detects_single_and_bulk_transfer_conflicts() {
+        let items = vec![
+            TransferItem { local: PathBuf::from("a.txt"), remote: "/srv/a.txt".into(), name: "a.txt".into() },
+            TransferItem { local: PathBuf::from("b.txt"), remote: "/srv/b.txt".into(), name: "b.txt".into() },
+            TransferItem { local: PathBuf::from("c.txt"), remote: "/srv/c.txt".into(), name: "c.txt".into() },
+        ];
+        let remote_rows = vec![dummy_row("a.txt"), dummy_row("c.txt"), dummy_row("other.txt")];
+        let conflicts = transfer_conflicts(Direction::Upload, &items, &[], &remote_rows);
+        assert_eq!(conflicts, vec!["a.txt".to_string(), "c.txt".to_string()]);
     }
 }

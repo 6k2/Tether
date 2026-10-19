@@ -94,7 +94,7 @@ pub fn apply_commands(dock: &mut DockState<Tab>, rt: &tokio::runtime::Handle, ct
 }
 
 /// Focuses the editor already showing the file, else joins the leaf holding other editors,
-/// else splits the focused leaf (the SFTP pane that opened it) to the right.
+/// else opens it below the whole workspace when already split (or to the right of a single pane).
 fn place_editor(dock: &mut DockState<Tab>, doc: EditorDoc, rt: &tokio::runtime::Handle, ctx: &egui::Context) {
     if let Some(path) = dock.find_tab_from(|t| t.edits(doc.profile.id, &doc.remote_path)) {
         let _ = dock.set_active_tab(path);
@@ -107,6 +107,11 @@ fn place_editor(dock: &mut DockState<Tab>, doc: EditorDoc, rt: &tokio::runtime::
     {
         leaf.append_tab(tab);
         dock.set_focused_node_and_surface(path.node_path());
+        return;
+    }
+    if dock.main_surface().root_node().is_some_and(Node::is_parent) {
+        let [_, new] = dock.main_surface_mut().split_below(egui_dock::NodeIndex::root(), 0.5, vec![tab]);
+        dock.set_focused_node_and_surface(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: new });
         return;
     }
     match dock.focused_leaf() {
@@ -122,6 +127,7 @@ fn place_editor(dock: &mut DockState<Tab>, doc: EditorDoc, rt: &tokio::runtime::
 pub struct Viewer {
     pub inputs: Vec<(u64, Vec<u8>)>,
     pub reconnect: Vec<u64>,
+    pub open_files: Vec<(u64, Vec<String>)>,
     pub focused_uid: Option<u64>,
 }
 
@@ -172,6 +178,9 @@ impl egui_dock::TabViewer for Viewer {
                 let out = view.ui(ui, &tab.profile);
                 if !out.input.is_empty() {
                     self.inputs.push((tab.uid, out.input));
+                }
+                if !out.open_files.is_empty() {
+                    self.open_files.push((tab.uid, out.open_files));
                 }
                 if out.reconnect {
                     self.reconnect.push(tab.uid);

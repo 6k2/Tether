@@ -48,6 +48,18 @@ impl TypeAhead {
         self.buf.clear();
     }
 
+    /// Removes the last character of an active search at `now`; returns true if a character
+    /// was removed.
+    pub fn pop(&mut self, now: f64) -> bool {
+        if self.buf.is_empty() || now - self.last > TIMEOUT {
+            self.buf.clear();
+            return false;
+        }
+        self.buf.pop();
+        self.last = now;
+        true
+    }
+
     /// Opacity (0..1) of the on-screen indicator at `now`.
     pub fn visibility(&self, now: f64) -> f32 {
         if self.buf.is_empty() {

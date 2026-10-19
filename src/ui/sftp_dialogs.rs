@@ -7,8 +7,16 @@ use eframe::egui::{self, Color32};
 
 use super::SftpView;
 use crate::ssh::sftp;
+use crate::ssh::transfer::Direction;
 use crate::theme;
 use crate::ui::file_list::Side;
+
+#[derive(Debug, Clone)]
+pub(super) struct TransferItem {
+    pub local: PathBuf,
+    pub remote: String,
+    pub name: String,
+}
 
 pub(super) enum Dialog {
     NewFolder {
@@ -25,6 +33,12 @@ pub(super) enum Dialog {
     Delete {
         side: Side,
         names: Vec<String>,
+    },
+    /// Confirmation before overwriting existing file(s) during upload or download.
+    Replace {
+        direction: Direction,
+        items: Vec<TransferItem>,
+        conflicts: Vec<String>,
     },
     /// The editor refused a remote file; offer the system app instead.
     OpenRefused {
@@ -58,12 +72,14 @@ impl SftpView {
         let Some(dialog) = self.dialog.take() else { return };
         let mut keep = true;
         let mut confirmed = false;
+        let mut skip_existing = false;
         let mut dialog = dialog;
         // Enter confirms every dialog (Esc closes it, handled by the modal). Read before
         // the text field, which surrenders focus on Enter.
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
         let modal = egui::Modal::new(egui::Id::new("sftp_dialog")).show(ctx, |ui| {
-            ui.set_width(320.0);
+            let width = if matches!(dialog, Dialog::Replace { .. }) { 360.0 } else { 320.0 };
+            ui.set_width(width);
             match &mut dialog {
                 Dialog::NewFolder { name, .. } => {
                     ui.heading("New folder");
@@ -85,6 +101,47 @@ impl SftpView {
                     ui.label(if more > 0 { format!("{preview} and {more} more") } else { preview });
                     ui.colored_label(theme::danger(), "Folders are deleted recursively. This cannot be undone.");
                 }
+                Dialog::Replace { direction, items, conflicts } => {
+                    let target_side = match direction {
+                        Direction::Upload => "remote",
+                        Direction::Download => "local",
+                    };
+                    if conflicts.len() == 1 {
+                        ui.heading(format!("Replace “{}”?", conflicts[0]));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "“{}” already exists in the {target_side} folder. Are you sure you want to replace it?",
+                                conflicts[0]
+                            ))
+                            .color(theme::text_dim()),
+                        );
+                    } else {
+                        ui.heading(format!("Replace {} existing files?", conflicts.len()));
+                        let summary = if items.len() > conflicts.len() {
+                            format!(
+                                "{} of the {} selected items already exist in the {target_side} folder and will be replaced:",
+                                conflicts.len(),
+                                items.len()
+                            )
+                        } else {
+                            format!("The following {} items already exist in the {target_side} folder and will be replaced:", conflicts.len())
+                        };
+                        ui.label(egui::RichText::new(summary).color(theme::text_dim()));
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(theme::surface_2())
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::vertical().max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
+                                    for name in conflicts.iter() {
+                                        ui.label(egui::RichText::new(format!("• {name}")).monospace().size(12.0).color(theme::text()));
+                                    }
+                                });
+                            });
+                    }
+                }
                 Dialog::OpenRefused { name, reason } => {
                     ui.heading(format!("Can't open {name} in the editor"));
                     ui.label(egui::RichText::new(reason.as_str()).color(theme::text_dim()));
@@ -93,14 +150,27 @@ impl SftpView {
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let label = match dialog {
+                let label = match &dialog {
                     Dialog::Delete { .. } => "Delete",
+                    Dialog::Replace { conflicts, .. } => {
+                        if conflicts.len() > 1 {
+                            "Replace all"
+                        } else {
+                            "Replace"
+                        }
+                    }
                     Dialog::OpenRefused { .. } => "Open with system app",
                     Dialog::Rename { .. } => "Rename",
                     Dialog::NewFolder { .. } => "Create",
                 };
-                let color = if matches!(dialog, Dialog::Delete { .. }) { theme::danger() } else { theme::accent() };
+                let color = if matches!(dialog, Dialog::Delete { .. } | Dialog::Replace { .. }) { theme::danger() } else { theme::accent() };
                 confirmed |= ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(color.gamma_multiply(0.75))).clicked();
+                if let Dialog::Replace { items, conflicts, .. } = &dialog
+                    && items.len() > conflicts.len()
+                    && ui.button("Skip existing").clicked()
+                {
+                    skip_existing = true;
+                }
                 if ui.button("Cancel").clicked() {
                     keep = false;
                 }
@@ -111,7 +181,12 @@ impl SftpView {
             keep = false;
         }
         confirmed |= enter && keep && dialog.is_ready();
-        if confirmed {
+        if skip_existing {
+            if let Dialog::Replace { direction, items, conflicts } = dialog {
+                let non_conflicting: Vec<TransferItem> = items.into_iter().filter(|it| !conflicts.contains(&it.name)).collect();
+                self.spawn_transfers(direction, non_conflicting);
+            }
+        } else if confirmed {
             self.run_dialog(dialog);
         } else if keep {
             self.dialog = Some(dialog);
@@ -165,6 +240,9 @@ impl SftpView {
                     Ok(())
                 });
             }
+            Dialog::Replace { direction, items, .. } => {
+                self.spawn_transfers(direction, items);
+            }
             Dialog::OpenRefused { name, .. } => self.open_with_system(name),
         }
     }
@@ -182,5 +260,6 @@ mod tests {
         assert!(rename("b.txt").is_ready());
         assert!(!Dialog::NewFolder { side: Side::Local, name: " ".into() }.is_ready());
         assert!(Dialog::Delete { side: Side::Local, names: vec!["x".into()] }.is_ready());
+        assert!(Dialog::Replace { direction: Direction::Upload, items: Vec::new(), conflicts: vec!["x.txt".into()] }.is_ready());
     }
 }

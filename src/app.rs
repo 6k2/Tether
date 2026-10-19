@@ -309,6 +309,9 @@ impl TetherApp {
         for uid in viewer.reconnect {
             self.reconnect(uid, None, ctx);
         }
+        for (uid, files) in viewer.open_files {
+            self.open_terminal_files(uid, files, ctx);
+        }
     }
 
     // ---- workspaces -------------------------------------------------------------
@@ -533,6 +536,9 @@ impl TetherApp {
             for uid in viewer.reconnect {
                 self.reconnect(uid, None, ui.ctx());
             }
+            for (uid, files) in viewer.open_files {
+                self.open_terminal_files(uid, files, ui.ctx());
+            }
         });
     }
 
@@ -546,6 +552,80 @@ impl TetherApp {
                 }
             }
         }
+    }
+
+    /// Opens files requested from a terminal (`nano <file>`) in the built-in editor.
+    fn open_terminal_files(&mut self, uid: u64, files: Vec<String>, ctx: &egui::Context) {
+        let Some((profile, handle)) = self.all_tabs().find_map(|t| match &t.body {
+            TabBody::Terminal(term) if t.uid == uid => Some((t.profile.clone(), term.handle.clone())),
+            _ => None,
+        }) else {
+            return;
+        };
+        let profile = self.store.get(profile.id).cloned().unwrap_or(profile);
+        let (pool, toasts, ctx) = (self.pool.clone(), self.toasts.clone(), ctx.clone());
+        let osc_cwd = handle.shared.lock().ok().and_then(|s| s.parser.callbacks().cwd.clone());
+        let (age_secs, rows, cols) = handle.probe_facts();
+        self.rt.spawn(async move {
+            let conn = match pool.get(&profile, secret::get(profile.secret_id())).await {
+                Ok(c) => c,
+                Err(e) => {
+                    toasts.error(format!("Could not open file in editor: {e:#}"));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let sftp = match crate::ssh::sftp::Sftp::open(&conn).await {
+                Ok(s) => s,
+                Err(e) => {
+                    toasts.error(format!("Could not open SFTP for editor: {e:#}"));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
+            let cwd = match osc_cwd {
+                Some(c) => c,
+                None => {
+                    let probe = crate::ssh::cwd::Probe { tag: &handle.tag, age_secs, rows, cols };
+                    crate::ssh::cwd::terminal_cwd(&conn, probe).await.unwrap_or_else(|_| home.clone())
+                }
+            };
+            for file in files {
+                let raw_path = if file == "~" {
+                    home.clone()
+                } else if let Some(rest) = file.strip_prefix("~/") {
+                    crate::ssh::sftp::join(&home, rest)
+                } else if file.starts_with('/') {
+                    file
+                } else {
+                    crate::ssh::sftp::join(&cwd, &file)
+                };
+                let remote_path = crate::ui::path_complete::normalize_remote(&raw_path);
+                let read = match crate::remote_edit::read_capped(&sftp, &remote_path, crate::remote_edit::MAX_EDITOR_BYTES).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) if is_no_such_file(&e) => Ok(Vec::new()),
+                    Err(e) => Err(e),
+                };
+                match read {
+                    Ok(bytes) => match crate::remote_edit::decode(&bytes) {
+                        Ok(_) => {
+                            let pipeline_kb = profile.pipeline_kb;
+                            crate::commands::push(crate::commands::AppCommand::OpenEditor(Box::new(crate::commands::EditorDoc {
+                                profile: profile.clone(),
+                                remote_path,
+                                bytes,
+                                sftp: sftp.clone(),
+                                pipeline_kb,
+                            })));
+                        }
+                        Err(r) => toasts.error(format!("Cannot open {remote_path}: {r}")),
+                    },
+                    Err(e) => toasts.error(format!("Cannot open {remote_path}: {e:#}")),
+                }
+            }
+            ctx.request_repaint();
+        });
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
@@ -755,3 +835,13 @@ fn broadcast_frame(ctx: &egui::Context) {
     painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, theme::danger().gamma_multiply(0.4 + 0.4 * pulse)), egui::StrokeKind::Inside);
     ctx.request_repaint_after(std::time::Duration::from_millis(33));
 }
+
+fn is_no_such_file(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<russh_sftp::client::error::Error>(),
+            Some(russh_sftp::client::error::Error::Status(s)) if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile
+        )
+    })
+}
+

@@ -192,7 +192,10 @@ impl PathField {
             .text_color(text_color)
             .margin(egui::Margin::symmetric(8, 4))
             .show(ui);
-        let resp = out.response.response.clone();
+        let mut resp = out.response.response.clone();
+        if !focused && !self.text.is_empty() && out.galley.size().x + 16.0 > resp.rect.width() {
+            resp = resp.on_hover_text(self.text.as_str());
+        }
         let mut anchor = resp.rect;
         if resp.changed() {
             self.cycle = None;

@@ -63,6 +63,8 @@ pub enum ListAction {
     /// Remember how files with this extension (lower-case, no dot; "" = none) open.
     AlwaysOpenWith(String, OpenWith),
     Transfer(Vec<String>),
+    Copy(Vec<String>),
+    Paste,
     Rename(String),
     Delete(Vec<String>),
     CopyPath(String),
@@ -208,6 +210,9 @@ pub fn show(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState, transf
     });
 
     bg.context_menu(|ui| {
+        if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+            actions.push(ListAction::Paste);
+        }
         if ui.add(egui::Button::new("New folder").shortcut_text("F7")).clicked() {
             actions.push(ListAction::NewFolder);
         }
@@ -255,6 +260,12 @@ fn row_menu(ui: &mut Ui, side: Side, row: &Row, i: usize, rows: &[Row], state: &
     }
     if ui.button(transfer_label).clicked() {
         actions.push(ListAction::Transfer(names.clone()));
+    }
+    if ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+        actions.push(ListAction::Copy(names.clone()));
+    }
+    if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+        actions.push(ListAction::Paste);
     }
     if ui.add(egui::Button::new("Rename").shortcut_text("F2")).clicked() {
         actions.push(ListAction::Rename(row.name.clone()));
@@ -312,6 +323,10 @@ fn handle_keyboard(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState,
                 keys.push((*key, *modifiers));
                 false
             }
+            Event::Copy => {
+                keys.push((Key::C, Modifiers::COMMAND));
+                false
+            }
             Event::Text(t) if !held.ctrl && !held.alt => {
                 text.push_str(t);
                 false
@@ -321,11 +336,15 @@ fn handle_keyboard(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState,
         (keys, text, i.time)
     });
     let mut handled = false;
+    let mut typed = false;
     for (key, mods) in keys {
         handled = true;
-        apply_key(side, key, mods, rows, state, actions, scroll_to);
+        if key == Key::Backspace {
+            typed |= state.type_ahead.pop(now) && !state.type_ahead.buffer().is_empty();
+        } else {
+            apply_key(side, key, mods, rows, state, actions, scroll_to);
+        }
     }
-    let mut typed = false;
     for ch in text.chars() {
         typed |= state.type_ahead.push(ch, now);
     }
@@ -344,10 +363,11 @@ fn handle_keyboard(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState,
 
 fn is_nav_key(key: Key, mods: Modifiers) -> bool {
     let plain = !mods.ctrl && !mods.alt && !mods.command;
+    let cmd = (mods.command || mods.ctrl) && !mods.shift && !mods.alt;
     match key {
         Key::ArrowUp | Key::ArrowDown | Key::Home | Key::End | Key::PageUp | Key::PageDown => plain,
         Key::Enter | Key::Backspace | Key::Delete | Key::F2 | Key::F7 => plain && !mods.shift,
-        Key::A => mods.command && !mods.shift && !mods.alt,
+        Key::A | Key::C => cmd,
         _ => false,
     }
 }
@@ -370,8 +390,9 @@ fn apply_key(side: Side, key: Key, mods: Modifiers, rows: &[Row], state: &mut Li
                 actions.push(ListAction::Transfer(state.selected.iter().cloned().collect()));
             }
         }
-        Key::Backspace => actions.push(ListAction::Up),
+        Key::Backspace => {}
         Key::Delete if !state.selected.is_empty() => actions.push(ListAction::Delete(state.selected.iter().cloned().collect())),
+        Key::C if !state.selected.is_empty() => actions.push(ListAction::Copy(state.selected.iter().cloned().collect())),
         Key::F2 => {
             if let Some(row) = state.cursor.and_then(|c| rows.get(c)) {
                 actions.push(ListAction::Rename(row.name.clone()));
@@ -486,7 +507,7 @@ fn parent_row(ui: &mut Ui) -> bool {
     let p = ui.painter();
     file_icons::paint_parent(p, file_icons::icon_rect(pos2(rect.left() + ICON_CX, rect.center().y)), theme::text_dim());
     p.text(pos2(rect.left() + NAME_X, rect.center().y), Align2::LEFT_CENTER, "..", FontId::proportional(NAME_FONT), theme::text_dim());
-    resp.on_hover_text("Parent folder (Backspace)").clicked()
+    resp.on_hover_text("Parent folder (Alt+Up)").clicked()
 }
 
 #[derive(Clone, Copy)]
@@ -656,8 +677,9 @@ mod tests {
         apply_key(Side::Local, Key::Enter, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
         apply_key(Side::Local, Key::Delete, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
         apply_key(Side::Local, Key::Backspace, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
+        apply_key(Side::Local, Key::C, Modifiers::COMMAND, &rows, &mut s, &mut actions, &mut scroll);
         let shown: Vec<String> = actions.iter().map(|a| format!("{a:?}")).collect();
-        assert_eq!(shown, [r#"Open("a")"#, r#"Transfer(["d"])"#, r#"Delete(["d"])"#, "Up"]);
+        assert_eq!(shown, [r#"Open("a")"#, r#"Transfer(["d"])"#, r#"Delete(["d"])"#, r#"Copy(["d"])"#]);
     }
 
     #[test]

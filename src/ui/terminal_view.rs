@@ -58,6 +58,10 @@ pub struct TerminalView {
     connecting_since: Option<f64>,
     /// Stage shown while the connecting screen fades out.
     last_stage: Stage,
+    /// Cursor `(row, col)` when the user started typing on the current shell prompt.
+    prompt_col: Option<(u16, u16)>,
+    /// Characters typed since the last submitted/cancelled line (fallback before echo).
+    typed_line: String,
 }
 
 #[derive(Default)]
@@ -65,6 +69,8 @@ pub struct ViewOutput {
     /// Bytes the user typed this frame (the app routes them, possibly broadcasting).
     pub input: Vec<u8>,
     pub reconnect: bool,
+    /// Remote files the user asked to edit from the shell (e.g. `nano <file>`).
+    pub open_files: Vec<String>,
 }
 
 impl TerminalView {
@@ -82,6 +88,8 @@ impl TerminalView {
             font_dirty_at: None,
             connecting_since: None,
             last_stage: Stage::Connecting,
+            prompt_col: None,
+            typed_line: String::new(),
         }
     }
 
@@ -422,14 +430,33 @@ impl TerminalView {
         let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
         for event in events {
             match event {
-                Event::Text(t) => out.input.extend(keys::encode_text(&t, mods.alt && !mods.ctrl)),
-                Event::Paste(t) => out.input.extend(keys::encode_paste(&t, bracketed)),
+                Event::Text(t) => {
+                    if !mods.ctrl && !mods.alt {
+                        self.mark_prompt_start();
+                        self.typed_line.push_str(&t);
+                    }
+                    out.input.extend(keys::encode_text(&t, mods.alt && !mods.ctrl));
+                }
+                Event::Paste(t) => {
+                    self.mark_prompt_start();
+                    if let Some(last) = t.rsplit(['\n', '\r']).next() {
+                        if t.contains(['\n', '\r']) {
+                            self.typed_line.clear();
+                        }
+                        self.typed_line.push_str(last);
+                    }
+                    out.input.extend(keys::encode_paste(&t, bracketed));
+                }
                 Event::Copy => match self.selected_text() {
                     Some(text) if !text.is_empty() => {
                         ui.ctx().copy_text(text);
                         self.selection = None;
                     }
-                    _ => out.input.push(0x03),
+                    _ => {
+                        self.prompt_col = None;
+                        self.typed_line.clear();
+                        out.input.push(0x03);
+                    }
                 },
                 Event::Cut => out.input.push(0x18),
                 Event::Key { key, pressed: true, modifiers, .. } => {
@@ -437,6 +464,21 @@ impl TerminalView {
                         let page = self.size.0.max(2) as usize - 1;
                         self.scroll = if key == egui::Key::PageUp { self.scroll + page } else { self.scroll.saturating_sub(page) };
                         continue;
+                    }
+                    if matches!(key, egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Tab) {
+                        self.mark_prompt_start();
+                    } else if key == egui::Key::Backspace && !modifiers.ctrl && !modifiers.alt {
+                        self.typed_line.pop();
+                    } else if (modifiers.ctrl || modifiers.command) && matches!(key, egui::Key::C | egui::Key::U) {
+                        self.prompt_col = None;
+                        self.typed_line.clear();
+                    } else if key == egui::Key::Enter && !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command {
+                        if let Some(files) = self.take_nano_command() {
+                            // Cancel the typed command line in the remote shell and open the file(s) in Tether's editor.
+                            out.input.push(0x03);
+                            out.open_files.extend(files);
+                            continue;
+                        }
                     }
                     let font = settings::get().terminal.font_size();
                     let is = |a: Action| !keybindings::is_recording() && keybindings::binding(a).is_some_and(|b| b.matches(key, modifiers));
@@ -455,6 +497,51 @@ impl TerminalView {
         }
     }
 
+    fn mark_prompt_start(&mut self) {
+        if self.prompt_col.is_some() {
+            return;
+        }
+        if let Ok(shared) = self.handle.shared.lock() {
+            let screen = shared.parser.screen();
+            if !screen.alternate_screen() {
+                self.prompt_col = Some(screen.cursor_position());
+            }
+        }
+    }
+
+    /// Reads the command on the current shell prompt line and checks whether it is a
+    /// `nano <file…>` invocation that should open in Tether's built-in editor.
+    fn take_nano_command(&mut self) -> Option<Vec<String>> {
+        let prompt = self.prompt_col.take();
+        let typed = std::mem::take(&mut self.typed_line);
+        let shared = self.handle.shared.lock().ok()?;
+        let screen = shared.parser.screen();
+        if screen.alternate_screen() {
+            return None;
+        }
+        let (cr, cc) = screen.cursor_position();
+        let (_, cols) = screen.size();
+        if let Some((pr, pc)) = prompt
+            && (pr, pc) <= (cr, cols)
+        {
+            let full = screen.contents_between(pr, pc, cr, cols);
+            let before = screen.contents_between(pr, pc, cr, cc.max(pc));
+            let from_prompt = trim_after_cursor(&full, &before);
+            if let Some(files) = parse_nano_command(&from_prompt) {
+                return Some(files);
+            }
+        }
+        let full_row = screen.contents_between(cr, 0, cr, cols);
+        let before_cursor = screen.contents_between(cr, 0, cr, cc);
+        let row_line = trim_after_cursor(&full_row, &before_cursor);
+        if let Some(cmd) = strip_shell_prompt(&row_line)
+            && let Some(files) = parse_nano_command(cmd)
+        {
+            return Some(files);
+        }
+        parse_nano_command(&typed)
+    }
+
     fn selected_text(&self) -> Option<String> {
         let (a, b) = self.selection?;
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
@@ -465,6 +552,150 @@ impl TerminalView {
         let text = shared.parser.screen().contents_between(a.row, a.col, b.row, b.col);
         Some(text.trim_end().to_string())
     }
+}
+
+/// Keeps the command text up to (and including any single-spaced word after) the cursor,
+/// stopping before any right-aligned prompt (`RPROMPT`) separated by 2+ spaces.
+fn trim_after_cursor(full: &str, before_cursor: &str) -> String {
+    let split_at = before_cursor.len().min(full.len());
+    let (head, tail) = full.split_at(split_at);
+    let tail_keep = match tail.find("  ") {
+        Some(i) => &tail[..i],
+        None => tail,
+    };
+    format!("{head}{tail_keep}").trim().to_string()
+}
+
+/// Strips a shell prompt prefix (`user@host:~$ `, `root@host:# `, `➜  dir `, etc.) from a line.
+pub fn strip_shell_prompt(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if parse_nano_command(trimmed).is_some() {
+        return Some(trimmed);
+    }
+    const MARKERS: [&str; 7] = ["$ ", "# ", "% ", "> ", "❯ ", "» ", "λ "];
+    let mut best_end = None;
+    for m in MARKERS {
+        if let Some(pos) = trimmed.rfind(m) {
+            let end = pos + m.len();
+            if best_end.is_none_or(|b| end > b) {
+                best_end = Some(end);
+            }
+        }
+    }
+    if let Some(end) = best_end {
+        return Some(trimmed[end..].trim_start());
+    }
+    if trimmed.starts_with('➜') {
+        for (idx, _) in trimmed.match_indices("nano ") {
+            if idx == 0 || trimmed.as_bytes()[idx - 1].is_ascii_whitespace() {
+                return Some(&trimmed[idx..]);
+            }
+        }
+    }
+    None
+}
+
+/// Parses a `nano <files…>` command into its file arguments, or `None` when the command
+/// is not `nano`, has no file targets, or uses shell operators/redirections.
+pub fn parse_nano_command(cmd: &str) -> Option<Vec<String>> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let words = split_shell_words(cmd)?;
+    let prog = words.first()?.as_str();
+    if !matches!(prog, "nano" | "/bin/nano" | "/usr/bin/nano" | "tether") {
+        return None;
+    }
+    let mut files = Vec::new();
+    let mut args = words[1..].iter();
+    let mut options_done = false;
+    while let Some(arg) = args.next() {
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                continue;
+            }
+            if matches!(arg.as_str(), "-h" | "--help" | "-V" | "--version") {
+                return None;
+            }
+            if arg.starts_with('+') && arg[1..].chars().all(|c| c.is_ascii_digit() || c == ',' || c == ':') {
+                continue;
+            }
+            if arg.starts_with('-') && arg.len() > 1 {
+                if matches!(
+                    arg.as_str(),
+                    "-C" | "--backupdir" | "-o" | "--operatingdir" | "-r" | "--fill" | "-s" | "--speller" | "-T" | "--tabsize" | "-Q" | "--quotestr" | "-Y" | "--syntax"
+                ) {
+                    let _ = args.next();
+                }
+                continue;
+            }
+        }
+        if !arg.is_empty() {
+            files.push(arg.clone());
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+fn split_shell_words(cmd: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '|' | '&' | ';' | '>' | '<' | '`' | '$' => return None,
+            ' ' | '\t' => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for sc in chars.by_ref() {
+                    if sc == '\'' {
+                        break;
+                    }
+                    cur.push(sc);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(dc) = chars.next() {
+                    if dc == '"' {
+                        break;
+                    }
+                    if dc == '\\' {
+                        if let Some(&next) = chars.peek()
+                            && matches!(next, '"' | '\\' | '$' | '`')
+                        {
+                            cur.push(chars.next().unwrap());
+                            continue;
+                        }
+                    }
+                    if matches!(dc, '$' | '`') {
+                        return None;
+                    }
+                    cur.push(dc);
+                }
+            }
+            '\\' => {
+                in_word = true;
+                cur.push(chars.next()?);
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
 }
 
 /// Fraction of the track above the thumb and the thumb's share of the track,
@@ -709,5 +940,18 @@ mod tests {
         assert_eq!(thumb_span(50, 100, 20).0, 0.5);
         assert_eq!(thumb_span(500, 100, 20).0, 0.0);
         assert_eq!(thumb_span(0, 0, 20), (1.0, 1.0));
+    }
+
+    #[test]
+    fn parses_nano_commands_and_strips_prompts() {
+        assert_eq!(parse_nano_command("nano foo.txt"), Some(vec!["foo.txt".to_string()]));
+        assert_eq!(parse_nano_command("nano -l +10,2 'my file.rs' b.toml"), Some(vec!["my file.rs".to_string(), "b.toml".to_string()]));
+        assert_eq!(parse_nano_command("nano -T 4 config.yaml"), Some(vec!["config.yaml".to_string()]));
+        assert_eq!(parse_nano_command("nano"), None);
+        assert_eq!(parse_nano_command("nano --version"), None);
+        assert_eq!(parse_nano_command("nano foo.txt | cat"), None);
+        assert_eq!(strip_shell_prompt("user@host:~/app$ nano src/main.rs"), Some("nano src/main.rs"));
+        assert_eq!(strip_shell_prompt("root@box:/etc# nano nginx.conf"), Some("nano nginx.conf"));
+        assert_eq!(strip_shell_prompt("➜  project git:(main) nano Cargo.toml"), Some("nano Cargo.toml"));
     }
 }

@@ -738,7 +738,7 @@ impl SftpView {
             (Side::Local, ListAction::Refresh) => self.refresh_local(),
             (Side::Remote, ListAction::Refresh) => self.remote_go(NavOp::Reload),
             (_, ListAction::NewFolder) => self.dialog = Some(Dialog::NewFolder { side, name: String::new() }),
-            (_, ListAction::Rename(old)) => self.dialog = Some(Dialog::Rename { side, new: old.clone(), old }),
+            (_, ListAction::Rename(old)) => self.dialog = Some(Dialog::Rename { side, new: old.clone(), old, selected: false }),
             (_, ListAction::Delete(names)) => self.dialog = Some(Dialog::Delete { side, names }),
             (Side::Local, ListAction::CopyPath(n)) => ctx.copy_text(self.local_cwd.join(n).display().to_string()),
             (Side::Remote, ListAction::CopyPath(n)) => ctx.copy_text(sftp::join(&self.remote_cwd(), &n)),

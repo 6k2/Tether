@@ -208,10 +208,10 @@ pub fn show(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState, transf
     });
 
     bg.context_menu(|ui| {
-        if ui.button("New folder").clicked() {
+        if ui.add(egui::Button::new("New folder").shortcut_text("F7")).clicked() {
             actions.push(ListAction::NewFolder);
         }
-        if ui.button("Refresh").clicked() {
+        if ui.add(egui::Button::new("Refresh").shortcut_text("F5")).clicked() {
             actions.push(ListAction::Refresh);
         }
     });
@@ -256,14 +256,14 @@ fn row_menu(ui: &mut Ui, side: Side, row: &Row, i: usize, rows: &[Row], state: &
     if ui.button(transfer_label).clicked() {
         actions.push(ListAction::Transfer(names.clone()));
     }
-    if ui.button("Rename").clicked() {
+    if ui.add(egui::Button::new("Rename").shortcut_text("F2")).clicked() {
         actions.push(ListAction::Rename(row.name.clone()));
     }
     if ui.button("Copy path").clicked() {
         actions.push(ListAction::CopyPath(row.name.clone()));
     }
     ui.separator();
-    if ui.button(egui::RichText::new("Delete").color(theme::danger())).clicked() {
+    if ui.add(egui::Button::new(egui::RichText::new("Delete").color(theme::danger())).shortcut_text("Del")).clicked() {
         actions.push(ListAction::Delete(names));
     }
 }
@@ -346,7 +346,7 @@ fn is_nav_key(key: Key, mods: Modifiers) -> bool {
     let plain = !mods.ctrl && !mods.alt && !mods.command;
     match key {
         Key::ArrowUp | Key::ArrowDown | Key::Home | Key::End | Key::PageUp | Key::PageDown => plain,
-        Key::Enter | Key::Backspace | Key::Delete => plain && !mods.shift,
+        Key::Enter | Key::Backspace | Key::Delete | Key::F2 | Key::F7 => plain && !mods.shift,
         Key::A => mods.command && !mods.shift && !mods.alt,
         _ => false,
     }
@@ -372,6 +372,12 @@ fn apply_key(side: Side, key: Key, mods: Modifiers, rows: &[Row], state: &mut Li
         }
         Key::Backspace => actions.push(ListAction::Up),
         Key::Delete if !state.selected.is_empty() => actions.push(ListAction::Delete(state.selected.iter().cloned().collect())),
+        Key::F2 => {
+            if let Some(row) = state.cursor.and_then(|c| rows.get(c)) {
+                actions.push(ListAction::Rename(row.name.clone()));
+            }
+        }
+        Key::F7 => actions.push(ListAction::NewFolder),
         Key::A => {
             state.selected = rows.iter().map(|r| r.name.clone()).collect();
         }
@@ -652,6 +658,22 @@ mod tests {
         apply_key(Side::Local, Key::Backspace, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
         let shown: Vec<String> = actions.iter().map(|a| format!("{a:?}")).collect();
         assert_eq!(shown, [r#"Open("a")"#, r#"Transfer(["d"])"#, r#"Delete(["d"])"#, "Up"]);
+    }
+
+    #[test]
+    fn f2_renames_the_cursor_row_and_f7_makes_a_folder() {
+        let rows = rows();
+        let mut s = ListState::default();
+        let mut actions = Vec::new();
+        let mut scroll = None;
+        apply_key(Side::Remote, Key::F2, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
+        assert!(actions.is_empty(), "nothing to rename without a cursor");
+        apply_key(Side::Remote, Key::End, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
+        apply_key(Side::Remote, Key::F2, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
+        apply_key(Side::Remote, Key::F7, Modifiers::NONE, &rows, &mut s, &mut actions, &mut scroll);
+        let shown: Vec<String> = actions.iter().map(|a| format!("{a:?}")).collect();
+        assert_eq!(shown, [r#"Rename("d")"#, "NewFolder"]);
+        assert!(is_nav_key(Key::F2, Modifiers::NONE) && !is_nav_key(Key::F2, Modifiers::CTRL));
     }
 
     #[test]

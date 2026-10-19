@@ -44,6 +44,20 @@ struct Find {
     /// (text revision, query, case) the matches were computed for.
     key: Option<(u64, String, bool)>,
     focus: bool,
+    /// Set once the user steps through results; ←/→ then step too (until they type).
+    browsing: bool,
+}
+
+/// Which way an arrow key steps through find results, if it does: ↑/↓ always, ←/→ only
+/// while browsing (otherwise they move the caret in the query).
+fn arrow_step(key: Key, browsing: bool) -> Option<bool> {
+    match key {
+        Key::ArrowDown => Some(true),
+        Key::ArrowUp => Some(false),
+        Key::ArrowRight if browsing => Some(true),
+        Key::ArrowLeft if browsing => Some(false),
+        _ => None,
+    }
 }
 
 pub struct EditorView {
@@ -378,6 +392,30 @@ impl EditorView {
         child.add_space(8.0);
         let before = self.find.query.clone();
         let find_id = self.find_id();
+        // Arrow keys step through results; taken before the field would move its caret.
+        if child.memory(|m| m.has_focus(find_id)) {
+            let browsing = self.find.browsing;
+            let steps: Vec<bool> = child.input_mut(|i| {
+                let mut steps = Vec::new();
+                i.events.retain(|e| match e {
+                    egui::Event::Key { key, pressed, modifiers, .. } if modifiers.is_none() => match arrow_step(*key, browsing) {
+                        Some(forward) => {
+                            if *pressed {
+                                steps.push(forward);
+                            }
+                            false
+                        }
+                        None => true,
+                    },
+                    _ => true,
+                });
+                steps
+            });
+            for forward in steps {
+                self.step_match(forward);
+                self.find.browsing = true;
+            }
+        }
         let field =
             child.add(egui::TextEdit::singleline(&mut self.find.query).id(find_id).hint_text("Find").desired_width(w - 170.0).font(FontId::proportional(12.5)));
         if std::mem::take(&mut self.find.focus) {
@@ -386,9 +424,11 @@ impl EditorView {
         let (enter, shift) = child.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift));
         if field.lost_focus() && enter {
             self.step_match(!shift);
+            self.find.browsing = true;
             field.request_focus();
         }
         if self.find.query != before {
+            self.find.browsing = false;
             self.find.current = None;
             self.refresh_matches();
             if let Some(m) = self.find.matches.first() {
@@ -410,10 +450,10 @@ impl EditorView {
                 self.find.open = false;
                 self.focus_text = true;
             }
-            if icon_button(ui, "↓", "Next match (Enter)") {
+            if icon_button(ui, "↓", "Next match (Enter, ↓, →)") {
                 self.step_match(true);
             }
-            if icon_button(ui, "↑", "Previous match (Shift+Enter)") {
+            if icon_button(ui, "↑", "Previous match (Shift+Enter, ↑, ←)") {
                 self.step_match(false);
             }
             let case = if self.find.case_sensitive { theme::accent() } else { theme::text_dim() };
@@ -529,5 +569,20 @@ impl TextSel {
     fn current(id: Id, ctx: &egui::Context) -> Option<Range<usize>> {
         let r = egui::TextEdit::load_state(ctx, id)?.cursor.char_range()?.as_sorted_char_range();
         Some(r.start.0..r.end.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertical_arrows_always_step_horizontal_only_while_browsing() {
+        assert_eq!(arrow_step(Key::ArrowDown, false), Some(true));
+        assert_eq!(arrow_step(Key::ArrowUp, false), Some(false));
+        assert_eq!(arrow_step(Key::ArrowRight, false), None, "→ moves the caret while typing");
+        assert_eq!(arrow_step(Key::ArrowRight, true), Some(true));
+        assert_eq!(arrow_step(Key::ArrowLeft, true), Some(false));
+        assert_eq!(arrow_step(Key::A, true), None);
     }
 }

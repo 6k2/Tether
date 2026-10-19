@@ -19,6 +19,8 @@ pub(super) enum Dialog {
         side: Side,
         old: String,
         new: String,
+        /// The name stem is pre-selected on the first frame, like Explorer.
+        selected: bool,
     },
     Delete {
         side: Side,
@@ -31,12 +33,35 @@ pub(super) enum Dialog {
     },
 }
 
+impl Dialog {
+    /// False while a name field is empty or unchanged, so Enter can't submit nothing.
+    fn is_ready(&self) -> bool {
+        match self {
+            Dialog::NewFolder { name, .. } => !name.trim().is_empty(),
+            Dialog::Rename { old, new, .. } => !new.trim().is_empty() && new.trim() != old,
+            _ => true,
+        }
+    }
+}
+
+/// Selects the name without its extension (the whole name for folders and dotfiles).
+fn select_stem(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, name: &str) {
+    let end = name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len());
+    let end = name[..end].chars().count();
+    let mut state = out.state.clone();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
+    state.store(ui.ctx(), out.response.id);
+}
+
 impl SftpView {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.take() else { return };
         let mut keep = true;
         let mut confirmed = false;
         let mut dialog = dialog;
+        // Enter confirms every dialog (Esc closes it, handled by the modal). Read before
+        // the text field, which surrenders focus on Enter.
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
         let modal = egui::Modal::new(egui::Id::new("sftp_dialog")).show(ctx, |ui| {
             ui.set_width(320.0);
             match &mut dialog {
@@ -44,13 +69,14 @@ impl SftpView {
                     ui.heading("New folder");
                     let r = ui.add(egui::TextEdit::singleline(name).hint_text("folder name").desired_width(f32::INFINITY));
                     r.request_focus();
-                    confirmed |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 }
-                Dialog::Rename { new, .. } => {
+                Dialog::Rename { new, selected, .. } => {
                     ui.heading("Rename");
-                    let r = ui.add(egui::TextEdit::singleline(new).desired_width(f32::INFINITY));
-                    r.request_focus();
-                    confirmed |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let out = egui::TextEdit::singleline(new).desired_width(f32::INFINITY).show(ui);
+                    out.response.request_focus();
+                    if !std::mem::replace(selected, true) {
+                        select_stem(ui, &out, new);
+                    }
                 }
                 Dialog::Delete { names, .. } => {
                     ui.heading("Delete permanently?");
@@ -70,18 +96,21 @@ impl SftpView {
                 let label = match dialog {
                     Dialog::Delete { .. } => "Delete",
                     Dialog::OpenRefused { .. } => "Open with system app",
-                    _ => "OK",
+                    Dialog::Rename { .. } => "Rename",
+                    Dialog::NewFolder { .. } => "Create",
                 };
                 let color = if matches!(dialog, Dialog::Delete { .. }) { theme::danger() } else { theme::accent() };
                 confirmed |= ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(color.gamma_multiply(0.75))).clicked();
                 if ui.button("Cancel").clicked() {
                     keep = false;
                 }
+                ui.label(egui::RichText::new("Enter to confirm · Esc to cancel").size(11.0).color(theme::text_faint()));
             });
         });
         if modal.should_close() {
             keep = false;
         }
+        confirmed |= enter && keep && dialog.is_ready();
         if confirmed {
             self.run_dialog(dialog);
         } else if keep {
@@ -100,7 +129,7 @@ impl SftpView {
                 let p = sftp::join(&rcwd, name.trim());
                 self.remote_op(move |s| async move { s.mkdir(&p).await });
             }
-            Dialog::Rename { side: Side::Local, old, new } => {
+            Dialog::Rename { side: Side::Local, old, new, .. } => {
                 let (a, b) = (self.local_cwd.join(old), self.local_cwd.join(new.trim()));
                 // std::fs::rename replaces an existing target on Windows; never do that silently.
                 self.local_op(|| {
@@ -110,7 +139,7 @@ impl SftpView {
                     std::fs::rename(a, b)
                 });
             }
-            Dialog::Rename { side: Side::Remote, old, new } => {
+            Dialog::Rename { side: Side::Remote, old, new, .. } => {
                 let (a, b) = (sftp::join(&rcwd, &old), sftp::join(&rcwd, new.trim()));
                 self.remote_op(move |s| async move { s.rename(&a, &b).await });
             }
@@ -138,5 +167,20 @@ impl SftpView {
             }
             Dialog::OpenRefused { name, .. } => self.open_with_system(name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_only_submits_a_real_name() {
+        let rename = |new: &str| Dialog::Rename { side: Side::Remote, old: "a.txt".into(), new: new.into(), selected: true };
+        assert!(!rename("a.txt").is_ready());
+        assert!(!rename("  ").is_ready());
+        assert!(rename("b.txt").is_ready());
+        assert!(!Dialog::NewFolder { side: Side::Local, name: " ".into() }.is_ready());
+        assert!(Dialog::Delete { side: Side::Local, names: vec!["x".into()] }.is_ready());
     }
 }

@@ -25,6 +25,9 @@ const PULSE_FRAME: Duration = Duration::from_millis(100);
 /// A hook-reported agent counts as gone only once a process sample this much newer
 /// than the hook no longer shows it.
 const HOOK_GRACE: Duration = Duration::from_secs(3);
+/// A finished turn shown this long (tab visible, window focused) counts as seen: the
+/// "Done" badge settles back to idle.
+const DONE_SEEN_AFTER: Duration = Duration::from_secs(4);
 
 /// A local terminal, as the app sees it this frame (borrowed: built every frame).
 pub struct TermInfo<'a> {
@@ -32,8 +35,10 @@ pub struct TermInfo<'a> {
     pub handle: &'a TerminalHandle,
     /// The tab is the active one of its pane.
     pub visible: bool,
-    /// The tab's title, for the panel.
+    /// The tab's host / shell name, for the panel.
     pub label: &'a str,
+    /// The name the user gave the tab, if any.
+    pub custom: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,6 +55,10 @@ pub struct SessionInfo {
     pub state: AgentState,
     pub since: Instant,
     pub message: Option<String>,
+    /// `message` is text a program printed (OSC notification), not from agent hooks.
+    pub message_from_terminal: bool,
+    /// The session's name: the user's tab name, else the agent's title (`agents::title`).
+    pub title: String,
     /// Folder name of the session's working directory, else the tab title.
     pub project: String,
     pub cwd: Option<String>,
@@ -73,10 +82,17 @@ pub struct Alert {
 }
 
 static BADGES: Mutex<Option<HashMap<u64, Badge>>> = Mutex::new(None);
+/// The folder agents reported through their hooks, by tab.
+static CWDS: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
 
 /// The badge of tab `uid`, if an agent runs in it.
 pub fn badge_for(uid: u64) -> Option<Badge> {
     BADGES.lock().ok().and_then(|b| b.as_ref().and_then(|m| m.get(&uid).copied()))
+}
+
+/// The working folder the agent in tab `uid` reported (hooks), if any.
+pub fn agent_cwd(uid: u64) -> Option<String> {
+    CWDS.lock().ok().and_then(|c| c.as_ref().and_then(|m| m.get(&uid).cloned()))
 }
 
 struct Session {
@@ -91,6 +107,8 @@ struct Session {
     cwd: Option<String>,
     label: String,
     visible: bool,
+    /// When the finished turn was first on screen (for [`DONE_SEEN_AFTER`]).
+    done_seen: Option<Instant>,
     ended: bool,
     last_alert: Option<Instant>,
     /// The terminal's raw title and OSC 7 folder as last read (copied only on change).
@@ -112,6 +130,7 @@ impl Session {
             cwd: None,
             label: String::new(),
             visible: false,
+            done_seen: None,
             ended: false,
             last_alert: None,
             seen_title: String::new(),
@@ -213,6 +232,7 @@ impl AgentHub {
     /// Runs once per frame. Returns the sessions that just started needing attention.
     pub fn frame(&mut self, ctx: &egui::Context, terms: Vec<TermInfo<'_>>, now: Instant) -> Vec<Alert> {
         let mut alerts = Vec::new();
+        let focused = ctx.input(|i| i.focused);
         self.drain_inbox(now, &mut alerts);
         let snap = procmon::latest();
         let mut watch = HashMap::new();
@@ -244,18 +264,25 @@ impl AgentHub {
             if let Some(cwd) = seen.cwd {
                 session.seen_cwd = cwd;
             }
-            // The agent's own title ("✳ Fix the login bug") names the task best.
-            let title = crate::ui::agent_badge::clean_title(&session.seen_title).trim();
-            let label = if title.is_empty() || title.eq_ignore_ascii_case("claude code") { t.label } else { title };
-            if session.label != label {
-                session.label = label.to_string();
-            }
             session.visible = t.visible;
             if session.seen_cwd.is_some() && session.hook_kind.is_none() && session.cwd != session.seen_cwd {
                 session.cwd.clone_from(&session.seen_cwd);
             }
             let sample = snap.as_ref().and_then(|s| s.per_tab.get(&t.uid).map(|u| (u.agent, s.at.unwrap_or(now))));
             update_kind(session, sample);
+            if let Some(kind) = session.kind {
+                // The agent's own title ("✳ Fix the login bug") names the task best.
+                let cwd = session.cwd.as_deref().or(session.seen_cwd.as_deref());
+                let label = match t.custom {
+                    Some(name) => name.to_string(),
+                    None => super::title::session_title(kind, Some(&session.seen_title), cwd),
+                };
+                if session.label != label {
+                    session.label = label;
+                }
+            } else if session.label != t.label {
+                session.label = t.label.to_string();
+            }
             let Some(kind) = session.kind else {
                 session.bells = seen.bells;
                 session.notices = seen.notices;
@@ -281,6 +308,7 @@ impl AgentHub {
             }
             let obs = Observation { title_busy: title_activity(Some(kind), &session.seen_title), last_output: seen.last_output };
             transitions.extend(session.tracker.observe(obs, now));
+            transitions.extend(settle_done(session, focused, now));
             for (_, to) in transitions {
                 push_alert(&mut alerts, t.uid, session, to, now);
             }
@@ -306,7 +334,8 @@ impl AgentHub {
     }
 
     fn schedule(&self, ctx: &egui::Context, now: Instant) {
-        let recheck = self.sessions.values().filter(|s| s.kind.is_some()).filter_map(|s| s.tracker.recheck_in(now)).min();
+        let done_fade = self.sessions.values().filter_map(|s| s.done_seen.map(|t| DONE_SEEN_AFTER.saturating_sub(now.saturating_duration_since(t))));
+        let recheck = self.sessions.values().filter(|s| s.kind.is_some()).filter_map(|s| s.tracker.recheck_in(now)).chain(done_fade).min();
         // Animate only while a working badge is actually being painted (last pass).
         let painted = crate::ui::agent_badge::take_pulse_painted();
         let pulsing = painted
@@ -326,15 +355,19 @@ impl AgentHub {
 
     /// Publishes the tab badges when they changed; true if they did.
     fn publish_badges(&mut self) -> bool {
-        let badges = || self.sessions.iter().filter_map(|(uid, s)| s.kind.map(|kind| (*uid, Badge { kind, state: s.tracker.state })));
+        let badges = || self.sessions.iter().filter_map(|(uid, s)| s.kind.map(|kind| (*uid, Badge { kind, state: s.tracker.state }, s.cwd.as_deref())));
         // Order-independent: the map's iteration order is not stable.
         let key = badges().fold(1u64, |acc, b| acc.wrapping_add(hash_of(&b)));
         if key == self.badges_key {
             return false;
         }
-        let map = badges().collect();
+        let map = badges().map(|(uid, b, _)| (uid, b)).collect();
         if let Ok(mut b) = BADGES.lock() {
             *b = Some(map);
+        }
+        let cwds = badges().filter_map(|(uid, _, cwd)| Some((uid, cwd?.to_string()))).collect();
+        if let Ok(mut c) = CWDS.lock() {
+            *c = Some(cwds);
         }
         self.badges_key = key;
         true
@@ -367,6 +400,8 @@ impl AgentHub {
                     state: s.tracker.state,
                     since: s.tracker.since,
                     message: s.tracker.message.clone(),
+                    message_from_terminal: s.tracker.message_from_terminal,
+                    title: s.label.clone(),
                     project: s.project(),
                     cwd: s.cwd.clone(),
                     hooked: s.tracker.hooked,
@@ -391,6 +426,14 @@ impl AgentHub {
         match at {
             Some(i) => list.get((i + 1) % list.len()).copied(),
             None => list.first().copied(),
+        }
+    }
+
+    /// "Mark as read": the session's attention state (done, waiting...) is dealt with.
+    pub fn mark_read(&mut self, uid: u64) {
+        if let Some(s) = self.sessions.get_mut(&uid) {
+            s.tracker.acknowledge(Instant::now());
+            s.done_seen = None;
         }
     }
 
@@ -421,6 +464,20 @@ fn update_kind(session: &mut Session, sample: Option<(Option<AgentKind>, Instant
         session.cwd = None;
     }
     session.kind = kind;
+}
+
+/// A "Done" that has been on screen for a while settles to idle.
+fn settle_done(session: &mut Session, window_focused: bool, now: Instant) -> Option<(AgentState, AgentState)> {
+    if session.tracker.state != AgentState::Done || !(session.visible && window_focused) {
+        session.done_seen = None;
+        return None;
+    }
+    let seen = *session.done_seen.get_or_insert(now);
+    if now.saturating_duration_since(seen) < DONE_SEEN_AFTER {
+        return None;
+    }
+    session.done_seen = None;
+    session.tracker.acknowledge(now)
 }
 
 fn apply_hook(session: &mut Session, msg: &IpcMessage, now: Instant) -> Option<AgentState> {
@@ -532,6 +589,21 @@ mod tests {
         let again = read(&term, Some(&s)).unwrap();
         assert!(again.title.is_none() && again.cwd.is_none() && again.notice.is_none(), "nothing new: nothing copied");
         assert_eq!(again.ended, None);
+    }
+
+    #[test]
+    fn done_settles_after_being_seen() {
+        let t0 = Instant::now();
+        let mut s = Session::new("tag".into(), 0, 0, t0);
+        apply_hook(&mut s, &msg("Stop", |_| {}), t0);
+        assert_eq!(s.tracker.state, AgentState::Done);
+        // Hidden or unfocused: stays done.
+        assert_eq!(settle_done(&mut s, true, t0), None);
+        s.visible = true;
+        assert_eq!(settle_done(&mut s, false, t0 + Duration::from_secs(9)), None);
+        assert_eq!(settle_done(&mut s, true, t0 + Duration::from_secs(10)), None, "first seen now");
+        assert_eq!(settle_done(&mut s, true, t0 + Duration::from_secs(12)), None);
+        assert_eq!(settle_done(&mut s, true, t0 + Duration::from_secs(15)), Some((AgentState::Done, AgentState::Idle)));
     }
 
     #[test]

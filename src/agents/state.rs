@@ -219,6 +219,12 @@ impl Tracker {
         }
     }
 
+    /// The user has seen what the session wanted (opened it, "Mark as read"): an
+    /// attention state settles to idle.
+    pub fn acknowledge(&mut self, now: Instant) -> Option<Transition> {
+        if self.state.needs_attention() { self.set(AgentState::Idle, now) } else { None }
+    }
+
     /// Applies the heuristics to what the terminal shows now.
     pub fn observe(&mut self, obs: Observation, now: Instant) -> Option<Transition> {
         if let Some(t) = obs.last_output
@@ -396,6 +402,16 @@ mod tests {
         assert_eq!(HookKind::parse("Notification", None, Some("Claude needs your permission")), Some(HookKind::Notification { permission: true }));
         assert_eq!(HookKind::parse("agent-turn-complete", None, None), Some(HookKind::TurnComplete));
         assert_eq!(HookKind::parse("PreToolUse", None, None), None);
+    }
+
+    #[test]
+    fn acknowledging_clears_attention_only() {
+        let t0 = Instant::now();
+        let mut t = Tracker::new(t0);
+        t.apply(Event::Hook { kind: HookKind::PromptSubmit, message: None }, t0);
+        assert_eq!(t.acknowledge(t0), None, "work is not dismissed");
+        t.apply(Event::Hook { kind: HookKind::Stop, message: None }, t0);
+        assert_eq!(t.acknowledge(t0), Some((AgentState::Done, AgentState::Idle)));
     }
 
     #[test]

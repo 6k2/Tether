@@ -82,7 +82,9 @@ fn ui_flows() {
     h.run_steps(10);
 
     // Key manager: generate an Ed25519 key without a passphrase.
-    h.get_by_label_contains("Keys").click();
+    h.get_by_label("App menu").click();
+    h.run_steps(10);
+    h.get_by_label_contains("Key manager").click();
     h.run_steps(10);
     h.get_by_label("+ Generate").click();
     h.run_steps(10);

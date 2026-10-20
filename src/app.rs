@@ -731,6 +731,7 @@ impl eframe::App for TetherApp {
         }
         self.workspace_area(ui);
         self.detached_windows(&ctx);
+        self.agent_popover(&ctx);
         self.modals(&ctx);
         self.rename_modal(&ctx);
         self.palette_frame(&ctx);

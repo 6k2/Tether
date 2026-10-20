@@ -64,6 +64,7 @@ impl TetherApp {
         r.add(Entry::new("Layout", format!("Turn {} dim inactive panes", toggle(l.dim_inactive_panes)), Command::ToggleDimPanes));
         r.add(Entry::new("Layout", format!("Turn {} focus follows mouse", toggle(l.focus_follows_mouse)), Command::ToggleFocusFollowsMouse));
         r.add(Entry::new("Layout", "Layout settings…", Command::OpenLayoutSettings));
+        r.add(Entry::new("Hosts", "Import hosts…", Command::ImportHosts).detail("Bitvise profiles, SSH config"));
         for l in crate::agents::launch::available() {
             let (kind, command) = (l.kind, l.command);
             r.add(Entry::new("Agent", format!("Launch {}", kind.name()), Command::LaunchAgent { kind, command, pick_folder: false }).detail(command));
@@ -130,6 +131,7 @@ impl TetherApp {
             Command::FocusTab(uid) => self.show_tab(uid),
             Command::RestoreWorkspace(name) => self.restore_workspace(&name, ctx),
             Command::OpenLayoutSettings => self.open_layout_settings(),
+            Command::ImportHosts => self.import = Some(crate::ui::import_view::ImportDialog::new(&self.store)),
             Command::LaunchAgent { kind, command, pick_folder } => {
                 let pick = crate::ui::agents_panel::LaunchPick { kind, command, pick_folder };
                 let target = self.dock.focused_leaf().or_else(|| self.dock.iter_leaves().next().map(|(p, _)| p)).unwrap_or(egui_dock::NodePath {

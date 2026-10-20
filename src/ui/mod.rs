@@ -1,4 +1,6 @@
 pub mod agent_badge;
+pub mod agent_icons;
+pub mod agent_status;
 pub mod agents_panel;
 pub mod autocomplete;
 pub mod backdrop;

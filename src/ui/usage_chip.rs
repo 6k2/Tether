@@ -16,14 +16,28 @@ pub fn label(u: &Usage) -> String {
     format!("{:.0}% · {}", u.cpu, human_mem(u.mem))
 }
 
-/// Appends the usage of tab `uid` (if sampled) to its title.
-pub fn append_to_title(job: &mut egui::text::LayoutJob, uid: u64) {
+/// CPU share above which a tab's usage shows in its title without hovering.
+const HIGH_CPU: f32 = 50.0;
+/// Memory above which a tab's usage shows in its title without hovering.
+const HIGH_MEM: u64 = 1 << 30;
+
+/// Whether usage is worth showing in a tab title unasked.
+pub fn is_high(u: &Usage) -> bool {
+    u.cpu >= HIGH_CPU || u.mem >= HIGH_MEM
+}
+
+/// Appends the usage of tab `uid` (if sampled) to its title: only while the tab is
+/// `hovered` or the usage is high, to keep tab titles quiet.
+pub fn append_to_title(job: &mut egui::text::LayoutJob, uid: u64, hovered: bool) {
     if !enabled() {
         return;
     }
     let Some(u) = procmon::usage_for(uid) else { return };
+    if !hovered && !is_high(&u) {
+        return;
+    }
     // Busy trees catch the eye a little more.
-    let colour = if u.cpu >= 50.0 { theme::warn().gamma_multiply(0.85) } else { theme::text_faint() };
+    let colour = if is_high(&u) { theme::warn().gamma_multiply(0.85) } else { theme::text_faint() };
     RichText::new(format!("   {}", label(&u))).size(10.5).color(colour).append_to(
         job,
         &egui::Style::default(),
@@ -53,18 +67,14 @@ pub fn breakdown(ui: &mut egui::Ui, u: &Usage) {
     });
 }
 
-/// Top-bar total: tether and every process it started.
-pub fn total(ui: &mut egui::Ui) {
+/// The app total (tether and every process it started), e.g. `CPU 4% · 512 MB`.
+pub fn total() -> Option<(String, Usage)> {
     if !enabled() {
-        return;
+        return None;
     }
-    let Some(snap) = procmon::latest() else { return };
+    let snap = procmon::latest()?;
     if snap.total.procs == 0 {
-        return;
+        return None;
     }
-    let r = ui.label(RichText::new(format!("CPU {:.0}% · {}", snap.total.cpu, human_mem(snap.total.mem))).size(11.0).color(theme::text_faint()));
-    r.on_hover_ui(|ui| {
-        ui.label("tether and every process it started");
-        breakdown(ui, &snap.total);
-    });
+    Some((format!("CPU {:.0}% · {}", snap.total.cpu, human_mem(snap.total.mem)), snap.total.clone()))
 }

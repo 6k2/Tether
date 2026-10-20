@@ -34,6 +34,8 @@ pub enum Command {
     FocusTab(u64),
     RestoreWorkspace(String),
     OpenLayoutSettings,
+    /// The "Import hosts" dialog (Bitvise, SSH config).
+    ImportHosts,
     /// Start an AI agent CLI in a new default shell.
     LaunchAgent { kind: crate::agents::AgentKind, command: &'static str, pick_folder: bool },
     /// Anything else: runs on the UI thread when chosen.
@@ -57,6 +59,7 @@ impl std::fmt::Debug for Command {
             Command::FocusTab(uid) => write!(f, "FocusTab({uid})"),
             Command::RestoreWorkspace(n) => write!(f, "RestoreWorkspace({n})"),
             Command::OpenLayoutSettings => f.write_str("OpenLayoutSettings"),
+            Command::ImportHosts => f.write_str("ImportHosts"),
             Command::LaunchAgent { command, .. } => write!(f, "LaunchAgent({command})"),
         }
     }

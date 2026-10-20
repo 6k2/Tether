@@ -209,27 +209,30 @@ impl VerticalTabs {
         // Icon tile with the host / shell colour; a status dot on its corner.
         let tint = theme::hue_color(row.hue);
         let tile = Rect::from_center_size(Pos2::new(card.left() + 10.0 + TILE / 2.0, card.center().y), Vec2::splat(if opts.compact { 20.0 } else { TILE }));
-        p.rect_filled(tile, CornerRadius::same(6), tint.gamma_multiply(0.2 * alpha));
-        p.text(tile.center(), Align2::CENTER_CENTER, &row.icon, FontId::proportional(if opts.compact { 11.0 } else { 12.5 }), tint.gamma_multiply(alpha));
-        let dot = Pos2::new(tile.right() - 1.0, tile.bottom() - 1.0);
-        p.circle_filled(dot, 4.5, theme::bg());
-        p.circle_filled(dot, 3.0, row.status.gamma_multiply(alpha));
+        // An AI agent's mark replaces the shell glyph while it runs (its pill shows the state).
+        if !tab.is_some_and(|t| super::tab_badges::paint_row_icon(&p, tile, t, alpha)) {
+            p.rect_filled(tile, CornerRadius::same(6), tint.gamma_multiply(0.2 * alpha));
+            p.text(tile.center(), Align2::CENTER_CENTER, &row.icon, FontId::proportional(if opts.compact { 11.0 } else { 12.5 }), tint.gamma_multiply(alpha));
+            let dot = Pos2::new(tile.right() - 1.0, tile.bottom() - 1.0);
+            p.circle_filled(dot, 4.5, theme::bg());
+            p.circle_filled(dot, 3.0, row.status.gamma_multiply(alpha));
+        }
 
         let text_x = tile.right() + 10.0;
         let close_w = 26.0;
         let renaming = self.renaming.as_ref().is_some_and(|(u, _)| *u == row.uid);
-        // Chips (agent state, CPU / RAM) on the title line, right-aligned; the title is
-        // clipped before them. Hidden while the close button shows.
+        // Chips (CPU / RAM; the agent's dot in compact rows) on the title line,
+        // right-aligned; the title is clipped before them. They slide left to make room
+        // for the close button. Full rows put the agent's status pill on the second line.
         let mut badges_w = 0.0;
-        if !renaming
-            && hover <= 0.05
-            && let Some(tab) = tab
-        {
+        if !renaming && let Some(tab) = tab {
             let line = if opts.compact { card } else { Rect::from_min_max(card.min, Pos2::new(card.right(), card.center().y + 1.0)) };
-            let badge_rect = Rect::from_min_max(Pos2::new(text_x + 40.0, line.top() + if opts.compact { 0.0 } else { 6.0 }), Pos2::new(card.right() - 8.0, line.bottom()));
+            let badge_rect = Rect::from_min_max(Pos2::new(text_x + 40.0, line.top() + if opts.compact { 0.0 } else { 6.0 }), Pos2::new(card.right() - 8.0 - close_w * hover, line.bottom()));
             // A child that doesn't allocate in the list (the row already did).
             let mut badges = ui.new_child(UiBuilder::new().max_rect(badge_rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
-            self.badges.row_badges(tab, &mut badges);
+            if self.badges.row_badges(tab, &mut badges, opts.compact) {
+                actions.push(TabAction::Focus(row.uid));
+            }
             let used = badges.min_rect();
             if used.width() > 0.5 {
                 badges_w = card.right() - used.left() + 4.0;
@@ -246,10 +249,20 @@ impl VerticalTabs {
             let title = elide_end(&tp, &row.title, FontId::proportional(size), title_col.gamma_multiply(alpha), title_w);
             tp.galley(Pos2::new(text_x, y - title.size().y / 2.0), title, Color32::PLACEHOLDER);
             if !opts.compact {
+                let sub_y = card.center().y + 9.0;
+                let mut sub_x = text_x;
+                if let Some(tab) = tab
+                    && let Some((pill, clicked)) = super::tab_badges::row_pill(ui, tab, Pos2::new(text_x, sub_y))
+                {
+                    sub_x = pill.right() + 6.0;
+                    if clicked {
+                        actions.push(TabAction::Focus(row.uid));
+                    }
+                }
                 // The subtitle runs under the chips too (they sit on the title line).
-                let sub_w = (card.right() - 6.0 - close_w * hover - text_x).max(10.0);
+                let sub_w = (card.right() - 6.0 - close_w * hover - sub_x).max(10.0);
                 let sub = elide_middle(&tp, &row.subtitle, FontId::proportional(11.0), theme::text_faint().gamma_multiply(alpha), sub_w);
-                tp.galley(Pos2::new(text_x, card.center().y + 9.0 - sub.size().y / 2.0), sub, Color32::PLACEHOLDER);
+                tp.galley(Pos2::new(sub_x, sub_y - sub.size().y / 2.0), sub, Color32::PLACEHOLDER);
             }
         }
 

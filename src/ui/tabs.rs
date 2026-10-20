@@ -1,5 +1,6 @@
 //! Dock tabs (terminal / SFTP / editor) and the egui_dock TabViewer that renders them.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::{self, Id, RichText, Ui, WidgetText};
@@ -10,6 +11,8 @@ use super::editor_tab::EditorView;
 use super::sftp_view::SftpView;
 use super::terminal_view::TerminalView;
 use super::vertical_tabs::TabAction;
+use super::{agent_badge, agent_icons, agent_status, usage_chip};
+use crate::agents::{AgentKind, AgentState};
 use crate::commands::{self, AppCommand, EditorDoc};
 use crate::profile::Profile;
 use crate::pty::{self, ShellSpec};
@@ -101,11 +104,18 @@ impl Tab {
 
     /// The title tabs show: the user's name, else what the shell / file reports, else
     /// the host's name. Refreshes the terminal's cached title, hence `&mut`.
+    /// A local shell running an AI agent is named after the agent's session
+    /// (`agents::title`) and reverts once the agent quits.
     pub fn display_title(&mut self) -> String {
+        let agent = self.agent().map(|b| b.kind);
         let remote_title = match (&mut self.body, &self.local) {
             (TabBody::Terminal(t), Some(shell)) => {
                 let title = t.remote_title();
-                Some(pty::tab_title(shell, title.as_deref(), t.remote_cwd()))
+                let cwd = t.remote_cwd();
+                // The agent's own folder (from its hooks) names the project best.
+                let agent_cwd = agent.and_then(|_| crate::agents::hub::agent_cwd(self.uid));
+                let title_cwd = agent_cwd.as_deref().or(cwd);
+                return crate::agents::title::tab_title(self.custom_title.as_deref(), agent, title.as_deref(), title_cwd, |raw| pty::tab_title(shell, raw, cwd));
             }
             (TabBody::Terminal(t), None) => t.remote_title(),
             (TabBody::Sftp(_), _) => None,
@@ -127,6 +137,11 @@ impl Tab {
             (TabBody::Sftp(_), _) => format!("SFTP · {}", self.profile.address()),
             (TabBody::Editor(e), _) => e.remote_path().to_string(),
         }
+    }
+
+    /// The AI agent running in this local shell (whatever the badge setting).
+    pub fn agent(&self) -> Option<crate::agents::Badge> {
+        if self.is_local() { crate::agents::hub::badge_for(self.uid) } else { None }
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -213,7 +228,28 @@ pub struct Viewer {
     pub tab_actions: Vec<TabAction>,
     /// Rendering the main window's dock (tab actions only apply there).
     pub in_main: bool,
+    /// Agent tabs' title layouts this frame: where `on_tab_button` paints the agent
+    /// icon and status pill.
+    pub agent_titles: HashMap<u64, AgentTitle>,
 }
+
+/// A dock tab title with room left for the painted agent icon and status pill.
+pub struct AgentTitle {
+    job: egui::text::LayoutJob,
+    kind: AgentKind,
+    /// Badge state and the char range of the (invisible) pill label in `job`.
+    pill: Option<(AgentState, usize, usize)>,
+}
+
+/// Room before an agent tab's name for its icon.
+const ICON_SLOT: f32 = 20.0;
+const ICON_SIZE: f32 = 14.0;
+/// Space between the name and the status pill.
+const PILL_GAP: f32 = 7.0;
+/// Width of egui_dock's close button (`Style::TAB_CLOSE_BUTTON_SIZE`).
+const DOCK_CLOSE_W: f32 = 24.0;
+/// The tab button under the pointer last frame (0: none): its usage chip shows.
+static HOVERED_TAB: AtomicU64 = AtomicU64::new(0);
 
 /// Per-frame inputs for pane dimming, outlines and focus handling.
 #[derive(Default, Clone)]
@@ -267,6 +303,84 @@ impl Viewer {
     }
 }
 
+impl Viewer {
+    /// Paints the agent icon and status pill into the room `agent_title` left in the
+    /// tab button; a click on the pill opens its popover. True while the pointer is on
+    /// the pill.
+    fn agent_tab_button(&mut self, uid: u64, title: &AgentTitle, response: &egui::Response) -> bool {
+        if response.dragged() {
+            return false;
+        }
+        let ctx = &response.ctx;
+        let mut job = title.job.clone();
+        job.wrap.max_width = f32::INFINITY;
+        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+        let Some(row) = galley.rows.first() else { return false };
+        // egui_dock centres the title in the tab minus its close button.
+        let tab = response.rect;
+        let text_center = tab.left() + (tab.width() - DOCK_CLOSE_W) / 2.0;
+        let origin = egui::pos2(text_center - galley.size().x / 2.0, tab.center().y - galley.size().y / 2.0);
+        let glyph_x = |i: usize| row.row.glyphs.get(i).map(|g| origin.x + row.pos.x + g.pos.x);
+        let painter = ctx.layer_painter(response.layer_id).with_clip_rect(tab);
+        let icon = egui::Rect::from_center_size(egui::pos2(origin.x + (ICON_SLOT - 4.0) / 2.0, tab.center().y), egui::Vec2::splat(ICON_SIZE));
+        agent_icons::paint(&painter, icon, title.kind, 1.0);
+        let Some((state, start, end)) = title.pill else { return false };
+        let (Some(label_x), Some(right)) = (glyph_x(start), glyph_x(end)) else { return false };
+        let half = agent_status::PILL_H / 2.0;
+        let pill = egui::Rect::from_min_max(egui::pos2(label_x - agent_status::LEAD, tab.center().y - half), egui::pos2(right, tab.center().y + half));
+        let over = response.hovered() && ctx.pointer_hover_pos().is_some_and(|p| pill.contains(p));
+        let hover = ctx.animate_bool_with_time(Id::new(("tab_pill", uid)), over, theme::anim_time(0.1));
+        agent_status::paint(&painter, pill, state, self.time, hover);
+        if response.clicked() && response.interact_pointer_pos().is_some_and(|p| pill.contains(p)) && self.in_main {
+            agent_status::toggle_popover(ctx, uid, pill);
+        }
+        if over {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            response.clone().on_hover_text(agent_status::tooltip(title.kind, state));
+        }
+        over
+    }
+
+    /// With tab bars hidden (vertical tabs) the pane has no header: the status pill
+    /// floats in its top-right corner instead.
+    fn pane_status_pill(&mut self, ui: &mut Ui, uid: u64, body: egui::Rect) {
+        if !self.in_main || !crate::settings::snapshot().layout.tab_position.is_vertical() {
+            return;
+        }
+        let Some(badge) = agent_badge::for_tab(uid) else { return };
+        let w = agent_status::width(ui.painter(), badge.state, false);
+        let rect = egui::Rect::from_min_size(egui::pos2(body.right() - w - 12.0, body.top() + 8.0), egui::vec2(w, agent_status::PILL_H));
+        // A backing so the pill reads over terminal text.
+        ui.painter().rect_filled(rect.expand(2.0), egui::CornerRadius::same(11), theme::palette().term_bg);
+        let resp = agent_status::button(ui, rect, Id::new(("pane_pill", uid)), badge.kind, badge.state);
+        if resp.clicked() {
+            self.tab_actions.push(TabAction::Focus(uid));
+            agent_status::toggle_popover(ui.ctx(), uid, rect);
+        }
+    }
+}
+
+/// The title of an agent tab: room for the icon, the name, then (badges on) the pill's
+/// label laid out invisibly so the tab is wide enough, and the usage chip when high.
+fn agent_title(name: &str, kind: AgentKind, state: Option<AgentState>, uid: u64) -> AgentTitle {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let format = |size: f32, color: egui::Color32| TextFormat { font_id: egui::FontId::proportional(size), color, valign: egui::Align::Center, ..Default::default() };
+    job.append(name, ICON_SLOT, format(12.5, egui::Color32::PLACEHOLDER));
+    let mut pill = None;
+    if let Some(state) = state
+        && let Some(label) = agent_status::spec(state).label
+    {
+        let start = name.chars().count();
+        job.append(label, PILL_GAP + agent_status::LEAD, format(agent_status::FONT_SIZE, egui::Color32::TRANSPARENT));
+        let end = start + label.chars().count();
+        job.append(" ", agent_status::TAIL, format(agent_status::FONT_SIZE, egui::Color32::TRANSPARENT));
+        pill = Some((state, start, end));
+    }
+    usage_chip::append_to_title(&mut job, uid, HOVERED_TAB.load(Ordering::Relaxed) == uid);
+    AgentTitle { job, kind, pill }
+}
+
 impl egui_dock::TabViewer for Viewer {
     type Tab = Tab;
 
@@ -275,14 +389,19 @@ impl egui_dock::TabViewer for Viewer {
     }
 
     fn title(&mut self, tab: &mut Tab) -> WidgetText {
-        let icon = tab.icon();
         let name: String = tab.display_title().chars().take(32).collect();
         let mut job = egui::text::LayoutJob::default();
-        let time = self.time;
-        super::agent_badge::append_title_mark(&mut job, tab.uid, tab.status_color(), time);
+        if let Some(agent) = tab.agent() {
+            let title = agent_title(&name, agent.kind, agent_badge::for_tab(tab.uid).map(|b| b.state), tab.uid);
+            job = title.job.clone();
+            self.agent_titles.insert(tab.uid, title);
+            return job.into();
+        }
+        let icon = tab.icon();
+        agent_badge::append_title_mark(&mut job, tab.uid, tab.status_color(), self.time);
         RichText::new(format!("{icon}  {name}")).size(12.5).append_to(&mut job, &egui::Style::default(), egui::FontSelection::Default, egui::Align::Center);
         if tab.is_local() {
-            super::usage_chip::append_to_title(&mut job, tab.uid);
+            usage_chip::append_to_title(&mut job, tab.uid, HOVERED_TAB.load(Ordering::Relaxed) == tab.uid);
         }
         job.into()
     }
@@ -316,6 +435,7 @@ impl egui_dock::TabViewer for Viewer {
                 if ui.memory(|m| m.focused().is_some_and(|f| f == term_id)) {
                     self.focused_uid = Some(tab.uid);
                 }
+                self.pane_status_pill(ui, tab.uid, body);
             }
             TabBody::Sftp(view) => {
                 let out = view.ui(ui);
@@ -350,6 +470,20 @@ impl egui_dock::TabViewer for Viewer {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        let hovered = HOVERED_TAB.load(Ordering::Relaxed);
+        if response.hovered() && hovered != tab.uid {
+            HOVERED_TAB.store(tab.uid, Ordering::Relaxed);
+            response.ctx.request_repaint();
+        } else if !response.hovered() && hovered == tab.uid {
+            HOVERED_TAB.store(0, Ordering::Relaxed);
+            response.ctx.request_repaint();
+        }
+        if let Some(title) = self.agent_titles.remove(&tab.uid)
+            && self.agent_tab_button(tab.uid, &title, response)
+        {
+            // The pointer is on the status pill: its tooltip replaces the tab's.
+            return;
+        }
         // Where the shell is (shell integration / OSC 7), then the process tree's usage.
         if let TabBody::Terminal(t) = &tab.body
             && let Some((cwd, branch)) = t.shell_context()
@@ -357,7 +491,7 @@ impl egui_dock::TabViewer for Viewer {
             response.clone().on_hover_text(context_line(cwd, branch));
         }
         if tab.is_local() {
-            super::usage_chip::tab_tooltip(tab.uid, response);
+            usage_chip::tab_tooltip(tab.uid, response);
         }
         if let TabBody::Editor(e) = &tab.body {
             response.clone().on_hover_text(format!("{}:{}", tab.profile.display_name(), e.remote_path()));

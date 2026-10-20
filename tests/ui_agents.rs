@@ -14,6 +14,7 @@ use eframe::egui::{self, Key, Modifiers};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use tether::app::TetherApp;
+use tether::layout::TabPosition;
 
 fn shot(h: &mut Harness<'_, TetherApp>, name: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/ui-shots");
@@ -101,25 +102,71 @@ fn agent_sessions() {
         "",
     );
 
+    // A session that has not named its task yet: "Claude Code · <folder>".
+    let fresh = script(
+        work.path(),
+        "fresh.js",
+        "Claude Code",
+        "SessionStart",
+        r#"{hook_event_name:'SessionStart', cwd:'D:/work/website', session_id:'s4'}"#,
+        800,
+        "\u{2733} Claude Code",
+    );
+
     let mut h = Harness::builder().with_size(egui::vec2(1360.0, 820.0)).with_max_steps(100_000).wgpu().build_eframe(|cc| TetherApp::new(cc).expect("app init"));
     h.run_steps(10);
-    for js in [&perm, &done, &busy] {
+    for js in [&perm, &done, &busy, &fresh] {
         h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
         run_for(&mut h, 1.5);
         type_line(&mut h, &format!("\"{}\" \"{}\"", fake.display(), js.display()));
         run_for(&mut h, 0.5);
     }
-    // A plain shell: usage only, no badge.
+    // A plain shell: no agent identity, usage only on hover.
     h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
-    run_for(&mut h, 2.0);
-    shot(&mut h, "agents-01-working");
     run_for(&mut h, 5.0);
+    shot(&mut h, "agents-01-top-tabs");
+    h.get_by_label_contains("Agents ·");
+
+    // Vertical rows, then the popover of the session asking for permission.
+    layout(|l| l.tab_position = TabPosition::Left);
+    run_for(&mut h, 1.0);
+    shot(&mut h, "agents-02-vertical-rows");
+    h.get_all_by_label("Agent status Permission").next().expect("permission pill").click();
+    run_for(&mut h, 0.6);
+    shot(&mut h, "agents-03-popover");
+    h.get_by_label("Jump to tab").click();
+    run_for(&mut h, 0.6);
+    shot(&mut h, "agents-03b-pane-pill");
+
     h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::J);
     run_for(&mut h, 1.0);
-    shot(&mut h, "agents-02-panel");
-    h.get_by_label_contains("Agents ·");
-    // Jump to the session asking for permission.
-    h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::A);
+    shot(&mut h, "agents-04-panel");
+    h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::J);
+
+    // Top tabs in a light theme.
+    layout(|l| l.tab_position = TabPosition::Top);
+    tether::themes::apply(&h.ctx, "Tether Day");
     run_for(&mut h, 1.0);
-    shot(&mut h, "agents-03-jump");
+    shot(&mut h, "agents-05-light");
+
+    // Narrow window: the palette pill becomes a button; the app menu holds the rest.
+    h.set_size(egui::vec2(700.0, 820.0));
+    run_for(&mut h, 0.6);
+    shot(&mut h, "agents-06-narrow");
+    h.get_by_label("App menu").click();
+    run_for(&mut h, 0.6);
+    shot(&mut h, "agents-07-app-menu");
+    h.key_press(Key::Escape);
+    tether::themes::apply(&h.ctx, "Tether Night");
+    h.set_size(egui::vec2(1360.0, 820.0));
+    run_for(&mut h, 0.6);
+
+    // The top-bar badge jumps to the most urgent session.
+    h.get_by_label_contains("Agents ·").click();
+    run_for(&mut h, 1.0);
+    shot(&mut h, "agents-08-jump");
+}
+
+fn layout(f: impl FnOnce(&mut tether::layout::LayoutSettings)) {
+    tether::settings::update(|s| f(&mut s.layout)).unwrap();
 }

@@ -2,6 +2,7 @@
 //! agents panel, jumping to sessions and the "+" menu launchers.
 //! A child module of `app` so it can use the app's private state.
 
+use std::sync::Mutex;
 use std::time::Instant;
 
 use eframe::egui::{self, RichText};
@@ -9,10 +10,11 @@ use egui_dock::DockState;
 
 use super::TetherApp;
 use crate::agents::hub::{Alert, TermInfo};
-use crate::agents::{AgentState, notify};
+use crate::agents::{AgentKind, AgentState, install, notify};
 use crate::keybindings::{self, Action};
 use crate::layout::SidebarSection;
 use crate::theme;
+use crate::ui::agent_status::PopoverAction;
 use crate::ui::agents_panel::{LaunchPick, PanelAction};
 use crate::ui::tabs::{Tab, TabBody};
 
@@ -21,10 +23,29 @@ fn local_terms<'a>(dock: &'a DockState<Tab>, out: &mut Vec<TermInfo<'a>>) {
     for (_, leaf) in dock.iter_leaves() {
         for (i, tab) in leaf.tabs.iter().enumerate() {
             if let (TabBody::Terminal(view), true) = (&tab.body, tab.is_local()) {
-                out.push(TermInfo { uid: tab.uid, handle: &view.handle, visible: i == leaf.active.0, label: tab.profile.display_name() });
+                out.push(TermInfo { uid: tab.uid, handle: &view.handle, visible: i == leaf.active.0, label: tab.profile.display_name(), custom: tab.custom_title.as_deref() });
             }
         }
     }
+}
+
+/// Whether the agent's hooks are in its config, read once per opened popover.
+fn hooks_installed(uid: u64, kind: AgentKind) -> bool {
+    static CACHE: Mutex<Option<(u64, bool)>> = Mutex::new(None);
+    let Ok(mut cache) = CACHE.lock() else { return false };
+    if let Some((u, installed)) = *cache
+        && u == uid
+    {
+        return installed;
+    }
+    let target = match kind {
+        AgentKind::Claude => Some(install::Target::Claude),
+        AgentKind::Codex => Some(install::Target::Codex),
+        _ => None,
+    };
+    let installed = target.is_some_and(|t| install::status(t) == install::Status::Installed);
+    *cache = Some((uid, installed));
+    installed
 }
 
 /// Activates tab `uid` in `dock`; true when found.
@@ -134,19 +155,34 @@ impl TetherApp {
         }
     }
 
-    /// Top-bar entry: the agents panel toggle (with a count of waiting sessions) and
-    /// the app's CPU / memory total.
+    /// Top-bar entry, only while sessions need the user: a warm badge with the count
+    /// that jumps to the most urgent one.
     pub(super) fn agents_top_bar(&mut self, ui: &mut egui::Ui) {
         let waiting = self.agents.attention_count();
-        let text = if waiting > 0 {
-            RichText::new(format!("✳ Agents · {waiting}")).size(12.0).color(theme::warn())
-        } else {
-            RichText::new("✳ Agents").size(12.0).color(if self.agents_shown() { theme::text() } else { theme::text_dim() })
-        };
-        if ui.add(egui::Button::new(text).frame(false)).on_hover_text(keybindings::hint("Agent sessions", Action::ToggleAgents)).clicked() {
-            self.toggle_agents();
+        if waiting == 0 {
+            return;
         }
-        crate::ui::usage_chip::total(ui);
+        let text = RichText::new(format!("{waiting}")).size(12.0).strong().color(theme::warn());
+        let tip = keybindings::hint(&format!("{waiting} agent session{} need{} you: jump to the next", if waiting == 1 { "" } else { "s" }, if waiting == 1 { "s" } else { "" }), Action::NextAttention);
+        let resp = super::chrome::chrome_button(ui, Some(crate::ui::settings_widgets::Icon::Sparkle), Some(text), super::chrome::ButtonTone::Warn, &tip);
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Agents · {waiting} need attention")));
+        if resp.clicked() {
+            self.focus_next_attention(ui.ctx());
+        }
+    }
+
+    /// The status pill's popover (opened from a tab, a row or a pane), on top of everything.
+    pub(super) fn agent_popover(&mut self, ctx: &egui::Context) {
+        let Some(uid) = crate::ui::agent_status::popover_uid() else { return };
+        let info = self.agents.sessions().iter().find(|s| s.uid == uid).cloned();
+        let hooks_installed = info.as_ref().is_some_and(|s| hooks_installed(uid, s.kind));
+        let data = info.as_ref().map(|info| crate::ui::agent_status::PopoverData { info, title: &info.title, hooks_installed, now: Instant::now() });
+        match crate::ui::agent_status::show_popover(ctx, data) {
+            Some(PopoverAction::Jump(uid)) => self.focus_tab(uid, ctx),
+            Some(PopoverAction::MarkRead(uid)) => self.agents.mark_read(uid),
+            Some(PopoverAction::InstallHooks) => self.apply_agents_panel(Some(PanelAction::InstallHooks), ctx),
+            None => {}
+        }
     }
 
     /// Whether the "Agents" sidebar section is on screen (sidebar open, section shown).

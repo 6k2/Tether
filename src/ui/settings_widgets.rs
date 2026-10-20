@@ -230,6 +230,10 @@ pub enum Icon {
     SidebarRight,
     /// Stacked rows (a tab list).
     Rows,
+    /// Three lines (the app menu).
+    Menu,
+    /// A mast with waves on both sides (broadcast input).
+    Broadcast,
 }
 
 /// Frameless icon button (e.g. the gear that opens Settings in the top bar).
@@ -373,6 +377,26 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             let (a, b) = if icon == Icon::SidebarLeft { (0.14, 0.28) } else { (0.72, 0.86) };
             for y in [0.34, 0.5] {
                 p.line_segment([at(a, y), at(b, y)], Stroke::new(w * 0.8, c));
+            }
+        }
+        Icon::Menu => {
+            for y in [0.24, 0.5, 0.76] {
+                p.line_segment([at(0.12, y), at(0.88, y)], s);
+            }
+        }
+        Icon::Broadcast => {
+            let c0 = at(0.5, 0.5);
+            p.circle_filled(c0, w * 1.2, c);
+            for (rad, sweep) in [(0.27, 1.5), (0.47, 1.3)] {
+                for side in [0.0, std::f32::consts::PI] {
+                    let pts: Vec<Pos2> = (0..=8)
+                        .map(|i| {
+                            let a = side - sweep / 2.0 + sweep * i as f32 / 8.0;
+                            c0 + Vec2::new(a.cos(), a.sin()) * r.width() * rad
+                        })
+                        .collect();
+                    p.add(egui::Shape::line(pts, s));
+                }
             }
         }
         Icon::Rows => {

@@ -161,17 +161,21 @@ fn row(ui: &mut egui::Ui, s: &SessionInfo, now: Instant, time: f64) -> bool {
     }
     let left = rect.left() + 14.0;
     agent_badge::paint(p, egui::pos2(left + 6.0, rect.top() + 18.0), 6.0, s.state, time);
-    let kind_colour = theme::hue_color(s.kind.hue());
     let title_pos = egui::pos2(left + 20.0, rect.top() + 18.0);
-    let glyph = p.text(title_pos, Align2::LEFT_CENTER, s.kind.glyph(), FontId::proportional(12.0), kind_colour);
-    let name_w = rect.right() - glyph.right() - 80.0;
-    let project = clip(&s.project, name_w, 12.5);
-    p.text(egui::pos2(glyph.right() + 6.0, title_pos.y), Align2::LEFT_CENTER, project, FontId::proportional(12.5), theme::text());
+    let icon = Rect::from_center_size(egui::pos2(title_pos.x + 7.0, title_pos.y), Vec2::splat(14.0));
+    super::agent_icons::paint(p, icon, s.kind, 1.0);
+    let name_w = rect.right() - icon.right() - 80.0;
+    let title = clip(&s.title, name_w, 12.5);
+    p.text(egui::pos2(icon.right() + 6.0, title_pos.y), Align2::LEFT_CENTER, title, FontId::proportional(12.5), theme::text());
     let age = elapsed(now.saturating_duration_since(s.since));
     p.text(egui::pos2(rect.right() - 10.0, title_pos.y), Align2::RIGHT_CENTER, age, FontId::proportional(10.5), theme::text_faint());
 
     let line2 = egui::pos2(left + 20.0, rect.top() + 36.0);
-    p.text(line2, Align2::LEFT_CENTER, s.state.label(), FontId::proportional(11.0), agent_badge::color(s.state));
+    let state = p.text(line2, Align2::LEFT_CENTER, s.state.label(), FontId::proportional(11.0), agent_badge::color(s.state));
+    if s.project != s.title {
+        let project = clip(&s.project, rect.right() - state.right() - 100.0, 11.0);
+        p.text(egui::pos2(state.right() + 6.0, line2.y), Align2::LEFT_CENTER, format!("· {project}"), FontId::proportional(11.0), theme::text_faint());
+    }
     if let Some(u) = &s.usage {
         let usage = format!("{:.0}% · {}", u.cpu, human_mem(u.mem));
         p.text(egui::pos2(rect.right() - 10.0, line2.y), Align2::RIGHT_CENTER, usage, FontId::proportional(10.5), theme::text_faint());

@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod launch;
 pub mod notify;
 pub mod state;
+pub mod title;
 
 pub use hub::{AgentHub, Badge, SessionInfo};
 pub use state::AgentState;

@@ -11,7 +11,7 @@ use eframe::egui;
 use uuid::Uuid;
 
 use crate::keybindings::Action;
-use crate::layout::{Side, TabPosition};
+use crate::layout::{BarOrientation, Container, Side, TabPosition, View};
 
 /// What choosing an entry does. The app interprets every variant but `Run`.
 #[derive(Clone)]
@@ -27,7 +27,10 @@ pub enum Command {
     SetTheme(String),
     SetTabPosition(TabPosition),
     SetSidebarSide(Side),
-    ToggleActivityBar,
+    /// Show a view (un-hiding it, opening its container).
+    ShowView(View),
+    MoveView(View, Container),
+    SetBar(Container, BarOrientation),
     ToggleDimPanes,
     ToggleFocusFollowsMouse,
     /// Focus an open tab by uid.
@@ -53,7 +56,9 @@ impl std::fmt::Debug for Command {
             Command::SetTheme(t) => write!(f, "SetTheme({t})"),
             Command::SetTabPosition(p) => write!(f, "SetTabPosition({p:?})"),
             Command::SetSidebarSide(s) => write!(f, "SetSidebarSide({s:?})"),
-            Command::ToggleActivityBar => f.write_str("ToggleActivityBar"),
+            Command::ShowView(v) => write!(f, "ShowView({v:?})"),
+            Command::MoveView(v, c) => write!(f, "MoveView({v:?}, {c:?})"),
+            Command::SetBar(c, b) => write!(f, "SetBar({c:?}, {b:?})"),
             Command::ToggleDimPanes => f.write_str("ToggleDimPanes"),
             Command::ToggleFocusFollowsMouse => f.write_str("ToggleFocusFollowsMouse"),
             Command::FocusTab(uid) => write!(f, "FocusTab({uid})"),
@@ -192,7 +197,9 @@ impl Registry {
 fn action_keywords(a: Action) -> &'static str {
     match a {
         Action::ZoomPane => "zoom fullscreen pane",
-        Action::ToggleSidebar => "panel hide show",
+        Action::ToggleSidebar | Action::ToggleSecondarySidebar => "sidebar panel hide show",
+        Action::TogglePanel => "bottom hide show",
+        Action::ResetLayout => "default views sidebar panel",
         Action::SplitRight => "pane vertical",
         Action::SplitDown => "pane horizontal",
         Action::CycleTabPosition => "vertical tabs sidebar",
@@ -318,7 +325,7 @@ mod tests {
     #[test]
     fn registry_search_ranks_and_filters() {
         let mut r = Registry::default();
-        r.add(Entry::new("Action", "Toggle sidebar", Command::ToggleActivityBar));
+        r.add(Entry::new("Action", "Toggle sidebar", Command::ShowView(View::Sessions)));
         r.add(Entry::new("Theme", "Nord", Command::SetTheme("Nord".into())));
         r.add(Entry::new("Action", "Split right", Command::App(Action::SplitRight)));
         r.add(Entry::new("Host", "api-prod-01", Command::Connect(Uuid::nil())).detail("deploy@10.0.4.21"));

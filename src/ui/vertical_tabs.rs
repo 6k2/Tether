@@ -1,7 +1,7 @@
 //! Vertical tabs: every open tab as a row (icon, title, folder or address, status),
 //! optionally grouped by pane. Rows can be clicked, renamed (double-click), closed
 //! (hover ✕ or middle-click), reordered or moved between panes by dragging, and dropped
-//! onto the panes to split them. Used by the Sessions panel and the sidebar section.
+//! onto the panes to split them. Used by the Sessions view (side bars and panel).
 
 use std::sync::Arc;
 
@@ -18,6 +18,9 @@ use crate::theme;
 const ROW_H: f32 = 44.0;
 const ROW_H_COMPACT: f32 = 30.0;
 const GROUP_H: f32 = 26.0;
+/// Column widths of the Sessions view in the bottom panel.
+const COLUMN_MIN: f32 = 200.0;
+const COLUMN_MAX: f32 = 300.0;
 const TILE: f32 = 24.0;
 /// Share of a pane's width / height near an edge that splits instead of joining.
 const EDGE: f32 = 0.28;
@@ -105,31 +108,25 @@ impl VerticalTabs {
         rows as f32 * row_h(opts) + headers
     }
 
-    /// The Sessions panel: header with "+" and options, the list, an empty state.
-    pub fn panel(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions, position: TabPosition) -> Vec<TabAction> {
+    /// The Sessions view header's buttons, right to left: options, then "+" (new shell;
+    /// right-click lists every shell). `ui` should be a right-to-left layout.
+    pub fn header_buttons(ui: &mut Ui, opts: ListOptions, position: TabPosition) -> Vec<TabAction> {
         let mut actions = Vec::new();
-        let count = dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.set_height(28.0);
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("SESSIONS").size(10.5).color(theme::text_faint()));
-            if count > 0 {
-                ui.label(egui::RichText::new(count.to_string()).size(10.5).color(theme::text_faint().gamma_multiply(0.7)));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let more = small_button(ui, "", "Tab list options");
-                egui::Popup::menu(&more).show(|ui| options_menu(ui, opts, position, &mut actions));
-                let add = small_button(ui, "+", &keybindings::hint("New terminal", Action::NewLocalTerminal));
-                if add.clicked() {
-                    actions.push(TabAction::NewShell(None));
-                }
-                add.context_menu(|ui| shells_menu(ui, &mut actions));
-            });
-        });
-        ui.add_space(4.0);
-        if count == 0 {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let more = small_button(ui, "", "Tab list options");
+        egui::Popup::menu(&more).show(|ui| options_menu(ui, opts, position, &mut actions));
+        let add = small_button(ui, "+", &keybindings::hint("New terminal", Action::NewLocalTerminal));
+        if add.clicked() {
+            actions.push(TabAction::NewShell(None));
+        }
+        add.context_menu(|ui| shells_menu(ui, &mut actions));
+        actions
+    }
+
+    /// The Sessions view body in a side bar: the list (scrolling), an empty state.
+    pub fn body(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions, position: TabPosition) -> Vec<TabAction> {
+        let mut actions = Vec::new();
+        if dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count() == 0 {
             empty_state(ui, &mut actions);
             return actions;
         }
@@ -152,10 +149,42 @@ impl VerticalTabs {
         actions
     }
 
-    /// Just the rows (the sidebar section scrolls them itself).
-    pub fn list(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions) -> Vec<TabAction> {
+    /// The Sessions view body in the (wide, short) bottom panel: compact rows in
+    /// columns, one per pane when grouped, otherwise flowing left to right.
+    pub fn columns(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions) -> Vec<TabAction> {
         let mut actions = Vec::new();
-        self.list_into(ui, dock, opts, &mut actions);
+        let groups = collect(dock);
+        if groups.is_empty() {
+            empty_state(ui, &mut actions);
+            return actions;
+        }
+        let opts = ListOptions { compact: true, ..opts };
+        let by_pane = opts.grouped && groups.len() > 1;
+        let rows: Vec<&RowModel> = groups.iter().flat_map(|g| g.rows.iter()).collect();
+        let per_col = ((ui.available_height() - 8.0) / row_h(opts)).floor().max(1.0) as usize;
+        let cols: Vec<(Option<usize>, Vec<&RowModel>)> =
+            if by_pane { groups.iter().enumerate().map(|(i, g)| (Some(i), g.rows.iter().collect())).collect() } else { rows.chunks(per_col).map(|c| (None, c.to_vec())).collect() };
+        let col_w = ((ui.available_width() - 8.0 * cols.len() as f32) / cols.len() as f32).clamp(COLUMN_MIN, COLUMN_MAX);
+        egui::ScrollArea::both().id_salt("vtabs_columns").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for (group, col) in &cols {
+                    ui.allocate_ui_with_layout(Vec2::new(col_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(col_w);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if let Some(gi) = group {
+                            let resp = group_header(ui, *gi, &groups[*gi]);
+                            drop_zone(ui, &resp, TabTarget::Append(groups[*gi].leaf), &mut actions);
+                        }
+                        for row in col {
+                            let tab = dock.iter_all_tabs().find(|(_, t)| t.uid == row.uid).map(|(_, t)| t);
+                            self.row(ui, row, tab, opts, &mut actions);
+                        }
+                    });
+                }
+            });
+        });
+        drag_ghost(ui, &groups);
         actions
     }
 

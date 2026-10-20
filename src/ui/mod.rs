@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod agent_badge;
 pub mod agent_icons;
 pub mod agent_status;
@@ -34,7 +35,6 @@ pub mod sftp_data;
 pub mod sftp_status;
 pub mod sftp_view;
 pub mod sidebar;
-pub mod sidebar_sections;
 pub mod suggest;
 pub mod tab_badges;
 pub mod tabs;

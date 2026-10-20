@@ -1,15 +1,16 @@
-//! Headless screenshots of the layout features (vertical tabs, sidebar sections,
-//! activity bar, command palette, dimmed panes, maximized pane, welcome screen), with
-//! real local shells. PNGs land in `target/ui-shots/`.
+//! Headless screenshots of the layout features (activity strips and movable views,
+//! side bars, the bottom panel, drag-and-drop drop zones, command palette, dimmed
+//! panes, maximized pane, welcome screen), with real local shells. PNGs land in
+//! `target/ui-shots/`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Key, Modifiers};
+use eframe::egui::{self, Key, Modifiers, PointerButton};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use tether::app::TetherApp;
-use tether::layout::{Side, SidebarSection, TabPosition};
+use tether::layout::{BarOrientation, Container, Side, TabPosition, View};
 
 const PROFILES: &str = r#"[
  {"id":"22222222-2222-4222-8222-222222222222","name":"api-prod-01","group":"Production","host":"10.0.4.21","port":22,"user":"deploy","auth":"Password","hue":210,"pipeline_kb":4096,"remote_start_dir":"","last_used":1760000000},
@@ -49,6 +50,18 @@ fn layout(f: impl FnOnce(&mut tether::layout::LayoutSettings)) {
     tether::settings::update(|s| f(&mut s.layout)).unwrap();
 }
 
+fn views() -> tether::layout::ViewLayout {
+    tether::settings::snapshot().layout.views.clone()
+}
+
+fn pointer(h: &mut Harness<'_, TetherApp>, pos: egui::Pos2, pressed: Option<bool>) {
+    h.event(egui::Event::PointerMoved(pos));
+    if let Some(pressed) = pressed {
+        h.event(egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+    }
+    h.run_steps(2);
+}
+
 const CS: Modifiers = Modifiers { ctrl: true, shift: true, alt: false, mac_cmd: false, command: true };
 
 #[test]
@@ -71,61 +84,133 @@ fn layout_screens() {
     keys(&mut h, CS, Key::D);
     settle(&mut h, 2.5);
 
-    // Vertical tabs on the left, grouped by pane.
-    layout(|l| l.tab_position = TabPosition::Left);
-    settle(&mut h, 0.6);
-    shot(&mut h, "21-vertical-tabs-left");
-    h.get_all_by_label_contains("Tab ").nth(1).unwrap().hover();
+    // Default: the Sessions view active in the primary side bar, no tab strips.
+    assert!(views().is_shown(View::Sessions));
+    shot(&mut h, "21-views-default");
+    h.get_by_label("Hosts view").hover();
+    h.run_steps(20);
+    shot(&mut h, "21b-activity-hover");
+
+    // Clicking the active icon folds the side bar to its strip; again unfolds it.
+    h.get_by_label("Sessions view").click();
+    settle(&mut h, 0.5);
+    assert!(views().primary.collapsed);
+    shot(&mut h, "22-primary-folded");
+    h.get_by_label("Sessions view").click();
+    settle(&mut h, 0.5);
+    assert!(!views().primary.collapsed);
+
+    // Right-click an icon: Move to / Hide / views / icon placement.
+    h.get_by_label("Agents view").click_secondary();
     h.run_steps(10);
-    shot(&mut h, "21b-vertical-tabs-hover");
+    h.get_by_label_contains("Move to");
+    shot(&mut h, "23-icon-menu");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
 
-    // Tabs on the right, sidebar on the right with an activity bar, compact rows.
+    // Views split between both side bars.
     layout(|l| {
-        l.tab_position = TabPosition::Right;
-        l.sidebar_side = Side::Left;
-        l.activity_bar = true;
-        l.active_view = SidebarSection::Hosts;
-        l.compact_tabs = true;
+        l.views.move_view(View::Hosts, Container::Secondary, None);
+        l.views.move_view(View::Agents, Container::Secondary, None);
+        l.views.secondary.active = Some(View::Hosts);
     });
     settle(&mut h, 0.6);
-    shot(&mut h, "22-tabs-right-activity-bar");
+    shot(&mut h, "24-views-split");
+
+    // Icons on top of the side bars.
     layout(|l| {
-        l.compact_tabs = false;
-        l.activity_bar = false;
-        l.sidebar_side = Side::Right;
-        l.tab_position = TabPosition::Left;
+        l.views.primary.bar = BarOrientation::Top;
+        l.views.secondary.bar = BarOrientation::Top;
     });
     settle(&mut h, 0.6);
-    shot(&mut h, "22b-sidebar-right");
+    shot(&mut h, "25-activity-top");
 
-    // Tabs on top, sidebar sections reordered with one collapsed, panes dimmed.
+    // Sessions in the bottom panel (compact columns, one per pane).
     layout(|l| {
+        l.views.primary.bar = BarOrientation::Side;
+        l.views.secondary.bar = BarOrientation::Side;
+        l.views.move_view(View::Sessions, Container::Panel, None);
+        l.views.move_view(View::Agents, Container::Panel, None);
+        l.views.panel.active = Some(View::Sessions);
+    });
+    settle(&mut h, 0.6);
+    shot(&mut h, "26-view-in-panel");
+
+    // Drag the Workspaces icon: drop zones on the window edges, then drop it on the
+    // bottom edge (the panel).
+    tether::ui::activity::forget_sizes(&h.ctx);
+    layout(|l| l.reset_views());
+    settle(&mut h, 0.6);
+    let icon = h.get_by_label("Workspaces view").rect().center();
+    pointer(&mut h, icon, None);
+    pointer(&mut h, icon, Some(true));
+    for k in 1..=12 {
+        let t = k as f32 / 12.0;
+        pointer(&mut h, icon + egui::vec2(600.0 * t, 560.0 * t), None);
+    }
+    h.run_steps(10);
+    shot(&mut h, "27-drag-drop-zones");
+    let drop_at = icon + egui::vec2(600.0, 560.0);
+    pointer(&mut h, drop_at, Some(false));
+    settle(&mut h, 0.6);
+    assert_eq!(views().container_of(View::Workspaces), Some(Container::Panel), "dropped on the bottom edge");
+    shot(&mut h, "27b-dropped-in-panel");
+
+    // Reorder within the primary strip: Agents before Sessions.
+    let from = h.get_by_label("Agents view").rect().center();
+    let to = h.get_by_label("Sessions view").rect().center() - egui::vec2(0.0, 14.0);
+    pointer(&mut h, from, None);
+    pointer(&mut h, from, Some(true));
+    for k in 1..=8 {
+        pointer(&mut h, from + (to - from) * (k as f32 / 8.0), None);
+    }
+    shot(&mut h, "28-drag-reorder");
+    pointer(&mut h, to, Some(false));
+    h.run_steps(10);
+    assert_eq!(views().primary.views.first(), Some(&View::Agents), "reordered: {:?}", views().primary.views);
+
+    // Tabs on top of the panes, side bar on the right, panes dimmed.
+    tether::ui::activity::forget_sizes(&h.ctx);
+    layout(|l| {
+        l.reset_views();
         l.tab_position = TabPosition::Top;
-        l.sidebar_side = Side::Left;
+        l.sidebar_side = Side::Right;
         l.dim_inactive_panes = true;
-        l.move_section(2, 0);
-        l.set_collapsed(SidebarSection::Hosts, true);
+        l.views.click(View::Hosts);
     });
     settle(&mut h, 0.6);
-    shot(&mut h, "24-dim-inactive-panes");
+    shot(&mut h, "29-tabs-top-sidebar-right");
 
     // Command palette with a query.
     keys(&mut h, CS, Key::P);
     h.run_steps(10);
     shot(&mut h, "23a-palette-open");
-    h.event(egui::Event::Text("split".into()));
+    h.event(egui::Event::Text("move view".into()));
     h.run_steps(10);
-    shot(&mut h, "23-palette");
+    shot(&mut h, "23b-palette-views");
     h.key_press(Key::Escape);
     h.run_steps(10);
     assert!(h.query_by_label_contains("Palette ").is_none(), "Esc closes the palette");
 
     // Maximize the focused pane.
-    layout(|l| l.set_collapsed(SidebarSection::Hosts, false));
+    layout(|l| {
+        l.tab_position = TabPosition::Sidebar;
+        l.sidebar_side = Side::Left;
+        l.views.click(View::Sessions);
+    });
     keys(&mut h, CS, Key::Enter);
     settle(&mut h, 0.6);
     h.get_by_label_contains("Maximized");
-    shot(&mut h, "25-zoomed-pane");
+    shot(&mut h, "30-zoomed-pane");
     keys(&mut h, CS, Key::Enter);
     h.run_steps(10);
+
+    // Settings → Layout with its schematic.
+    layout(|l| l.views.move_view(View::Agents, Container::Secondary, None));
+    keys(&mut h, CS, Key::P);
+    h.event(egui::Event::Text("layout settings".into()));
+    h.run_steps(5);
+    h.key_press(Key::Enter);
+    settle(&mut h, 0.8);
+    shot(&mut h, "31-layout-settings");
 }

@@ -59,6 +59,9 @@ fn ui_flows() {
     let config = tempfile::tempdir().unwrap();
     let mut h = harness(config.path());
     h.run_steps(30);
+    // Sessions is the default view; the hosts live in the Hosts view.
+    h.get_by_label("Hosts view").click();
+    h.run_steps(10);
     h.get_by_label("Docker sshd");
     h.get_by_label("db-replica");
     shot(&mut h, "01-welcome");
@@ -96,7 +99,7 @@ fn ui_flows() {
     h.key_press(Key::Escape);
     h.run_steps(10);
 
-    // Hosts imported with a group show up inside folders.
+    // Hosts imported with a group show up inside folders (in the Hosts view).
     h.get_by_label("Production");
     h.get_by_label("Lab");
 
@@ -109,7 +112,7 @@ fn ui_flows() {
     connected_flow(&mut h);
 }
 
-/// Two local shells in vertical tabs (left), then the command palette over them.
+/// Two local shells in the Sessions view, then the command palette over them.
 fn local_tabs_and_palette(h: &mut Harness<'_, TetherApp>) {
     let palette = |h: &mut Harness<'_, TetherApp>| {
         h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::P);
@@ -135,10 +138,15 @@ fn local_tabs_and_palette(h: &mut Harness<'_, TetherApp>) {
 /// Right-click menus on folders, hosts and workspaces, the "New" dropdown and the
 /// inline "save workspace" field.
 fn sidebar_menus(h: &mut Harness<'_, TetherApp>) {
+    h.get_by_label("Workspaces view").click();
+    h.run_steps(10);
     h.get_by_label("Workspace Production").hover();
     h.run_steps(10);
     shot(h, "06-sidebar-workspaces");
+    workspace_menus(h);
 
+    h.get_by_label("Hosts view").click();
+    h.run_steps(10);
     h.get_by_label("Production").click_secondary();
     h.run_steps(10);
     h.get_by_label_contains("New subfolder");
@@ -174,7 +182,10 @@ fn sidebar_menus(h: &mut Harness<'_, TetherApp>) {
     shot(h, "09-new-menu");
     h.key_press(Key::Escape);
     h.run_steps(10);
+}
 
+/// The workspace row's menu and its delete confirmation (Workspaces view showing).
+fn workspace_menus(h: &mut Harness<'_, TetherApp>) {
     h.get_by_label("Workspace Production").click_secondary();
     h.run_steps(10);
     h.get_by_label_contains("Overwrite with current layout");

@@ -19,6 +19,8 @@ mod chrome;
 mod layout_ui;
 #[path = "app_local.rs"]
 mod local;
+#[path = "app_views.rs"]
+mod views_ui;
 #[path = "app_palette.rs"]
 mod palette_ui;
 
@@ -69,6 +71,8 @@ pub struct TetherApp {
     sidebar: Sidebar,
     /// Rename state of the vertical tab list (inline editing).
     vtabs: VerticalTabs,
+    /// Where a dragged activity icon can land (rebuilt every frame).
+    view_targets: crate::ui::activity::DropTargets,
     palette: Option<Palette>,
     /// A tab shown alone over the whole workspace (maximized pane).
     zoomed: Option<u64>,
@@ -145,6 +149,7 @@ impl TetherApp {
             dock: DockState::new(Vec::new()),
             sidebar: Sidebar::default(),
             vtabs: VerticalTabs::default(),
+            view_targets: Default::default(),
             palette: None,
             zoomed: None,
             focus_request: None,
@@ -467,7 +472,7 @@ impl TetherApp {
         // Translucent window: the panel must not stack its fill under the terminals.
         let see_through = crate::themes::see_through() && self.dock.iter_all_tabs().next().is_some();
         let fill = if see_through { egui::Color32::TRANSPARENT } else { theme::bg() };
-        let vertical = crate::settings::snapshot().layout.tab_position.is_vertical();
+        let vertical = crate::settings::snapshot().layout.tab_bars_hidden();
         let margin = if vertical { egui::Margin { left: 0, right: 0, top: 0, bottom: 6 } } else { egui::Margin { left: 0, right: 6, top: 0, bottom: 6 } };
         let frame = egui::Frame::new().fill(fill).inner_margin(margin);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -724,12 +729,13 @@ impl eframe::App for TetherApp {
         self.handle_shortcuts(&ctx);
         self.top_bar(ui);
         self.agents_frame(&ctx);
-        self.side_panels(ui);
+        self.view_containers(ui);
         {
             let mut docks: Vec<&mut DockState<Tab>> = std::iter::once(&mut self.dock).chain(self.detached.docks_mut()).collect();
             link_terminals(&mut docks, self.focused_terminal);
         }
         self.workspace_area(ui);
+        self.finish_view_drag(&ctx);
         self.detached_windows(&ctx);
         self.agent_popover(&ctx);
         self.modals(&ctx);

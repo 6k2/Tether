@@ -124,11 +124,13 @@ fn agent_sessions() {
     // A plain shell: no agent identity, usage only on hover.
     h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
     run_for(&mut h, 5.0);
+    layout(|l| l.tab_position = TabPosition::Top);
+    run_for(&mut h, 0.5);
     shot(&mut h, "agents-01-top-tabs");
     h.get_by_label_contains("Agents ·");
 
     // Vertical rows, then the popover of the session asking for permission.
-    layout(|l| l.tab_position = TabPosition::Left);
+    layout(|l| l.tab_position = TabPosition::Sidebar);
     run_for(&mut h, 1.0);
     shot(&mut h, "agents-02-vertical-rows");
     h.get_all_by_label("Agent status Permission").next().expect("permission pill").click();

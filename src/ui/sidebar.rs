@@ -132,11 +132,18 @@ impl Sidebar {
     }
 
     /// The brand row with "New" and "⋯", above the sections.
-    pub fn title_bar(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
+    /// The Hosts view header's buttons ("More", then "New" with its dropdown), laid
+    /// out right to left in `ui`.
+    pub fn hosts_header(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
         let mut actions = Vec::new();
-        ui.add_space(6.0);
-        self.title_row(ui, data.shells, &mut actions);
-        ui.add_space(6.0);
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let more = glyph_button(ui, Glyph::More, "More");
+        egui::Popup::menu(&more).show(|ui| self.background_menu(ui, &mut actions));
+        let (main, caret) = new_split_button(ui);
+        if main.on_hover_text(keybindings::hint("New host", Action::NewHost)).clicked() {
+            actions.push(SidebarAction::New(None));
+        }
+        egui::Popup::menu(&caret).show(|ui| self.new_menu(ui, data.shells, &mut actions));
         actions
     }
 
@@ -203,23 +210,6 @@ impl Sidebar {
     /// Starts the inline "Save current layout as…" field.
     pub fn save_workspace(&mut self) {
         self.workspaces.start_save();
-    }
-
-    fn title_row(&mut self, ui: &mut Ui, shells: &[ShellSpec], actions: &mut Vec<SidebarAction>) {
-        ui.horizontal(|ui| {
-            logo(ui, 18.0);
-            ui.label(egui::RichText::new("tether").size(17.0).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let more = glyph_button(ui, Glyph::More, "More");
-                egui::Popup::menu(&more).show(|ui| self.background_menu(ui, actions));
-                let (main, caret) = new_split_button(ui);
-                if main.on_hover_text(keybindings::hint("New host", Action::NewHost)).clicked() {
-                    actions.push(SidebarAction::New(None));
-                }
-                egui::Popup::menu(&caret).show(|ui| self.new_menu(ui, shells, actions));
-            });
-        });
     }
 
     fn quick_connect(&mut self, ui: &mut Ui, store: &ProfileStore, actions: &mut Vec<SidebarAction>) {

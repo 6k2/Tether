@@ -344,7 +344,7 @@ impl Viewer {
     /// With tab bars hidden (vertical tabs) the pane has no header: the status pill
     /// floats in its top-right corner instead.
     fn pane_status_pill(&mut self, ui: &mut Ui, uid: u64, body: egui::Rect) {
-        if !self.in_main || !crate::settings::snapshot().layout.tab_position.is_vertical() {
+        if !self.in_main || !crate::settings::snapshot().layout.tab_bars_hidden() {
             return;
         }
         let Some(badge) = agent_badge::for_tab(uid) else { return };

@@ -7,7 +7,7 @@ use eframe::egui;
 use super::TetherApp;
 use crate::actions::{Command, Entry, Registry};
 use crate::keybindings::{Action, Group};
-use crate::layout::{Direction, TabPosition};
+use crate::layout::{BarOrientation, Container, Direction, TabPosition, View};
 use crate::settings;
 use crate::ui::palette::{Palette, PaletteOutcome};
 use crate::ui::settings_view::SettingsView;
@@ -45,21 +45,39 @@ impl TetherApp {
             r.add(Entry::new("Host", format!("Connect to {}", p.display_name()), Command::Connect(p.id)).detail(p.address()));
         }
         for a in Action::ALL {
-            if is_global(a) || matches!(a, Action::PrevPrompt | Action::NextPrompt) {
+            // The "Focus … view" entries below cover these.
+            let view_focus = matches!(a, Action::FocusSessionsView | Action::FocusWorkspacesView);
+            if (is_global(a) || matches!(a, Action::PrevPrompt | Action::NextPrompt)) && !view_focus {
                 r.add(Entry::action(category(a.group()), a));
+            }
+        }
+        for v in View::ALL {
+            let keys = crate::keybindings::binding(crate::ui::activity::view_action(v)).map(|b| b.label());
+            r.add(Entry::new("View", format!("Focus {} view", v.title()), Command::ShowView(v)).keys(keys));
+        }
+        for v in View::ALL {
+            let here = l.views.container_of(v);
+            for c in Container::ALL.into_iter().filter(|c| Some(*c) != here) {
+                r.add(Entry::new("View", format!("Move {} view to {}", v.title(), c.title().to_lowercase()), Command::MoveView(v, c)));
             }
         }
         for p in TabPosition::ALL.into_iter().filter(|p| *p != l.tab_position) {
             let title = match p {
-                TabPosition::Top => "Tabs on top of panes".to_string(),
-                _ => format!("Vertical tabs on the {}", p.label().to_lowercase()),
+                TabPosition::Top => "Tabs on top of panes",
+                TabPosition::Sidebar => "Vertical tabs in the Sessions view",
             };
             r.add(Entry::new("Layout", title, Command::SetTabPosition(p)));
         }
         let other = l.sidebar_side.flip();
-        r.add(Entry::new("Layout", format!("Sidebar on the {}", other.label().to_lowercase()), Command::SetSidebarSide(other)));
-        let flag = |on: bool| if on { "Hide" } else { "Show" };
-        r.add(Entry::new("Layout", format!("{} activity bar", flag(l.activity_bar)), Command::ToggleActivityBar));
+        r.add(Entry::new("Layout", format!("Primary side bar on the {}", other.label().to_lowercase()), Command::SetSidebarSide(other)));
+        for c in [Container::Primary, Container::Secondary] {
+            let bar = match l.views.get(c).bar {
+                BarOrientation::Side => BarOrientation::Top,
+                BarOrientation::Top => BarOrientation::Side,
+            };
+            let place = if bar == BarOrientation::Top { "on top" } else { "on the side" };
+            r.add(Entry::new("Layout", format!("{} icons {place}", c.title()), Command::SetBar(c, bar)));
+        }
         let toggle = |on: bool| if on { "off" } else { "on" };
         r.add(Entry::new("Layout", format!("Turn {} dim inactive panes", toggle(l.dim_inactive_panes)), Command::ToggleDimPanes));
         r.add(Entry::new("Layout", format!("Turn {} focus follows mouse", toggle(l.focus_follows_mouse)), Command::ToggleFocusFollowsMouse));
@@ -119,8 +137,12 @@ impl TetherApp {
             }
             Command::SetTabPosition(p) => super::layout_ui::set_tab_position(p),
             Command::SetSidebarSide(side) => super::layout_ui::set_sidebar_side(side),
-            Command::ToggleActivityBar => {
-                let _ = settings::update(|s| s.layout.activity_bar = !s.layout.activity_bar);
+            Command::ShowView(v) => super::layout_ui::reveal_view(v),
+            Command::MoveView(v, c) => {
+                let _ = settings::update(|s| s.layout.views.move_view(v, c, None));
+            }
+            Command::SetBar(c, bar) => {
+                let _ = settings::update(|s| s.layout.views.get_mut(c).bar = bar);
             }
             Command::ToggleDimPanes => {
                 let _ = settings::update(|s| s.layout.dim_inactive_panes = !s.layout.dim_inactive_panes);
@@ -154,7 +176,12 @@ impl TetherApp {
                     self.open_palette();
                 }
             }
-            Action::ToggleSidebar => super::layout_ui::toggle_sidebar(),
+            Action::ToggleSidebar => super::layout_ui::toggle_container(Container::Primary),
+            Action::ToggleSecondarySidebar => super::layout_ui::toggle_container(Container::Secondary),
+            Action::TogglePanel => super::layout_ui::toggle_container(Container::Panel),
+            Action::FocusSessionsView => super::layout_ui::reveal_view(View::Sessions),
+            Action::FocusWorkspacesView => super::layout_ui::reveal_view(View::Workspaces),
+            Action::ResetLayout => super::views_ui::reset_layout(ctx),
             Action::OpenSettings => {
                 self.settings_view.get_or_insert_with(SettingsView::new);
             }
@@ -170,11 +197,11 @@ impl TetherApp {
             }
             Action::NewFolder => self.new_folder(None),
             Action::QuickConnect => {
-                show_sidebar_view(crate::layout::SidebarSection::Hosts);
+                super::layout_ui::reveal_view(View::Hosts);
                 self.sidebar.focus_quick_connect();
             }
             Action::SearchHosts => {
-                show_sidebar_view(crate::layout::SidebarSection::Hosts);
+                super::layout_ui::reveal_view(View::Hosts);
                 self.sidebar.focus_search();
             }
             Action::NewLocalTerminal => self.open_local(None, ctx),
@@ -215,16 +242,6 @@ impl TetherApp {
     }
 }
 
-/// Makes sure the sidebar is open on `kind` (with the activity bar, that view).
-fn show_sidebar_view(kind: crate::layout::SidebarSection) {
-    let _ = settings::update(|s| {
-        s.layout.sidebar_visible = true;
-        if s.layout.activity_bar {
-            s.layout.active_view = kind;
-        }
-        s.layout.set_collapsed(kind, false);
-    });
-}
 
 fn category(g: Group) -> &'static str {
     match g {

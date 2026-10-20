@@ -1,45 +1,43 @@
-//! Window arrangement settings: where tabs and the sidebar go, which sidebar sections
-//! show in what order, and pane behaviour (dimming, focus on hover).
+//! Window arrangement settings: where tabs go, which side the primary side bar docks
+//! on, where each view lives (see [`crate::views`]) and pane behaviour (dimming, focus
+//! on hover).
 //!
 //! Stored under `settings.layout`; every field has a serde default so settings files
-//! written before this existed keep loading.
+//! written before this existed keep loading, and the single-sidebar settings of older
+//! versions are migrated on load (see [`migrate_views`]).
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::views::SIDE_DEFAULT;
+pub use crate::views::{BarOrientation, Container, ContainerState, View, ViewLayout};
+
 /// Where the tabs of the workspace are listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TabPosition {
-    /// A tab strip on top of every pane (egui_dock's own tab bars).
+    /// Vertical tabs in the Sessions view (wherever it is placed); the panes get tab
+    /// strips back while that view is hidden or folded away.
     #[default]
+    Sidebar,
+    /// A tab strip on top of every pane (egui_dock's own tab bars).
     Top,
-    /// A vertical "Sessions" panel on the left of the panes.
-    Left,
-    /// A vertical "Sessions" panel on the right of the panes.
-    Right,
 }
 
 impl TabPosition {
-    pub const ALL: [TabPosition; 3] = [TabPosition::Top, TabPosition::Left, TabPosition::Right];
-
-    pub fn is_vertical(self) -> bool {
-        self != TabPosition::Top
-    }
+    pub const ALL: [TabPosition; 2] = [TabPosition::Sidebar, TabPosition::Top];
 
     pub fn label(self) -> &'static str {
         match self {
-            TabPosition::Top => "Top",
-            TabPosition::Left => "Left",
-            TabPosition::Right => "Right",
+            TabPosition::Sidebar => "Sessions view",
+            TabPosition::Top => "Top of panes",
         }
     }
 
-    /// The next position (for "cycle tab position").
+    /// The other position (for "cycle tab position").
     pub fn next(self) -> Self {
         match self {
-            TabPosition::Top => TabPosition::Left,
-            TabPosition::Left => TabPosition::Right,
-            TabPosition::Right => TabPosition::Top,
+            TabPosition::Sidebar => TabPosition::Top,
+            TabPosition::Top => TabPosition::Sidebar,
         }
     }
 }
@@ -67,62 +65,18 @@ impl Side {
     }
 }
 
-/// A block of the sidebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SidebarSection {
-    Hosts,
-    /// Every open tab (shown in the sidebar while tabs sit on top of the panes).
-    Sessions,
-    Workspaces,
-    /// Reserved for AI agents running in terminals.
-    Agents,
-}
-
-impl SidebarSection {
-    pub const ALL: [SidebarSection; 4] = [SidebarSection::Hosts, SidebarSection::Sessions, SidebarSection::Workspaces, SidebarSection::Agents];
-
-    pub fn title(self) -> &'static str {
-        match self {
-            SidebarSection::Hosts => "Hosts",
-            SidebarSection::Sessions => "Sessions",
-            SidebarSection::Workspaces => "Workspaces",
-            SidebarSection::Agents => "Agents",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SectionEntry {
-    pub kind: SidebarSection,
-    #[serde(default)]
-    pub collapsed: bool,
-}
-
-impl SectionEntry {
-    pub const fn new(kind: SidebarSection) -> Self {
-        Self { kind, collapsed: false }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawLayout")]
 pub struct LayoutSettings {
     pub tab_position: TabPosition,
     /// Vertical tabs: group rows under a header per pane (split).
     pub group_by_pane: bool,
     /// Vertical tabs: one line per tab instead of title + subtitle.
     pub compact_tabs: bool,
-    /// Width of the vertical tabs panel.
-    pub tabs_width: f32,
+    /// The side of the primary side bar (the secondary one takes the other).
     pub sidebar_side: Side,
-    pub sidebar_visible: bool,
-    pub sidebar_width: f32,
-    /// A thin icon strip that switches the sidebar between its sections (one at a time).
-    pub activity_bar: bool,
-    /// The section shown while the activity bar is on.
-    pub active_view: SidebarSection,
-    /// Sidebar sections, top to bottom. Read through [`LayoutSettings::sections`].
-    pub sections: Vec<SectionEntry>,
+    /// Which view sits in which container, their order, sizes and folded state.
+    pub views: ViewLayout,
     /// Fade panes that don't have focus.
     pub dim_inactive_panes: bool,
     /// 0..=1, how much inactive panes are faded.
@@ -132,72 +86,46 @@ pub struct LayoutSettings {
 }
 
 impl LayoutSettings {
-    pub const SIDEBAR_MIN: f32 = 200.0;
-    pub const SIDEBAR_MAX: f32 = 460.0;
-    pub const TABS_MIN: f32 = 170.0;
-    pub const TABS_MAX: f32 = 420.0;
     pub const DIM_MAX: f32 = 0.8;
-
-    pub fn sidebar_width(&self) -> f32 {
-        sane(self.sidebar_width, Self::SIDEBAR_MIN, Self::SIDEBAR_MAX, 264.0)
-    }
-
-    pub fn tabs_width(&self) -> f32 {
-        sane(self.tabs_width, Self::TABS_MIN, Self::TABS_MAX, 232.0)
-    }
 
     pub fn dim_amount(&self) -> f32 {
         sane(self.dim_amount, 0.0, Self::DIM_MAX, 0.35)
     }
 
-    /// The sections in display order: every kind exactly once (unknown duplicates
-    /// dropped, missing ones appended), so a hand-edited file can't lose a section.
-    pub fn sections(&self) -> Vec<SectionEntry> {
-        normalize_sections(&self.sections)
-    }
-
-    pub fn is_collapsed(&self, kind: SidebarSection) -> bool {
-        self.sections().iter().any(|e| e.kind == kind && e.collapsed)
-    }
-
-    pub fn set_collapsed(&mut self, kind: SidebarSection, collapsed: bool) {
-        let mut list = self.sections();
-        for e in &mut list {
-            if e.kind == kind {
-                e.collapsed = collapsed;
-            }
+    /// The window side `c` docks on (`None` for the panel).
+    pub fn side_of(&self, c: Container) -> Option<Side> {
+        match c {
+            Container::Primary => Some(self.sidebar_side),
+            Container::Secondary => Some(self.sidebar_side.flip()),
+            Container::Panel => None,
         }
-        self.sections = list;
     }
 
-    /// Moves the section at `from` so it lands before the one now at `to`
-    /// (`to == len` moves it to the end).
-    pub fn move_section(&mut self, from: usize, to: usize) {
-        let mut list = self.sections();
-        move_item(&mut list, from, to);
-        self.sections = list;
+    /// The side bar docked on `side`.
+    pub fn container_at(&self, side: Side) -> Container {
+        if side == self.sidebar_side { Container::Primary } else { Container::Secondary }
     }
 
-    /// Whether the sidebar lists a "Sessions" section: only while tabs are on top,
-    /// since vertical tabs already have a panel of their own.
-    pub fn sessions_in_sidebar(&self) -> bool {
-        !self.tab_position.is_vertical()
+    /// Whether the panes hide their tab strips: vertical tabs are on screen instead.
+    pub fn tab_bars_hidden(&self) -> bool {
+        self.tab_position == TabPosition::Sidebar && self.views.is_shown(View::Sessions)
+    }
+
+    /// Back to the default arrangement of views (keeps tab and pane preferences).
+    pub fn reset_views(&mut self) {
+        self.views = ViewLayout::default();
+        self.sidebar_side = Side::Left;
     }
 }
 
 impl Default for LayoutSettings {
     fn default() -> Self {
         Self {
-            tab_position: TabPosition::Top,
+            tab_position: TabPosition::Sidebar,
             group_by_pane: true,
             compact_tabs: false,
-            tabs_width: 232.0,
             sidebar_side: Side::Left,
-            sidebar_visible: true,
-            sidebar_width: 264.0,
-            activity_bar: false,
-            active_view: SidebarSection::Hosts,
-            sections: SidebarSection::ALL.iter().map(|k| SectionEntry::new(*k)).collect(),
+            views: ViewLayout::default(),
             dim_inactive_panes: false,
             dim_amount: 0.35,
             focus_follows_mouse: false,
@@ -205,40 +133,135 @@ impl Default for LayoutSettings {
     }
 }
 
-pub fn normalize_sections(list: &[SectionEntry]) -> Vec<SectionEntry> {
-    let mut out: Vec<SectionEntry> = Vec::with_capacity(SidebarSection::ALL.len());
-    for e in list {
-        if !out.iter().any(|o| o.kind == e.kind) {
-            out.push(*e);
-        }
-    }
-    for k in SidebarSection::ALL {
-        if !out.iter().any(|o| o.kind == k) {
-            out.push(SectionEntry::new(k));
-        }
-    }
-    out
+// ---- loading (with the settings written before views could move) -------------------
+
+/// `tab_position` as any version wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum RawTabPosition {
+    Sidebar,
+    Top,
+    /// Older: a separate vertical "Sessions" panel on that side.
+    Left,
+    Right,
 }
 
-/// Moves `v[from]` so it ends up just before the element currently at `to`
-/// (`to == v.len()` = the end). Out-of-range `from` is ignored; `to` is clamped.
-pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) {
-    if from >= v.len() {
-        return;
-    }
-    let to = to.min(v.len());
-    if to == from || to == from + 1 {
-        return;
-    }
-    let item = v.remove(from);
-    let at = if to > from { to - 1 } else { to };
-    v.insert(at, item);
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct LegacySection {
+    kind: View,
 }
 
-/// Insertion index for a drag at `y` over rows whose vertical centres are `centres`
-/// (top to bottom): the first row whose centre lies below the pointer.
-pub fn insertion_index(centres: &[f32], y: f32) -> usize {
-    centres.iter().position(|c| y < *c).unwrap_or(centres.len())
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawLayout {
+    tab_position: Option<RawTabPosition>,
+    group_by_pane: bool,
+    compact_tabs: bool,
+    sidebar_side: Side,
+    views: Option<ViewLayout>,
+    dim_inactive_panes: bool,
+    dim_amount: f32,
+    focus_follows_mouse: bool,
+    // Older: one sidebar with stacked sections and an optional activity bar.
+    sections: Option<Vec<LegacySection>>,
+    activity_bar: bool,
+    active_view: Option<View>,
+    sidebar_visible: bool,
+    sidebar_width: Option<f32>,
+    tabs_width: Option<f32>,
+}
+
+impl Default for RawLayout {
+    fn default() -> Self {
+        let d = LayoutSettings::default();
+        Self {
+            tab_position: None,
+            group_by_pane: d.group_by_pane,
+            compact_tabs: d.compact_tabs,
+            sidebar_side: d.sidebar_side,
+            views: None,
+            dim_inactive_panes: d.dim_inactive_panes,
+            dim_amount: d.dim_amount,
+            focus_follows_mouse: d.focus_follows_mouse,
+            sections: None,
+            activity_bar: false,
+            active_view: None,
+            sidebar_visible: true,
+            sidebar_width: None,
+            tabs_width: None,
+        }
+    }
+}
+
+impl From<RawLayout> for LayoutSettings {
+    fn from(r: RawLayout) -> Self {
+        let tab_position = match r.tab_position {
+            Some(RawTabPosition::Top) => TabPosition::Top,
+            Some(_) | None => TabPosition::Sidebar,
+        };
+        let mut views = match r.views.clone() {
+            Some(v) => v,
+            None => migrate_views(&r),
+        };
+        views.normalize();
+        Self {
+            tab_position,
+            group_by_pane: r.group_by_pane,
+            compact_tabs: r.compact_tabs,
+            sidebar_side: r.sidebar_side,
+            views,
+            dim_inactive_panes: r.dim_inactive_panes,
+            dim_amount: r.dim_amount,
+            focus_follows_mouse: r.focus_follows_mouse,
+        }
+    }
+}
+
+/// Views from the old single sidebar: its sections (in their order) become the primary
+/// side bar's icons, a hidden sidebar becomes a folded one, and a separate vertical
+/// tabs panel on the far side becomes the secondary side bar holding Sessions.
+fn migrate_views(r: &RawLayout) -> ViewLayout {
+    let mut v = ViewLayout::default();
+    if let Some(sections) = &r.sections {
+        let mut order: Vec<View> = Vec::new();
+        for s in sections {
+            if !order.contains(&s.kind) {
+                order.push(s.kind);
+            }
+        }
+        v.primary.views = order;
+        v.normalize();
+        // The activity bar showed one section; stacked sections all showed, and the
+        // new default leads with Sessions.
+        v.primary.active = Some(if r.activity_bar { r.active_view.unwrap_or(View::Hosts) } else { View::Sessions });
+        v.primary.collapsed = !r.sidebar_visible;
+    }
+    if let Some(w) = r.sidebar_width {
+        v.primary.size = w;
+    }
+    let tabs_side = match r.tab_position {
+        Some(RawTabPosition::Left) => Some(Side::Left),
+        Some(RawTabPosition::Right) => Some(Side::Right),
+        _ => None,
+    };
+    if let Some(side) = tabs_side
+        && side != r.sidebar_side
+    {
+        let shown = v.primary.active;
+        v.move_view(View::Sessions, Container::Secondary, None);
+        v.secondary.size = r.tabs_width.unwrap_or(SIDE_DEFAULT);
+        // The old sidebar didn't list Sessions next to vertical tabs: keep what it showed.
+        if shown != Some(View::Sessions) {
+            v.primary.active = shown;
+        }
+    }
+    v.normalize();
+    v
+}
+
+/// Insertion index for a drag at `x` (or `y`) over items whose centres are `centres`
+/// (in order): the first item whose centre lies past the pointer.
+pub fn insertion_index(centres: &[f32], pos: f32) -> usize {
+    centres.iter().position(|c| pos < *c).unwrap_or(centres.len())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,50 +311,8 @@ fn sane(v: f32, min: f32, max: f32, default: f32) -> f32 {
 mod tests {
     use super::*;
 
-    fn kinds(l: &LayoutSettings) -> Vec<SidebarSection> {
-        l.sections().iter().map(|e| e.kind).collect()
-    }
-
     #[test]
-    fn move_item_inserts_before_target() {
-        let mut v = vec!['a', 'b', 'c', 'd'];
-        move_item(&mut v, 0, 2);
-        assert_eq!(v, vec!['b', 'a', 'c', 'd']);
-        move_item(&mut v, 3, 0);
-        assert_eq!(v, vec!['d', 'b', 'a', 'c']);
-        move_item(&mut v, 1, 4);
-        assert_eq!(v, vec!['d', 'a', 'c', 'b']);
-        // No-ops: onto itself, just after itself, out of range.
-        move_item(&mut v, 1, 1);
-        move_item(&mut v, 1, 2);
-        move_item(&mut v, 9, 0);
-        assert_eq!(v, vec!['d', 'a', 'c', 'b']);
-        move_item(&mut v, 0, 99);
-        assert_eq!(v, vec!['a', 'c', 'b', 'd']);
-    }
-
-    #[test]
-    fn sections_reorder_and_collapse() {
-        let mut l = LayoutSettings::default();
-        assert_eq!(kinds(&l), SidebarSection::ALL.to_vec());
-        l.move_section(2, 0);
-        assert_eq!(kinds(&l), vec![SidebarSection::Workspaces, SidebarSection::Hosts, SidebarSection::Sessions, SidebarSection::Agents]);
-        l.set_collapsed(SidebarSection::Hosts, true);
-        assert!(l.is_collapsed(SidebarSection::Hosts));
-        assert!(!l.is_collapsed(SidebarSection::Agents));
-        let back: LayoutSettings = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
-        assert_eq!(back, l);
-    }
-
-    #[test]
-    fn hand_edited_sections_are_repaired() {
-        let l: LayoutSettings = serde_json::from_str(r#"{"sections":[{"kind":"Workspaces"},{"kind":"Workspaces","collapsed":true}]}"#).unwrap();
-        assert_eq!(kinds(&l), vec![SidebarSection::Workspaces, SidebarSection::Hosts, SidebarSection::Sessions, SidebarSection::Agents]);
-        assert!(!l.is_collapsed(SidebarSection::Workspaces), "the first entry wins");
-    }
-
-    #[test]
-    fn insertion_index_follows_row_centres() {
+    fn insertion_index_follows_centres() {
         let c = [10.0, 30.0, 50.0];
         assert_eq!(insertion_index(&c, 0.0), 0);
         assert_eq!(insertion_index(&c, 20.0), 1);
@@ -341,11 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn widths_and_dim_are_clamped() {
-        let l = LayoutSettings { sidebar_width: 9999.0, tabs_width: f32::NAN, dim_amount: -1.0, ..Default::default() };
-        assert_eq!(l.sidebar_width(), LayoutSettings::SIDEBAR_MAX);
-        assert_eq!(l.tabs_width(), 232.0);
+    fn dim_is_clamped() {
+        let l = LayoutSettings { dim_amount: -1.0, ..Default::default() };
         assert_eq!(l.dim_amount(), 0.0);
+        assert_eq!(LayoutSettings { dim_amount: f32::NAN, ..Default::default() }.dim_amount(), 0.35);
+    }
+
+    #[test]
+    fn new_settings_round_trip() {
+        let mut l = LayoutSettings { tab_position: TabPosition::Top, sidebar_side: Side::Right, ..Default::default() };
+        l.views.move_view(View::Agents, Container::Panel, None);
+        l.views.secondary.bar = BarOrientation::Top;
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(!json.contains("sections") && !json.contains("activity_bar"), "legacy keys are not written: {json}");
+        let back: LayoutSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, l);
     }
 
     #[test]
@@ -353,11 +344,83 @@ mod tests {
         let old = r#"{"appearance":{"theme":"Nord"},"terminal":{"font_size":15.0},"keybindings":{"CloseTab":null}}"#;
         let s: crate::settings::Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.layout, LayoutSettings::default());
+        assert_eq!(s.layout.tab_position, TabPosition::Sidebar);
+        assert!(s.layout.views.is_shown(View::Sessions));
         assert_eq!(s.appearance.theme, "Nord");
-        let partial: crate::settings::Settings = serde_json::from_str(r#"{"layout":{"tab_position":"Right","dim_inactive_panes":true}}"#).unwrap();
-        assert_eq!(partial.layout.tab_position, TabPosition::Right);
-        assert!(partial.layout.dim_inactive_panes && partial.layout.sidebar_visible);
-        assert_eq!(partial.layout.sections().len(), SidebarSection::ALL.len());
+        let partial: crate::settings::Settings = serde_json::from_str(r#"{"layout":{"dim_inactive_panes":true}}"#).unwrap();
+        assert!(partial.layout.dim_inactive_panes);
+        assert_eq!(partial.layout.views, ViewLayout::default());
+    }
+
+    /// A settings file from before views: tabs on top, activity bar off, sections
+    /// reordered, sidebar hidden.
+    #[test]
+    fn old_sidebar_sections_become_the_primary_strip() {
+        let old = r#"{"tab_position":"Top","sidebar_side":"Right","sidebar_visible":false,"sidebar_width":300.0,"activity_bar":false,"active_view":"Hosts",
+            "sections":[{"kind":"Workspaces","collapsed":false},{"kind":"Hosts","collapsed":true},{"kind":"Sessions","collapsed":false},{"kind":"Agents","collapsed":false}]}"#;
+        let l: LayoutSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(l.tab_position, TabPosition::Top);
+        assert_eq!(l.sidebar_side, Side::Right);
+        assert_eq!(l.views.primary.views, vec![View::Workspaces, View::Hosts, View::Sessions, View::Agents]);
+        assert_eq!(l.views.primary.active, Some(View::Sessions));
+        assert!(l.views.primary.collapsed, "a hidden sidebar is a folded one");
+        assert_eq!(l.views.size(Container::Primary), 300.0);
+        assert!(l.views.secondary.is_empty() && l.views.panel.is_empty());
+    }
+
+    #[test]
+    fn old_activity_bar_keeps_its_view() {
+        let old = r#"{"activity_bar":true,"active_view":"Agents","sections":[{"kind":"Hosts"},{"kind":"Sessions"},{"kind":"Workspaces"},{"kind":"Agents"}]}"#;
+        let l: LayoutSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(l.views.primary.active, Some(View::Agents));
+        assert!(!l.views.primary.collapsed);
+    }
+
+    /// Vertical tabs used to have a panel of their own: on the far side it becomes the
+    /// secondary side bar holding Sessions; on the sidebar's side it just joins it.
+    #[test]
+    fn old_vertical_tabs_panel_maps_to_a_container() {
+        let far = r#"{"tab_position":"Right","sidebar_side":"Left","tabs_width":250.0,"activity_bar":true,"active_view":"Hosts",
+            "sections":[{"kind":"Hosts"},{"kind":"Sessions"},{"kind":"Workspaces"},{"kind":"Agents"}]}"#;
+        let l: LayoutSettings = serde_json::from_str(far).unwrap();
+        assert_eq!(l.tab_position, TabPosition::Sidebar);
+        assert_eq!(l.views.secondary.views, vec![View::Sessions]);
+        assert_eq!(l.views.size(Container::Secondary), 250.0);
+        assert_eq!(l.views.primary.active, Some(View::Hosts));
+        assert!(l.tab_bars_hidden());
+        let near: LayoutSettings = serde_json::from_str(r#"{"tab_position":"Left"}"#).unwrap();
+        assert_eq!(near.tab_position, TabPosition::Sidebar);
+        assert_eq!(near.views.container_of(View::Sessions), Some(Container::Primary));
+        assert!(near.views.secondary.is_empty());
+    }
+
+    #[test]
+    fn tab_bars_come_back_when_sessions_is_not_on_screen() {
+        let mut l = LayoutSettings::default();
+        assert!(l.tab_bars_hidden());
+        l.views.click(View::Hosts);
+        assert!(!l.tab_bars_hidden());
+        l.views.move_view(View::Sessions, Container::Panel, None);
+        assert!(l.tab_bars_hidden());
+        l.views.toggle(Container::Panel);
+        assert!(!l.tab_bars_hidden());
+        l.tab_position = TabPosition::Top;
+        l.views.toggle(Container::Panel);
+        assert!(!l.tab_bars_hidden());
+    }
+
+    #[test]
+    fn containers_dock_on_sides() {
+        let mut l = LayoutSettings::default();
+        assert_eq!(l.side_of(Container::Primary), Some(Side::Left));
+        assert_eq!(l.container_at(Side::Right), Container::Secondary);
+        l.sidebar_side = Side::Right;
+        assert_eq!(l.side_of(Container::Secondary), Some(Side::Left));
+        assert_eq!(l.side_of(Container::Panel), None);
+        l.views.move_view(View::Hosts, Container::Panel, None);
+        l.reset_views();
+        assert_eq!(l.views, ViewLayout::default());
+        assert_eq!(l.sidebar_side, Side::Left);
     }
 
     #[test]
@@ -378,8 +441,7 @@ mod tests {
 
     #[test]
     fn positions_cycle() {
-        assert_eq!(TabPosition::Top.next().next().next(), TabPosition::Top);
-        assert!(TabPosition::Left.is_vertical() && !TabPosition::Top.is_vertical());
+        assert_eq!(TabPosition::Top.next().next(), TabPosition::Top);
         assert_eq!(Side::Left.flip(), Side::Right);
     }
 }

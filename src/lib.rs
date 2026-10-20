@@ -27,4 +27,5 @@ pub mod theme_import;
 pub mod themes;
 pub mod ui;
 pub mod updater;
+pub mod views;
 pub mod workspace;

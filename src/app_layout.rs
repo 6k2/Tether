@@ -1,250 +1,22 @@
-//! Window arrangement: activity bar, sidebar sections, the vertical tabs panel, and
-//! tab / pane operations (focus, move, split, zoom, rename). A child module of `app`.
+//! Tab and pane operations (focus, move, split, zoom, rename) and the small layout
+//! commands (toggle containers, tab position). The view containers themselves are in
+//! `app_views.rs`. A child module of `app`.
 
-use eframe::egui::{self, RichText};
+use eframe::egui;
 use egui_dock::{DockState, Node, NodePath, TabIndex, TabInsert, TabViewer};
 
 use super::TetherApp;
 use crate::keybindings::{self, Action};
-use crate::layout::{Direction, LayoutSettings, Side, SidebarSection, TabPosition};
+use crate::layout::{Container, Direction, Side, TabPosition, View};
 use crate::profile::secret;
 use crate::settings;
 use crate::theme;
-use crate::ui::agents_panel;
 use crate::ui::settings_view::{Section, SettingsView};
-use crate::ui::sidebar::{Sidebar, SidebarAction, SidebarData};
-use crate::ui::sidebar_sections::{self as sections, ActivityEvent, BodySize, SectionEvent, SectionHost};
 use crate::ui::tabs::{PaneFx, Tab, TabBody, Viewer};
-use crate::ui::vertical_tabs::{ListOptions, TabAction, TabTarget, VerticalTabs};
+use crate::ui::vertical_tabs::{TabAction, TabTarget};
 use crate::workspace::TabKind;
 
-/// Max share of the sidebar the Sessions section takes before it scrolls.
-const SESSIONS_MAX_SHARE: f32 = 0.4;
-const SESSIONS_EMPTY_H: f32 = 34.0;
-const AGENTS_MAX_SHARE: f32 = 0.45;
-
-/// Gives the sidebar sections their content.
-struct Host<'a, 'd> {
-    sidebar: &'a mut Sidebar,
-    data: &'a SidebarData<'d>,
-    dock: &'a mut DockState<Tab>,
-    vtabs: &'a mut VerticalTabs,
-    opts: ListOptions,
-    actions: Vec<SidebarAction>,
-    tab_actions: Vec<TabAction>,
-    /// AI agent sessions for the "Agents" section, and what was clicked there.
-    agents: &'a [crate::agents::SessionInfo],
-    agent_action: Option<crate::ui::agents_panel::PanelAction>,
-}
-
-impl SectionHost for Host<'_, '_> {
-    fn size(&self, kind: SidebarSection, avail: f32) -> BodySize {
-        match kind {
-            SidebarSection::Hosts => BodySize::Flex,
-            SidebarSection::Sessions => {
-                let h = VerticalTabs::list_height(self.dock, self.opts);
-                BodySize::Fixed(if h <= 0.0 { SESSIONS_EMPTY_H } else { h.min(avail * SESSIONS_MAX_SHARE) + 4.0 })
-            }
-            SidebarSection::Workspaces => BodySize::Fixed(self.sidebar.workspaces_height(self.data)),
-            SidebarSection::Agents => BodySize::Fixed(agents_panel::list_height(self.agents).min(avail * AGENTS_MAX_SHARE)),
-        }
-    }
-
-    fn count(&self, kind: SidebarSection) -> Option<usize> {
-        match kind {
-            SidebarSection::Hosts => Some(Sidebar::host_count(self.data)),
-            SidebarSection::Sessions => Some(self.dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count()),
-            SidebarSection::Workspaces => Some(self.data.workspaces.len()),
-            SidebarSection::Agents => Some(agents_panel::waiting(self.agents)),
-        }
-    }
-
-    fn header_extra(&mut self, kind: SidebarSection, ui: &mut egui::Ui) {
-        match kind {
-            SidebarSection::Workspaces => self.sidebar.workspaces_header(ui, self.data),
-            SidebarSection::Sessions => {
-                let tip = keybindings::hint("New terminal", Action::NewLocalTerminal);
-                if ui.add(egui::Button::new(RichText::new("+").size(14.0)).frame(false)).on_hover_text(tip).clicked() {
-                    self.tab_actions.push(TabAction::NewShell(None));
-                }
-            }
-            SidebarSection::Hosts | SidebarSection::Agents => {}
-        }
-    }
-
-    fn body(&mut self, kind: SidebarSection, ui: &mut egui::Ui) {
-        match kind {
-            SidebarSection::Hosts => {
-                let a = self.sidebar.hosts_body(ui, self.data);
-                self.actions.extend(a);
-            }
-            SidebarSection::Sessions => {
-                if self.dock.iter_all_tabs().next().is_none() {
-                    ui.label(RichText::new("   No open sessions").size(11.5).color(theme::text_faint()));
-                    return;
-                }
-                egui::ScrollArea::vertical().id_salt("sidebar_sessions").max_height(ui.available_height()).auto_shrink([false, true]).show(ui, |ui| {
-                    let a = self.vtabs.list(ui, self.dock, self.opts);
-                    self.tab_actions.extend(a);
-                });
-            }
-            SidebarSection::Workspaces => {
-                let a = self.sidebar.workspaces_body(ui, self.data);
-                self.actions.extend(a);
-            }
-            SidebarSection::Agents => {
-                self.agent_action = agents_panel::list(ui, self.agents, std::time::Instant::now());
-                // Elapsed times tick while sessions are listed.
-                if !self.agents.is_empty() {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-                }
-            }
-        }
-    }
-}
-
-fn list_options(l: &LayoutSettings) -> ListOptions {
-    ListOptions { grouped: l.group_by_pane, compact: l.compact_tabs }
-}
-
-fn side_panel(id: &'static str, side: Side) -> egui::Panel {
-    match side {
-        Side::Left => egui::Panel::left(id),
-        Side::Right => egui::Panel::right(id),
-    }
-}
-
 impl TetherApp {
-    /// Activity bar, sidebar and the vertical tabs panel, in that order from the edge.
-    pub(super) fn side_panels(&mut self, ui: &mut egui::Ui) {
-        let l = settings::snapshot().layout.clone();
-        if l.activity_bar {
-            self.activity_bar(ui, &l);
-        }
-        self.sidebar_panel(ui, &l);
-        if l.tab_position.is_vertical() {
-            self.tabs_panel(ui, &l);
-        }
-    }
-
-    fn activity_bar(&mut self, ui: &mut egui::Ui, l: &LayoutSettings) {
-        let frame = egui::Frame::new().fill(theme::bg());
-        let entries: Vec<_> = l.sections().into_iter().filter(|e| e.kind != SidebarSection::Sessions || l.sessions_in_sidebar()).collect();
-        let tabs = self.dock.iter_all_tabs().count();
-        let workspaces = self.workspaces.names().len();
-        let badge = move |k: SidebarSection| match k {
-            SidebarSection::Sessions => Some(tabs),
-            SidebarSection::Workspaces if workspaces > 0 => None,
-            _ => None,
-        };
-        let on_right = l.sidebar_side == Side::Right;
-        let event = side_panel("activity_bar", l.sidebar_side)
-            .exact_size(sections::ACTIVITY_W)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(frame)
-            .show(ui, |ui| {
-                let r = ui.max_rect();
-                let x = if on_right { r.left() + 0.5 } else { r.right() - 0.5 };
-                ui.painter().vline(x, r.y_range(), egui::Stroke::new(1.0, theme::border().gamma_multiply(0.5)));
-                sections::activity_bar(ui, &entries, l.active_view, l.sidebar_visible, &badge, on_right)
-            })
-            .inner;
-        match event {
-            Some(ActivityEvent::Show(kind)) => {
-                let _ = settings::update(|s| {
-                    s.layout.active_view = kind;
-                    s.layout.sidebar_visible = true;
-                });
-            }
-            Some(ActivityEvent::ToggleSidebar) => toggle_sidebar(),
-            Some(ActivityEvent::OpenSettings) => {
-                self.settings_view.get_or_insert_with(SettingsView::new);
-            }
-            Some(ActivityEvent::OpenPalette) => self.open_palette(),
-            None => {}
-        }
-    }
-
-    fn sidebar_panel(&mut self, ui: &mut egui::Ui, l: &LayoutSettings) {
-        let margin = match l.sidebar_side {
-            Side::Left => egui::Margin { left: 12, right: 8, top: 4, bottom: 10 },
-            Side::Right => egui::Margin { left: 8, right: 12, top: 4, bottom: 10 },
-        };
-        let frame = egui::Frame::new().fill(theme::bg()).inner_margin(margin);
-        let workspaces = self.workspace_infos();
-        let pool = self.pool.clone();
-        let is_live = move |id| pool.has_live(id);
-        let has_tabs = self.layout_specs().is_some();
-        let shells = crate::pty::shells::detected().unwrap_or_default();
-        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live, shells };
-        let sessions = self.agents.sessions();
-        let mut host = Host {
-            sidebar: &mut self.sidebar,
-            data: &data,
-            dock: &mut self.dock,
-            vtabs: &mut self.vtabs,
-            opts: list_options(l),
-            actions: Vec::new(),
-            tab_actions: Vec::new(),
-            agents: sessions,
-            agent_action: None,
-        };
-        let mut visible = l.sidebar_visible;
-        let entries: Vec<_> = l.sections().into_iter().filter(|e| e.kind != SidebarSection::Sessions || l.sessions_in_sidebar()).collect();
-        let single = l.activity_bar.then(|| if entries.iter().any(|e| e.kind == l.active_view) { l.active_view } else { SidebarSection::Hosts });
-        let shown = side_panel("sidebar", l.sidebar_side)
-            .resizable(true)
-            .default_size(l.sidebar_width())
-            .size_range(LayoutSettings::SIDEBAR_MIN..=LayoutSettings::SIDEBAR_MAX)
-            .frame(frame)
-            .show_separator_line(false)
-            .show_collapsible(ui, &mut visible, |ui| {
-                let title = host.sidebar.title_bar(ui, host.data);
-                host.actions.extend(title);
-                match single {
-                    Some(kind) => {
-                        sections::single(ui, kind, &mut host);
-                        Vec::new()
-                    }
-                    None => sections::stacked(ui, &entries, &mut host),
-                }
-            });
-        let (actions, tab_actions, agent_action) = (std::mem::take(&mut host.actions), std::mem::take(&mut host.tab_actions), host.agent_action.take());
-        drop(host);
-        if let Some(r) = &shown {
-            // A hairline between the sidebar and what is next to it.
-            let edge = r.response.rect;
-            let x = if l.sidebar_side == Side::Left { edge.right() - 0.5 } else { edge.left() + 0.5 };
-            ui.painter().vline(x, edge.y_range().shrink(8.0), egui::Stroke::new(1.0, theme::border().gamma_multiply(0.35)));
-            persist_width(r.response.rect.width() - f32::from(margin.left + margin.right), l.sidebar_width(), ui.ctx(), |s, w| s.layout.sidebar_width = w);
-        }
-        let events = shown.map(|r| r.inner).unwrap_or_default();
-        if visible != l.sidebar_visible {
-            let _ = settings::update(|s| s.layout.sidebar_visible = visible);
-        }
-        apply_section_events(events);
-        for a in actions {
-            self.apply_sidebar(a, ui.ctx());
-        }
-        self.apply_tab_actions(tab_actions, ui.ctx());
-        self.apply_agents_panel(agent_action, ui.ctx());
-    }
-
-    fn tabs_panel(&mut self, ui: &mut egui::Ui, l: &LayoutSettings) {
-        let side = if l.tab_position == TabPosition::Right { Side::Right } else { Side::Left };
-        let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 6, right: 6, top: 4, bottom: 8 });
-        let resp = side_panel("vertical_tabs", side)
-            .resizable(true)
-            .default_size(l.tabs_width())
-            .size_range(LayoutSettings::TABS_MIN..=LayoutSettings::TABS_MAX)
-            .frame(frame)
-            .show_separator_line(false)
-            .show(ui, |ui| self.vtabs.panel(ui, &mut self.dock, list_options(l), l.tab_position));
-        persist_width(resp.response.rect.width() - 12.0, l.tabs_width(), ui.ctx(), |s, w| s.layout.tabs_width = w);
-        self.apply_tab_actions(resp.inner, ui.ctx());
-    }
-
     // ---- tab operations -------------------------------------------------------------
 
     pub(super) fn apply_tab_actions(&mut self, actions: Vec<TabAction>, ctx: &egui::Context) {
@@ -458,7 +230,7 @@ impl TetherApp {
             active_uid: self.active_uid(),
             multi_pane: self.panes().len() > 1 && self.zoomed.is_none(),
             dim: if l.dim_inactive_panes { l.dim_amount() } else { 0.0 },
-            outline: l.tab_position.is_vertical(),
+            outline: l.tab_bars_hidden(),
             focus_follows_mouse: l.focus_follows_mouse && !overlay_open,
             terminal_ids: std::mem::take(&mut self.terminal_ids),
         }
@@ -550,37 +322,14 @@ impl TetherApp {
     }
 }
 
-/// Saves a panel's width once the user lets go of its edge.
-fn persist_width(width: f32, saved: f32, ctx: &egui::Context, set: impl FnOnce(&mut settings::Settings, f32)) {
-    if (width - saved).abs() > 1.0 && !ctx.input(|i| i.pointer.any_down()) {
-        let _ = settings::update(|s| set(s, width.round()));
-    }
+/// Folds or opens a container.
+pub(super) fn toggle_container(c: Container) {
+    let _ = settings::update(|s| s.layout.views.toggle(c));
 }
 
-fn apply_section_events(events: Vec<SectionEvent>) {
-    if events.is_empty() {
-        return;
-    }
-    let _ = settings::update(|s| {
-        for e in events {
-            match e {
-                SectionEvent::SetCollapsed(kind, c) => s.layout.set_collapsed(kind, c),
-                SectionEvent::Move { from, to } => {
-                    // Indices count the sections shown, which may skip Sessions.
-                    let shown: Vec<SidebarSection> = s.layout.sections().into_iter().filter(|e| e.kind != SidebarSection::Sessions || s.layout.sessions_in_sidebar()).map(|e| e.kind).collect();
-                    let all: Vec<SidebarSection> = s.layout.sections().into_iter().map(|e| e.kind).collect();
-                    let Some(kind) = shown.get(from) else { continue };
-                    let Some(from_all) = all.iter().position(|k| k == kind) else { continue };
-                    let to_all = shown.get(to).and_then(|k| all.iter().position(|a| a == k)).unwrap_or(all.len());
-                    s.layout.move_section(from_all, to_all);
-                }
-            }
-        }
-    });
-}
-
-pub(super) fn toggle_sidebar() {
-    let _ = settings::update(|s| s.layout.sidebar_visible = !s.layout.sidebar_visible);
+/// Brings `view` up (un-hiding it and opening its container).
+pub(super) fn reveal_view(view: View) {
+    let _ = settings::update(|s| s.layout.views.reveal(view));
 }
 
 pub(super) fn set_tab_position(p: TabPosition) {
@@ -591,9 +340,10 @@ pub(super) fn set_sidebar_side(side: Side) {
     let _ = settings::update(|s| s.layout.sidebar_side = side);
 }
 
-/// The dock with tab bars hidden in vertical mode; returns whether they are hidden.
+/// The dock with tab bars hidden while vertical tabs are on screen; returns whether
+/// they are hidden.
 pub(super) fn sync_tab_bars(dock: &mut DockState<Tab>) -> bool {
-    let hide = settings::snapshot().layout.tab_position.is_vertical();
+    let hide = settings::snapshot().layout.tab_bars_hidden();
     for (_, leaf) in dock.iter_leaves_mut() {
         leaf.tab_bar_hidden = hide;
     }

@@ -12,7 +12,7 @@ use super::TetherApp;
 use crate::agents::hub::{Alert, TermInfo};
 use crate::agents::{AgentKind, AgentState, install, notify};
 use crate::keybindings::{self, Action};
-use crate::layout::SidebarSection;
+use crate::layout::View;
 use crate::theme;
 use crate::ui::agent_status::PopoverAction;
 use crate::ui::agents_panel::{LaunchPick, PanelAction};
@@ -185,30 +185,10 @@ impl TetherApp {
         }
     }
 
-    /// Whether the "Agents" sidebar section is on screen (sidebar open, section shown).
-    pub(super) fn agents_shown(&self) -> bool {
-        let l = &crate::settings::snapshot().layout;
-        l.sidebar_visible && if l.activity_bar { l.active_view == SidebarSection::Agents } else { !l.is_collapsed(SidebarSection::Agents) }
-    }
-
-    /// Ctrl+Shift+J / the top-bar button: show the "Agents" section of the sidebar
-    /// (opening the sidebar if needed), or fold it away when it is already showing.
+    /// Ctrl+Shift+J / the top-bar button: show the "Agents" view (wherever it lives,
+    /// opening its container), or fold that container when it is already showing.
     pub(super) fn toggle_agents(&mut self) {
-        let shown = self.agents_shown();
-        let _ = crate::settings::update(|s| {
-            let l = &mut s.layout;
-            if shown {
-                if l.activity_bar {
-                    l.sidebar_visible = false;
-                } else {
-                    l.set_collapsed(SidebarSection::Agents, true);
-                }
-            } else {
-                l.sidebar_visible = true;
-                l.active_view = SidebarSection::Agents;
-                l.set_collapsed(SidebarSection::Agents, false);
-            }
-        });
+        let _ = crate::settings::update(|s| s.layout.views.click(View::Agents));
     }
 
     pub(super) fn apply_agents_panel(&mut self, action: Option<PanelAction>, ctx: &egui::Context) {

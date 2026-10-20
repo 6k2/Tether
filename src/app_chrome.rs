@@ -8,7 +8,7 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Resp
 
 use super::TetherApp;
 use crate::keybindings::{self, Action};
-use crate::layout::{Side, TabPosition};
+use crate::layout::{Container, Side, TabPosition};
 use crate::settings;
 use crate::theme;
 use crate::ui::import_view::ImportDialog;
@@ -205,15 +205,28 @@ impl TetherApp {
         let mut l = before.clone();
         ui.spacing_mut().item_spacing.y = 6.0;
         ui.label(RichText::new("TABS").size(10.5).color(theme::text_faint()));
-        w::segmented(ui, &mut l.tab_position, &[(TabPosition::Top, "Top"), (TabPosition::Left, "Left"), (TabPosition::Right, "Right")]);
+        w::segmented(ui, &mut l.tab_position, &[(TabPosition::Sidebar, "Sessions view"), (TabPosition::Top, "Top of panes")]);
         ui.add_space(4.0);
-        ui.label(RichText::new("SIDEBAR").size(10.5).color(theme::text_faint()));
+        ui.label(RichText::new("SIDE BARS & PANEL").size(10.5).color(theme::text_faint()));
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Primary on the").size(12.0).color(theme::text_dim()));
             w::segmented(ui, &mut l.sidebar_side, &[(Side::Left, "Left"), (Side::Right, "Right")]);
-            ui.add_space(8.0);
-            ui.checkbox(&mut l.sidebar_visible, "Visible");
         });
-        ui.checkbox(&mut l.activity_bar, "Activity bar");
+        for (c, action) in [(Container::Primary, Action::ToggleSidebar), (Container::Secondary, Action::ToggleSecondarySidebar), (Container::Panel, Action::TogglePanel)] {
+            let state = l.views.get_mut(c);
+            let mut open = !state.collapsed;
+            let label = if state.is_empty() { format!("{} (empty)", c.title()) } else { c.title().to_string() };
+            let resp = ui.add_enabled(!state.is_empty(), egui::Checkbox::new(&mut open, label));
+            if resp.changed() {
+                state.collapsed = !open;
+            }
+            resp.on_hover_text(keybindings::hint("Show or fold", action));
+        }
+        if ui.add(egui::Button::new("Reset view layout").shortcut_text(keybindings::label(Action::ResetLayout))).clicked() {
+            super::views_ui::reset_layout(ui.ctx());
+            ui.close();
+            return;
+        }
         ui.add_space(4.0);
         ui.label(RichText::new("PANES").size(10.5).color(theme::text_faint()));
         ui.checkbox(&mut l.dim_inactive_panes, "Dim inactive panes");
@@ -237,8 +250,8 @@ impl TetherApp {
 fn sidebar_toggle(ui: &mut egui::Ui) {
     let l = settings::snapshot().layout.clone();
     let icon = if l.sidebar_side == Side::Right { Icon::SidebarRight } else { Icon::SidebarLeft };
-    let tip = keybindings::hint(if l.sidebar_visible { "Hide sidebar" } else { "Show sidebar" }, Action::ToggleSidebar);
+    let tip = keybindings::hint(if l.views.primary.collapsed { "Show primary side bar" } else { "Hide primary side bar" }, Action::ToggleSidebar);
     if icon_btn(ui, icon, ButtonTone::Normal, "Toggle sidebar", &tip).clicked() {
-        super::layout_ui::toggle_sidebar();
+        super::layout_ui::toggle_container(Container::Primary);
     }
 }

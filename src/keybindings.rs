@@ -43,6 +43,11 @@ pub enum Action {
     RenameTab,
     PrevPrompt,
     NextPrompt,
+    ToggleSecondarySidebar,
+    TogglePanel,
+    FocusSessionsView,
+    FocusWorkspacesView,
+    ResetLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +74,13 @@ impl Group {
 }
 
 impl Action {
-    pub const ALL: [Action; 35] = [
+    pub const ALL: [Action; 40] = [
         Action::CommandPalette,
         Action::ToggleSidebar,
+        Action::ToggleSecondarySidebar,
+        Action::TogglePanel,
+        Action::FocusSessionsView,
+        Action::FocusWorkspacesView,
         Action::OpenSettings,
         Action::KeyManager,
         Action::NewHost,
@@ -104,12 +113,18 @@ impl Action {
         Action::ZoomPane,
         Action::CycleTabPosition,
         Action::MoveSidebar,
+        Action::ResetLayout,
         Action::RenameTab,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Action::ToggleSidebar => "Toggle sidebar",
+            Action::ToggleSidebar => "Toggle primary side bar",
+            Action::ToggleSecondarySidebar => "Toggle secondary side bar",
+            Action::TogglePanel => "Toggle panel",
+            Action::FocusSessionsView => "Show the Sessions view",
+            Action::FocusWorkspacesView => "Show the Workspaces view",
+            Action::ResetLayout => "Reset view layout",
             Action::OpenSettings => "Open settings",
             Action::KeyManager => "Open key manager",
             Action::NewHost => "New host",
@@ -140,7 +155,7 @@ impl Action {
             Action::FocusPaneDown => "Focus pane below",
             Action::ZoomPane => "Maximize / restore pane",
             Action::CycleTabPosition => "Cycle tab position (top, left, right)",
-            Action::MoveSidebar => "Move sidebar to the other side",
+            Action::MoveSidebar => "Swap side bars (left / right)",
             Action::RenameTab => "Rename tab",
             Action::PrevPrompt => "Previous command (prompt)",
             Action::NextPrompt => "Next command (prompt)",
@@ -151,6 +166,10 @@ impl Action {
         match self {
             Action::CommandPalette
             | Action::ToggleSidebar
+            | Action::ToggleSecondarySidebar
+            | Action::TogglePanel
+            | Action::FocusSessionsView
+            | Action::FocusWorkspacesView
             | Action::OpenSettings
             | Action::KeyManager
             | Action::NewHost
@@ -174,7 +193,8 @@ impl Action {
             | Action::FocusPaneDown
             | Action::ZoomPane
             | Action::CycleTabPosition
-            | Action::MoveSidebar => Group::Panes,
+            | Action::MoveSidebar
+            | Action::ResetLayout => Group::Panes,
             Action::FontBigger | Action::FontSmaller | Action::FontReset | Action::PrevPrompt | Action::NextPrompt => Group::Terminal,
             Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => Group::Sftp,
         }
@@ -189,6 +209,13 @@ impl Action {
         let sa = |k| Some(Binding::new(k, false, true, true));
         match self {
             Action::ToggleSidebar => cs(Key::B),
+            // Not Ctrl+Alt+B (VS Code): Windows reports AltGr as Ctrl+Alt.
+            Action::ToggleSecondarySidebar => sa(Key::B),
+            // Not Ctrl+J / Ctrl+` (VS Code): terminals need Ctrl+J (newline) and `
+            // is a dead key on many layouts.
+            Action::TogglePanel => cs(Key::Y),
+            Action::FocusSessionsView => cs(Key::S),
+            Action::FocusWorkspacesView | Action::ResetLayout => None,
             Action::OpenSettings => c(Key::Comma),
             Action::KeyManager => cs(Key::K),
             Action::NewHost => cs(Key::N),

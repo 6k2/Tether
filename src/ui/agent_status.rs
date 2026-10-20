@@ -289,12 +289,18 @@ fn popover_body(ui: &mut egui::Ui, d: &PopoverData<'_>) -> Option<PopoverAction>
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let jump = egui::Button::new(RichText::new("Jump to tab").size(12.0).color(theme::on_accent())).fill(theme::accent()).corner_radius(CornerRadius::same(6)).min_size(Vec2::new(0.0, 26.0));
+        let jump = egui::Button::new(RichText::new("Jump to tab").size(12.0).color(theme::on_accent()))
+            .fill(theme::accent())
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 26.0));
         if ui.add(jump).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             action = Some(PopoverAction::Jump(s.uid));
         }
         let unread = s.state.needs_attention();
-        let read = egui::Button::new(RichText::new("Mark as read").size(12.0)).fill(theme::surface_3()).corner_radius(CornerRadius::same(6)).min_size(Vec2::new(0.0, 26.0));
+        let read = egui::Button::new(RichText::new("Mark as read").size(12.0))
+            .fill(theme::surface_3())
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 26.0));
         let resp = ui.add_enabled(unread, read).on_disabled_hover_text("Nothing new in this session");
         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             action = Some(PopoverAction::MarkRead(s.uid));

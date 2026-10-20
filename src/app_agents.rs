@@ -23,7 +23,13 @@ fn local_terms<'a>(dock: &'a DockState<Tab>, out: &mut Vec<TermInfo<'a>>) {
     for (_, leaf) in dock.iter_leaves() {
         for (i, tab) in leaf.tabs.iter().enumerate() {
             if let (TabBody::Terminal(view), true) = (&tab.body, tab.is_local()) {
-                out.push(TermInfo { uid: tab.uid, handle: &view.handle, visible: i == leaf.active.0, label: tab.profile.display_name(), custom: tab.custom_title.as_deref() });
+                out.push(TermInfo {
+                    uid: tab.uid,
+                    handle: &view.handle,
+                    visible: i == leaf.active.0,
+                    label: tab.profile.display_name(),
+                    custom: tab.custom_title.as_deref(),
+                });
             }
         }
     }
@@ -163,7 +169,10 @@ impl TetherApp {
             return;
         }
         let text = RichText::new(format!("{waiting}")).size(12.0).strong().color(theme::warn());
-        let tip = keybindings::hint(&format!("{waiting} agent session{} need{} you: jump to the next", if waiting == 1 { "" } else { "s" }, if waiting == 1 { "s" } else { "" }), Action::NextAttention);
+        let tip = keybindings::hint(
+            &format!("{waiting} agent session{} need{} you: jump to the next", if waiting == 1 { "" } else { "s" }, if waiting == 1 { "s" } else { "" }),
+            Action::NextAttention,
+        );
         let resp = super::chrome::chrome_button(ui, Some(crate::ui::settings_widgets::Icon::Sparkle), Some(text), super::chrome::ButtonTone::Warn, &tip);
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Agents · {waiting} need attention")));
         if resp.clicked() {

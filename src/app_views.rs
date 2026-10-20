@@ -98,7 +98,13 @@ impl Host<'_, '_> {
         let w = galley.size().x;
         p.galley(Pos2::new(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0), galley, theme::text_faint());
         if let Some(n) = self.count(v).filter(|n| *n > 0) {
-            p.text(Pos2::new(rect.left() + 4.0 + w + 6.0, rect.center().y), Align2::LEFT_CENTER, n.to_string(), FontId::proportional(10.5), theme::text_faint().gamma_multiply(0.7));
+            p.text(
+                Pos2::new(rect.left() + 4.0 + w + 6.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                n.to_string(),
+                FontId::proportional(10.5),
+                theme::text_faint().gamma_multiply(0.7),
+            );
         }
         let mut buttons = ui.new_child(UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
         self.header_buttons(v, &mut buttons);
@@ -318,12 +324,20 @@ fn panel_container(ui: &mut Ui, f: &mut Frame<'_>, host: &mut Host<'_, '_>) {
     let r = egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, expanded| {
         let (tabs, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), activity::TABS_H), Sense::hover());
         let full = ui.max_rect();
-        ui.painter().hline(full.expand2(Vec2::new(f32::from(PAD), 0.0)).x_range(), full.top() + 0.5, egui::Stroke::new(1.0, theme::border().gamma_multiply(0.45)));
+        ui.painter().hline(
+            full.expand2(Vec2::new(f32::from(PAD), 0.0)).x_range(),
+            full.top() + 0.5,
+            egui::Stroke::new(1.0, theme::border().gamma_multiply(0.45)),
+        );
         let strip = Strip { container: Container::Panel, state, hidden: &f.l.views.hidden, style: StripStyle::Tabs, marker_right: false, badge: f.badge };
         let strip_w = strip_width(ui, state, f.badge).min(tabs.width() * 0.6);
         strip.show(ui, Rect::from_min_size(tabs.min, Vec2::new(strip_w, tabs.height())), f.targets, &mut f.events);
         // Right side: the view's own buttons, then fold / unfold.
-        let mut right = ui.new_child(UiBuilder::new().max_rect(Rect::from_min_max(Pos2::new(tabs.left() + strip_w, tabs.top()), tabs.max)).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        let mut right = ui.new_child(
+            UiBuilder::new()
+                .max_rect(Rect::from_min_max(Pos2::new(tabs.left() + strip_w, tabs.top()), tabs.max))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
         right.spacing_mut().item_spacing.x = 2.0;
         let tip = crate::keybindings::hint(if expanded { "Fold panel" } else { "Unfold panel" }, crate::keybindings::Action::TogglePanel);
         if fold_button(&mut right, expanded).on_hover_text(tip).clicked() {

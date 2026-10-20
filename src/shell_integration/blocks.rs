@@ -423,7 +423,13 @@ impl ShellState {
                 let lazy = self.lazy_marks;
                 if let Some(b) = self.blocks.back_mut().filter(|b| b.phase == Phase::Running) {
                     // Lazy marks: the end is fixed up when the next prompt settles.
-                    let end = if lazy { 0 } else if col > 0 { line + 1 } else { line };
+                    let end = if lazy {
+                        0
+                    } else if col > 0 {
+                        line + 1
+                    } else {
+                        line
+                    };
                     b.phase = Phase::Done;
                     b.exit = exit;
                     b.end_line = Some(end.max(b.output_line.unwrap_or(end)));

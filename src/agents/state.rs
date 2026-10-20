@@ -201,9 +201,7 @@ impl Tracker {
                 // Child scripts and shells often ring `\x07` while Claude is working; never
                 // let a bell interrupt a hooked turn, an active spinner, or running subprocesses.
                 AgentState::Idle if !self.subprocs_busy && self.active_subagents == 0 => self.set(AgentState::NeedsInput, now),
-                AgentState::Working
-                    if !self.hooked && !self.subprocs_busy && self.active_subagents == 0 && self.prev_title_busy != Some(true) =>
-                {
+                AgentState::Working if !self.hooked && !self.subprocs_busy && self.active_subagents == 0 && self.prev_title_busy != Some(true) => {
                     self.set(AgentState::NeedsInput, now)
                 }
                 _ => None,
@@ -265,11 +263,7 @@ impl Tracker {
                         self.active_subagents = self.active_subagents.saturating_sub(1);
                         // If a subagent finished while the session was mistakenly marked Done or NeedsInput,
                         // parent Claude is now continuing its turn.
-                        if matches!(self.state, AgentState::Done | AgentState::NeedsInput) {
-                            self.set(AgentState::Working, now)
-                        } else {
-                            None
-                        }
+                        if matches!(self.state, AgentState::Done | AgentState::NeedsInput) { self.set(AgentState::Working, now) } else { None }
                     }
                 }
             }
@@ -319,13 +313,7 @@ impl Tracker {
             }
             // Only let `✳` (title_busy == Some(false)) mark Done when hooks are NOT active
             // and no child processes or subagents are still running.
-            Some(false)
-                if prev_busy == Some(true)
-                    && self.state == AgentState::Working
-                    && !self.hooked
-                    && !obs.subprocs_busy
-                    && self.active_subagents == 0 =>
-            {
+            Some(false) if prev_busy == Some(true) && self.state == AgentState::Working && !self.hooked && !obs.subprocs_busy && self.active_subagents == 0 => {
                 return self.set(AgentState::Done, now);
             }
             _ => {}

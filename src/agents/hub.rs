@@ -208,14 +208,7 @@ pub struct AgentHub {
 impl AgentHub {
     /// Starts the hook pipe and the resource monitor.
     pub fn new(rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            inbox: ipc::start(rt, ctx),
-            monitor: Arc::new(Monitor::start(ctx)),
-            listed: Vec::new(),
-            listed_key: 0,
-            badges_key: 0,
-        }
+        Self { sessions: HashMap::new(), inbox: ipc::start(rt, ctx), monitor: Arc::new(Monitor::start(ctx)), listed: Vec::new(), listed_key: 0, badges_key: 0 }
     }
 
     pub fn monitor(&self) -> &Monitor {
@@ -315,11 +308,7 @@ impl AgentHub {
                 session.ended = true;
                 transitions.extend(session.tracker.apply(Event::Exited(code), now));
             }
-            let obs = Observation {
-                title_busy: title_activity(Some(kind), &session.seen_title),
-                last_output: seen.last_output,
-                subprocs_busy,
-            };
+            let obs = Observation { title_busy: title_activity(Some(kind), &session.seen_title), last_output: seen.last_output, subprocs_busy };
             transitions.extend(session.tracker.observe(obs, now));
             transitions.extend(settle_done(session, focused, now));
             for (_, to) in transitions {

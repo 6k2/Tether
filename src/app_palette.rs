@@ -156,10 +156,11 @@ impl TetherApp {
             Command::ImportHosts => self.import = Some(crate::ui::import_view::ImportDialog::new(&self.store)),
             Command::LaunchAgent { kind, command, pick_folder } => {
                 let pick = crate::ui::agents_panel::LaunchPick { kind, command, pick_folder };
-                let target = self.dock.focused_leaf().or_else(|| self.dock.iter_leaves().next().map(|(p, _)| p)).unwrap_or(egui_dock::NodePath {
-                    surface: egui_dock::SurfaceIndex::main(),
-                    node: egui_dock::NodeIndex::root(),
-                });
+                let target = self
+                    .dock
+                    .focused_leaf()
+                    .or_else(|| self.dock.iter_leaves().next().map(|(p, _)| p))
+                    .unwrap_or(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: egui_dock::NodeIndex::root() });
                 self.open_agents_in(vec![(target, pick)], ctx);
             }
             Command::Run(f) => f(ctx),
@@ -168,8 +169,8 @@ impl TetherApp {
 
     /// Runs a shortcut action (from its key or the palette).
     pub(super) fn run_action(&mut self, a: Action, ctx: &egui::Context) {
-        use egui_dock::Split;
         use crate::workspace::TabKind;
+        use egui_dock::Split;
         match a {
             Action::CommandPalette => {
                 if self.palette.take().is_none() {
@@ -241,7 +242,6 @@ impl TetherApp {
         }
     }
 }
-
 
 fn category(g: Group) -> &'static str {
     match g {

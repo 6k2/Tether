@@ -1,6 +1,6 @@
 # macOS portability QA — 2026-10-20
 
-Branch: `codex/macos-portability`. Base: `969e3e4` (`main`, Tether 0.2.2).
+Branch: `MacOS-Portability`. Base: `969e3e4` (`main`, Tether 0.2.2).
 Host: macOS 27.2 (26B5101f), Apple Silicon, Rust 1.99.1.
 The x86_64 binaries were compiled for `x86_64-apple-darwin` and executed using
 Rosetta on the same Mac. This is not a physical Intel hardware certification.
@@ -109,8 +109,5 @@ architecture's images before starting the other run.
 4. A live upgrade from an upstream macOS release could not run because those assets
    are introduced by this contribution. Platform/architecture selection, required
    checksums and rejected untrusted sources are covered by local parser tests.
-5. The linked GitHub account has read permission and no push permission on
-   `izLoki/Tether`. The contribution remains a local branch, with a patch and Git
-   bundle for review/submission. No upstream branch, release, tag or PR was created.
 
 [CLAUDE.md](../CLAUDE.md) records the portability rules and required future checks.

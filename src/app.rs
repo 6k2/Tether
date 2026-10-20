@@ -480,14 +480,21 @@ impl TetherApp {
                 let profile = self.store.get(spec.profile_id)?.clone();
                 let secret = secret::get(profile.secret_id());
                 match spec.kind {
-                    TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
+                    TabKind::Sftp => {
+                        let mut tab = self.sftp_tab(&profile, secret, ctx);
+                        if let TabBody::Sftp(view) = &mut tab.body {
+                            view.restore_local_state(spec.sftp_local_cwd.as_deref(), spec.sftp_show_local);
+                        }
+                        tab
+                    }
                     TabKind::Terminal | TabKind::Local { .. } => {
                         let mut term = self.terminal_tab(&profile, secret.clone(), ctx);
                         if let (Some(dir), TabBody::Terminal(view)) = (&spec.cwd, &mut term.body) {
                             send_initial_remote_cd(view, dir);
                         }
                         if spec.with_sftp {
-                            let sftp_view = self.spawn_sftp(&profile, secret, ctx);
+                            let mut sftp_view = self.spawn_sftp(&profile, secret, ctx);
+                            sftp_view.restore_local_state(spec.sftp_local_cwd.as_deref(), spec.sftp_show_local);
                             term.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(sftp_view));
                         }
                         term

@@ -110,8 +110,11 @@ pub struct SftpView {
     local_stale: bool,
     local_undo: Option<LocalUndo>,
     local_nav: NavHistory<PathBuf>,
-    /// Local folders visited this session (suggestions); `local_version` bumps on change.
+    /// Local folders visited (persisted across sessions); `local_version` bumps on change.
     local_known: KnownDirs,
+    local_known_file: PathBuf,
+    local_history: Vec<String>,
+    local_history_file: PathBuf,
     local_version: u64,
     local_list: ListState,
     remote_list: ListState,
@@ -152,11 +155,25 @@ impl SftpView {
         let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()).unwrap_or_default();
         let view_n = NEXT_VIEW.fetch_add(1, Ordering::Relaxed);
         let history_file = sftp_history::default_path();
+        let local_history_file = sftp_history::local_default_path();
+        let local_known_file = sftp_history::local_known_default_path();
+        let local_history = sftp_history::load_local(&local_history_file, profile.id);
+        let local_known = sftp_history::load_known(&local_known_file, profile.id);
+        let sftp_cfg = settings::get().sftp.clone();
+        let initial_local = if sftp_cfg.resume_last_dir {
+            local_history
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.is_dir())
+                .unwrap_or(home)
+        } else {
+            home
+        };
         Self {
             remote: Arc::new(Mutex::new(RemoteState::default())),
             cache: dir_cache::host_cache(profile.id),
             prefetching: Arc::default(),
-            local_cwd: home,
+            local_cwd: initial_local,
             local_rows: Vec::new(),
             local_error: None,
             // The first frame lists the local folder in the background.
@@ -167,13 +184,16 @@ impl SftpView {
             local_stale: false,
             local_undo: None,
             local_nav: NavHistory::default(),
-            local_known: KnownDirs::default(),
-            local_version: 0,
+            local_known,
+            local_known_file,
+            local_history,
+            local_history_file,
+            local_version: 1,
             local_list: ListState::default(),
             remote_list: ListState::default(),
             local_path: PathField::new(Id::new(("sftp_path", "local", view_n)), path_complete::LOCAL),
             remote_path: PathField::new(Id::new(("sftp_path", "remote", view_n)), path_complete::REMOTE),
-            show_local: settings::get().sftp.start_with_local_pane,
+            show_local: sftp_cfg.start_with_local_pane,
             show_remote: true,
             // Loaded by `connect`, off the UI thread.
             history: Arc::default(),
@@ -196,6 +216,30 @@ impl SftpView {
             view_n,
             profile,
         }
+    }
+
+    /// Current local working directory of this SFTP pane, for workspace persistence.
+    pub fn local_cwd_str(&self) -> Option<String> {
+        let s = self.local_cwd.display().to_string();
+        (!s.trim().is_empty()).then_some(s)
+    }
+
+    /// Restores a saved local directory and local-pane visibility from a workspace.
+    pub fn restore_local_state(&mut self, local_cwd: Option<&str>, show_local: Option<bool>) {
+        if let Some(dir) = local_cwd.filter(|d| !d.trim().is_empty()) {
+            let p = PathBuf::from(dir);
+            if p.is_dir() {
+                self.local_cwd = p;
+                self.local_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Some(show) = show_local {
+            self.show_local = show;
+        }
+    }
+
+    pub fn shows_local(&self) -> bool {
+        self.show_local
     }
 
     pub fn connect(&self, pool: Pool, secret: Option<String>, toasts: Toasts) {
@@ -280,9 +324,23 @@ impl SftpView {
             Ok(rows) => {
                 self.local_rows = rows;
                 self.local_error = None;
-                if undo.is_some() && !self.local_cwd.as_os_str().is_empty() {
-                    self.local_known.visit(&self.local_cwd.display().to_string(), unix_now());
+                if !self.local_cwd.as_os_str().is_empty() {
+                    let cwd_str = self.local_cwd.display().to_string();
+                    let now = unix_now();
+                    self.local_known.visit(&cwd_str, now);
+                    for r in &self.local_rows {
+                        if r.is_dir {
+                            self.local_known.see(&self.local_cwd.join(&r.name).display().to_string(), now);
+                        }
+                    }
                     self.local_version += 1;
+                    match sftp_history::record_local(&self.local_history_file, self.profile.id, &cwd_str) {
+                        Ok(updated) => self.local_history = updated,
+                        Err(_) => {
+                            sftp_history::push_front(&mut self.local_history, &cwd_str);
+                        }
+                    }
+                    let _ = sftp_history::save_known(&self.local_known_file, self.profile.id, &self.local_known);
                 }
             }
             Err(e) => {
@@ -809,8 +867,9 @@ impl SftpView {
         ui.horizontal(|ui| {
             let width = ui.available_width().max(80.0);
             let known = &self.local_known;
-            let rank = |q: &str| data::rank_local(known, q);
-            let events = self.local_path.show(ui, &cwd, None, width, Some(Suggest { version: self.local_version, rank: &rank }));
+            let local_hist = &self.local_history;
+            let rank = |q: &str| data::rank_local(known, local_hist, q);
+            let events = self.local_path.show(ui, &cwd, Some(&self.local_history), width, Some(Suggest { version: self.local_version, rank: &rank }));
             for event in events {
                 match event {
                     PathEvent::Navigate(p) => self.local_navigate(PathBuf::from(p)),

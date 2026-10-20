@@ -63,11 +63,25 @@ pub struct TabSpec {
     /// True when an SSH terminal tab has a companion SFTP pane linked to its right side.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_sftp: bool,
+    /// Local working directory of the SFTP pane (standalone or linked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp_local_cwd: Option<String>,
+    /// Whether the Local pane was visible in this SFTP view when saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp_show_local: Option<bool>,
 }
 
 impl TabSpec {
     pub fn new(profile_id: Uuid, kind: TabKind) -> Self {
-        Self { profile_id, kind, title: None, cwd: None, with_sftp: false }
+        Self {
+            profile_id,
+            kind,
+            title: None,
+            cwd: None,
+            with_sftp: false,
+            sftp_local_cwd: None,
+            sftp_show_local: None,
+        }
     }
 }
 

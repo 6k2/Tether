@@ -125,10 +125,17 @@ impl Tab {
             // SFTP keeps the host's connection counted as in use while a file is open.
             TabBody::Sftp(_) | TabBody::Editor(_) => TabKind::Sftp,
         };
+        let (sftp_local_cwd, sftp_show_local) = match (&self.body, &self.linked_sftp) {
+            (TabBody::Sftp(view), _) => (view.local_cwd_str(), Some(view.shows_local())),
+            (TabBody::Terminal(_), Some(linked)) => (linked.view.local_cwd_str(), Some(linked.view.shows_local())),
+            _ => (None, None),
+        };
         TabSpec {
             title: self.custom_title.clone(),
             cwd,
             with_sftp: self.linked_sftp.is_some(),
+            sftp_local_cwd,
+            sftp_show_local,
             ..TabSpec::new(self.profile.id, kind)
         }
     }

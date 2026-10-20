@@ -92,9 +92,9 @@ pub fn rank_remote(cache: Option<&crate::ui::dir_cache::HostCache>, history: &[S
     suggest::rank_paths(query, known.chain(recent), path_complete::REMOTE, unix_now(), SUGGEST_LIMIT)
 }
 
-/// Local suggestions: folders visited this session plus the sub-folders of the directory
-/// being typed into (read straight from disk; local listings are cheap).
-pub fn rank_local(known: &KnownDirs, query: &str) -> Vec<String> {
+/// Local suggestions: folders visited (persisted across sessions) plus recent local
+/// history plus the sub-folders of the directory being typed into.
+pub fn rank_local(known: &KnownDirs, history: &[String], query: &str) -> Vec<String> {
     let style = path_complete::LOCAL;
     let (dir, _) = path_complete::split(query, style);
     let dir = path_complete::listing_dir(dir, style);
@@ -103,8 +103,9 @@ pub fn rank_local(known: &KnownDirs, query: &str) -> Vec<String> {
         .map(|rows| rows.into_iter().filter(|r| r.is_dir).map(|r| if dir.is_empty() { r.name } else { base.join(r.name).display().to_string() }).collect())
         .unwrap_or_default();
     let visited = known.iter().map(|k| PathEntry { path: &k.path, visits: k.visits, last_visit: k.last_visit });
+    let recent = history.iter().map(|p| PathEntry { path: p, visits: 1, last_visit: 0 });
     let listed = children.iter().map(|p| PathEntry { path: p, visits: 0, last_visit: 0 });
-    suggest::rank_paths(query, visited.chain(listed), style, unix_now(), SUGGEST_LIMIT)
+    suggest::rank_paths(query, visited.chain(recent).chain(listed), style, unix_now(), SUGGEST_LIMIT)
 }
 
 /// Records successful remote navigations into the host's persisted path history.

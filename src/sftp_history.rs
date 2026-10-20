@@ -16,9 +16,11 @@ use crate::profile::write_json_atomic;
 /// How many directories are remembered per host.
 pub const HISTORY_CAP: usize = 20;
 const FILE_NAME: &str = "sftp_history.json";
+const LOCAL_FILE_NAME: &str = "sftp_local_history.json";
 /// How many known directories are remembered per host.
 pub const KNOWN_CAP: usize = 2000;
 const KNOWN_FILE_NAME: &str = "sftp_known_dirs.json";
+const LOCAL_KNOWN_FILE_NAME: &str = "sftp_local_known_dirs.json";
 
 /// Serialises read-modify-write cycles so two SFTP panes never clobber each other.
 static FILE_LOCK: Mutex<()> = Mutex::new(());
@@ -28,6 +30,43 @@ pub type HistoryMap = BTreeMap<Uuid, Vec<String>>;
 /// Default location: `<config_dir>/sftp_history.json`.
 pub fn default_path() -> PathBuf {
     crate::app::config_dir().join(FILE_NAME)
+}
+
+/// Default location for local SFTP pane history: `<config_dir>/sftp_local_history.json`.
+pub fn local_default_path() -> PathBuf {
+    crate::app::config_dir().join(LOCAL_FILE_NAME)
+}
+
+/// Default location for local SFTP pane known directories: `<config_dir>/sftp_local_known_dirs.json`.
+pub fn local_known_default_path() -> PathBuf {
+    crate::app::config_dir().join(LOCAL_KNOWN_FILE_NAME)
+}
+
+/// Loads the saved local SFTP history for `host`, falling back to `Uuid::nil()` (global
+/// recent local folders) when the host has no history of its own yet.
+pub fn load_local(path: &Path, host: Uuid) -> Vec<String> {
+    let _guard = FILE_LOCK.lock();
+    let mut map = load_map(path);
+    let host_list = map.remove(&host).unwrap_or_default();
+    if !host_list.is_empty() {
+        return host_list;
+    }
+    map.remove(&Uuid::nil()).unwrap_or_default()
+}
+
+/// Records a local SFTP directory visit under both `host` and `Uuid::nil()` (global
+/// fallback) and returns the host's updated list.
+pub fn record_local(path: &Path, host: Uuid, dir: &str) -> Result<Vec<String>> {
+    let _guard = FILE_LOCK.lock();
+    let mut map = load_map(path);
+    let mut changed = push_front(map.entry(Uuid::nil()).or_default(), dir);
+    let list = map.entry(host).or_default();
+    changed |= push_front(list, dir);
+    let out = list.clone();
+    if changed {
+        write_json_atomic(path, &map)?;
+    }
+    Ok(out)
 }
 
 /// Moves `path` to the front of `list`, removing duplicates and trimming to [`HISTORY_CAP`].

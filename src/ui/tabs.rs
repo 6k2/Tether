@@ -83,9 +83,9 @@ impl Tab {
 
     fn status_color(&self) -> egui::Color32 {
         match &self.body {
-            TabBody::Terminal(t) => match t.handle.shared.lock().map(|s| s.state.clone()) {
-                Ok(LinkState::Connected) => theme::accent(),
-                Ok(LinkState::Connecting) => theme::warn(),
+            TabBody::Terminal(t) => match t.link_state() {
+                LinkState::Connected => theme::accent(),
+                LinkState::Connecting => theme::warn(),
                 _ => theme::danger(),
             },
             TabBody::Sftp(s) if s.is_ready() => theme::blue(),
@@ -163,12 +163,12 @@ impl egui_dock::TabViewer for Viewer {
             (TabBody::Sftp(_), _) => "📁",
             (TabBody::Editor(_), _) => "📝",
         };
-        let remote_title = match (&tab.body, &tab.local) {
-            (TabBody::Terminal(t), Some(shell)) => t.handle.shared.lock().ok().map(|s| {
-                let ev = s.parser.callbacks();
-                pty::tab_title(shell, ev.title.as_deref(), ev.cwd.as_deref())
-            }),
-            (TabBody::Terminal(t), None) => t.handle.shared.lock().ok().and_then(|s| s.parser.callbacks().title.clone()),
+        let remote_title = match (&mut tab.body, &tab.local) {
+            (TabBody::Terminal(t), Some(shell)) => {
+                let title = t.remote_title();
+                Some(pty::tab_title(shell, title.as_deref(), t.remote_cwd()))
+            }
+            (TabBody::Terminal(t), None) => t.remote_title(),
             (TabBody::Sftp(_), _) => None,
             (TabBody::Editor(e), _) => Some(if e.is_dirty() { format!("{} •", e.file_name()) } else { e.file_name().to_string() }),
         };

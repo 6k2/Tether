@@ -2,6 +2,7 @@
 //! soft corners, generous spacing.
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextStyle, Visuals};
 use egui_dock::Style as DockStyle;
@@ -92,14 +93,27 @@ impl Palette {
 }
 
 static CURRENT: RwLock<Palette> = RwLock::new(Palette::TETHER_NIGHT);
+/// Bumped whenever the active palette actually changes (cache key for painted colours).
+static VERSION: AtomicU64 = AtomicU64::new(0);
 
+/// A copy of the active palette. Hot loops (the terminal grid) take one per frame and
+/// pass `&Palette` down instead of calling the per-colour accessors per cell.
 pub fn palette() -> Palette {
     *CURRENT.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Changes whenever [`set_palette`] installs a different palette.
+pub fn palette_version() -> u64 {
+    VERSION.load(Ordering::Acquire)
+}
+
 /// Swaps the active palette; call `install` afterwards to refresh egui's visuals.
 pub fn set_palette(p: Palette) {
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = p;
+    let mut current = CURRENT.write().unwrap_or_else(|e| e.into_inner());
+    if *current != p {
+        *current = p;
+        VERSION.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 macro_rules! colour_accessors {
@@ -159,10 +173,15 @@ pub fn hue_color(hue: f32) -> Color32 {
     egui::ecolor::Hsva::new(hue.rem_euclid(360.0) / 360.0, 0.55, 0.85, 1.0).into()
 }
 
-/// xterm 256-color lookup.
+/// xterm 256-color lookup in the active palette.
 pub fn indexed(i: u8) -> Color32 {
+    indexed_in(&palette(), i)
+}
+
+/// xterm 256-color lookup in `p` (no global access).
+pub fn indexed_in(p: &Palette, i: u8) -> Color32 {
     match i {
-        0..=15 => ansi(i as usize),
+        0..=15 => p.ansi[i as usize],
         16..=231 => {
             let i = i - 16;
             let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
@@ -177,14 +196,15 @@ pub fn indexed(i: u8) -> Color32 {
 
 /// Animation duration scaled by the "animations" setting (0 when they are off).
 pub fn anim_time(seconds: f32) -> f32 {
-    if crate::settings::get().appearance.animations { seconds } else { 0.0 }
+    if crate::settings::snapshot().appearance.animations { seconds } else { 0.0 }
 }
 
 /// Rebuilds egui's style from the active palette and the appearance settings
 /// (UI scale, animations). Cheap enough to call on every frame of a theme crossfade.
 pub fn install(ctx: &egui::Context) {
     let p = palette();
-    let appearance = crate::settings::get().appearance;
+    let settings = crate::settings::snapshot();
+    let appearance = &settings.appearance;
     let mut style = (*ctx.global_style()).clone();
     let mut v = if p.dark { Visuals::dark() } else { Visuals::light() };
     v.panel_fill = bg();
@@ -320,6 +340,16 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn indexed_in_matches_global_lookup() {
+        let p = Palette::TETHER_NIGHT;
+        for i in [0u8, 7, 15] {
+            assert_eq!(indexed_in(&p, i), p.ansi[i as usize]);
+        }
+        assert_eq!(indexed_in(&p, 196), indexed(196));
+        assert_eq!(indexed_in(&p, 244), indexed(244));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -189,19 +189,32 @@ impl Settings {
     }
 }
 
-static CURRENT: RwLock<Option<Settings>> = RwLock::new(None);
+/// Shared, copy-on-write: readers take a cheap `Arc` clone (see [`snapshot`]).
+static CURRENT: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
 static PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Loads settings from `path` (defaults if missing; a corrupt file is kept as `.bak`) and makes them current.
 pub fn init(path: PathBuf) -> Settings {
     let loaded: Settings = crate::json_file::load_or_default(&path);
     *PATH.write().unwrap_or_else(|e| e.into_inner()) = Some(path);
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(loaded.clone());
+    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(loaded.clone()));
     loaded
 }
 
+/// An owned copy of the current settings. Clones every map: prefer [`snapshot`] on hot paths.
 pub fn get() -> Settings {
-    CURRENT.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+    (*snapshot()).clone()
+}
+
+/// The current settings without copying them (an `Arc` clone). Cheap enough to call per
+/// frame or per event; a later `update`/`preview` swaps in a new value and leaves this one intact.
+pub fn snapshot() -> Arc<Settings> {
+    CURRENT.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(default_snapshot)
+}
+
+fn default_snapshot() -> Arc<Settings> {
+    static DEFAULT: std::sync::OnceLock<Arc<Settings>> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| Arc::new(Settings::default())).clone()
 }
 
 /// Applies `f` to the current settings and persists them.
@@ -213,14 +226,15 @@ pub fn update(f: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
 /// Applies `f` in memory only. Use while a slider is being dragged, then call `save`.
 pub fn preview(f: impl FnOnce(&mut Settings)) {
     let mut guard = CURRENT.write().unwrap_or_else(|e| e.into_inner());
-    f(guard.get_or_insert_with(Settings::default));
+    // Copy-on-write: snapshots handed out earlier keep the old value.
+    f(Arc::make_mut(guard.get_or_insert_with(|| Arc::new(Settings::default()))));
 }
 
 /// Writes the current settings to disk (no-op before `init`).
 pub fn save() -> anyhow::Result<()> {
-    let snapshot = get();
+    let current = snapshot();
     match PATH.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        Some(path) => write_json_atomic(path, &snapshot),
+        Some(path) => write_json_atomic(path, &*current),
         None => Ok(()),
     }
 }
@@ -289,6 +303,17 @@ mod tests {
         assert_eq!(t.scrollback(), TerminalSettings::SCROLLBACK_MAX);
         let a = Appearance { ui_scale: 9.0, ..Default::default() };
         assert_eq!(a.ui_scale(), Appearance::SCALE_MAX);
+    }
+
+    #[test]
+    fn snapshots_are_copy_on_write() {
+        let before = snapshot();
+        assert!(Arc::ptr_eq(&before, &snapshot()), "reads share one allocation");
+        // A write while a snapshot is held copies instead of mutating the held value.
+        preview(|_| {});
+        let after = snapshot();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(*before, *after);
     }
 
     #[test]

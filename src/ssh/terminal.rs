@@ -8,6 +8,7 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc;
 
 use super::connection::{Connection, Stage};
+use crate::repaint::RepaintThrottle;
 
 pub const TERM_NAME: &str = "xterm-256color";
 /// Fallback scrollback; the live value comes from `settings.terminal.scrollback`.
@@ -83,7 +84,8 @@ pub fn osc7_path(uri: &[u8]) -> Option<String> {
 pub struct TermShared {
     pub parser: vt100::Parser<Events>,
     pub state: LinkState,
-    /// Bumped on every output chunk so views can detect activity in background tabs.
+    /// Bumped on every parser change (each output chunk). Views cache painted rows keyed
+    /// on it, so anything that feeds `parser` must bump it too.
     pub generation: u64,
     /// Connect progress shown while `state` is `Connecting`.
     pub stage: Stage,
@@ -106,6 +108,8 @@ pub struct TerminalHandle {
     /// `TETHER_SESSION`) so we can find its process (and working directory) later.
     /// Hex only: safe to embed in commands.
     pub tag: String,
+    /// Coalesces UI wake-ups from the output reader (see [`RepaintThrottle`]).
+    pub repaint: Arc<RepaintThrottle>,
     tx: mpsc::UnboundedSender<TermCmd>,
 }
 
@@ -121,7 +125,7 @@ impl TerminalHandle {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let tag = uuid::Uuid::new_v4().simple().to_string();
-        (Self { shared: Arc::new(Mutex::new(shared)), tag, tx }, rx)
+        (Self { shared: Arc::new(Mutex::new(shared)), tag, repaint: Arc::new(RepaintThrottle::new()), tx }, rx)
     }
 
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
@@ -160,7 +164,8 @@ impl TerminalHandle {
     }
 }
 
-/// Drives the shell channel until it closes. `repaint` wakes the UI after output.
+/// Drives the shell channel until it closes. `repaint` wakes the UI on state changes;
+/// output wakes it through the handle's [`RepaintThrottle`] (coalesced, visibility-aware).
 pub async fn run_shell(
     conn: Arc<Connection>,
     term: TerminalHandle,
@@ -214,7 +219,7 @@ pub async fn run_shell(
                     s.parser.process(&data);
                     s.generation = s.generation.wrapping_add(1);
                 }
-                repaint();
+                term.repaint.notify();
             }
             ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
             ChannelMsg::Close => break,

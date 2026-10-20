@@ -243,7 +243,7 @@ pub fn key_label(key: Key) -> String {
 
 /// The effective binding of `action` (user override, else default).
 pub fn binding(action: Action) -> Option<Binding> {
-    crate::settings::get().keybindings.get(&action).cloned().unwrap_or_else(|| action.default_binding())
+    crate::settings::snapshot().keybindings.get(&action).cloned().unwrap_or_else(|| action.default_binding())
 }
 
 /// `Ctrl+Shift+D`, or an empty string when unbound.

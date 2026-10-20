@@ -16,8 +16,6 @@ use super::shells::ShellSpec;
 use crate::ssh::terminal::{LinkState, TERM_NAME, TermCmd, TerminalHandle};
 
 const READ_BUF: usize = 64 * 1024;
-/// Output floods (`cat big.log`) ask for at most one frame per this long.
-pub const REPAINT_EVERY: Duration = Duration::from_millis(8);
 /// How long to wait for trailing output once the shell has exited.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -60,9 +58,9 @@ pub fn run_local_pty(
 
     let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
     spawn_named("tether-pty-read", {
-        let (term, repaint) = (term.clone(), repaint.clone());
+        let term = term.clone();
         move || {
-            pump_output(reader, &term, &*repaint);
+            pump_output(reader, &term);
             let _ = drained_tx.send(());
         }
     })?;
@@ -87,11 +85,8 @@ pub fn run_local_pty(
 }
 
 /// Feeds pty output into the screen model until EOF.
-fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle, repaint: &dyn Fn(Duration)) {
+fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle) {
     let mut buf = vec![0u8; READ_BUF];
-    // A request made within the last half period still lands after this chunk is in
-    // the parser, so skipping a new one loses nothing.
-    let mut last_request: Option<Instant> = None;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => return,
@@ -112,10 +107,7 @@ fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle, repaint:
         if let Some(report) = cursor_report {
             term.send(report.into_bytes());
         }
-        if last_request.is_none_or(|t| t.elapsed() >= REPAINT_EVERY / 2) {
-            repaint(REPAINT_EVERY);
-            last_request = Some(Instant::now());
-        }
+        term.repaint.notify();
     }
 }
 

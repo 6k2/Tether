@@ -263,6 +263,8 @@ pub struct Settings {
     pub editor: EditorSettings,
     pub updates: UpdateSettings,
     pub agents: AgentSettings,
+    /// Command blocks, cwd and git branch reported by local shells (`shell_integration`).
+    pub shell_integration: crate::shell_integration::ShellIntegrationSettings,
     /// Lower-case extension (no dot) -> how double-click opens it. Missing = `default_open`.
     pub open_with: BTreeMap<String, OpenWith>,
     pub default_open: OpenWith,

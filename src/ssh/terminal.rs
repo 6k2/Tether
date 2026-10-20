@@ -44,6 +44,8 @@ pub struct Events {
     /// and the latest text. `agents::hub` turns them into session states.
     pub notice_count: u64,
     pub notice: Option<String>,
+    /// Command blocks from shell-integration marks (OSC 133 / OSC 6973).
+    pub shell: crate::shell_integration::blocks::ShellState,
 }
 
 impl vt100::Callbacks for Events {
@@ -55,9 +57,12 @@ impl vt100::Callbacks for Events {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
 
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         match params {
             [b"7", uri, ..] => self.cwd = osc7_path(uri),
+            [b"133", ..] | [b"6973", ..] => {
+                self.shell.on_osc(screen, params, self.cwd.as_deref());
+            }
             // A title containing ';' is split into more params than vt100 matches.
             [b"0" | b"2", rest @ ..] if !rest.is_empty() => self.title = Some(join_params(rest)),
             _ => {
@@ -107,7 +112,11 @@ pub fn osc_notification(params: &[&[u8]]) -> Option<String> {
 pub fn osc7_path(uri: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(uri).ok()?;
     let rest = text.strip_prefix("file://")?;
-    let path = &rest[rest.find('/')?..];
+    let mut path = &rest[rest.find('/')?..];
+    // PowerShell on Windows reports `file://host/C:/dir`: keep `C:/dir`.
+    if path.len() >= 3 && path.as_bytes()[2] == b':' && path.as_bytes()[1].is_ascii_alphabetic() {
+        path = &path[1..];
+    }
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -124,6 +133,41 @@ pub fn osc7_path(uri: &[u8]) -> Option<String> {
         i += 1;
     }
     String::from_utf8(out).ok()
+}
+
+/// A screen model whose callbacks know its scrollback cap (for block line numbers).
+pub fn new_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser<Events> {
+    let events = Events { shell: crate::shell_integration::blocks::ShellState::new(scrollback), ..Default::default() };
+    vt100::Parser::new_with_callbacks(rows, cols, scrollback, events)
+}
+
+/// Feeds output to the parser. Once the shell sends integration marks, long output goes
+/// in pieces of at most half the scrollback, with a block line-number sync after each,
+/// so evicted rows are still counted (see `shell_integration::blocks`).
+pub fn feed(parser: &mut vt100::Parser<Events>, mut bytes: &[u8]) {
+    let Some(step) = parser.callbacks().shell.sync_every() else {
+        parser.process(bytes);
+        return;
+    };
+    while !bytes.is_empty() {
+        let mut newlines = 0;
+        let mut cut = bytes.len();
+        for (i, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'\n') {
+            newlines += 1;
+            if newlines == step {
+                cut = i + 1;
+                break;
+            }
+        }
+        let (piece, rest) = bytes.split_at(cut);
+        parser.callbacks_mut().shell.note_newlines(newlines);
+        parser.process(piece);
+        // The callbacks and the screen are lent out separately: move the state out briefly.
+        let mut shell = std::mem::take(&mut parser.callbacks_mut().shell);
+        shell.sync(parser.screen_mut());
+        parser.callbacks_mut().shell = shell;
+        bytes = rest;
+    }
 }
 
 pub struct TermShared {
@@ -163,7 +207,7 @@ pub struct TerminalHandle {
 impl TerminalHandle {
     pub fn new(rows: u16, cols: u16) -> (Self, mpsc::UnboundedReceiver<TermCmd>) {
         let shared = TermShared {
-            parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback_lines(), Events::default()),
+            parser: new_parser(rows, cols, scrollback_lines()),
             state: LinkState::Connecting,
             generation: 0,
             stage: Stage::Connecting,
@@ -264,7 +308,7 @@ pub async fn run_shell(
         match msg {
             ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
                 if let Ok(mut s) = term.shared.lock() {
-                    s.parser.process(&data);
+                    feed(&mut s.parser, &data);
                     s.generation = s.generation.wrapping_add(1);
                 }
                 term.repaint.notify();
@@ -334,6 +378,8 @@ mod tests {
         p.process(b"\x1b]2;plain\x07\x1b]7;file://host/home/me%20x\x07");
         assert_eq!(p.callbacks().title.as_deref(), Some("plain"));
         assert_eq!(p.callbacks().cwd.as_deref(), Some("/home/me x"));
+        p.process(b"\x1b]7;file://PC/C:/Users/me%20x\x07");
+        assert_eq!(p.callbacks().cwd.as_deref(), Some("C:/Users/me x"));
         assert_eq!(p.callbacks().notice_count, 0);
     }
 }

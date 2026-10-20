@@ -36,7 +36,16 @@ pub fn run_local_pty(
     let (rows, cols) = term.shared.lock().map(|s| s.parser.screen().size()).unwrap_or((24, 80));
     let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).context("opening a pseudo terminal")?;
     let mut cmd = CommandBuilder::new(&spec.program);
-    cmd.args(&spec.args);
+    let integration = crate::settings::snapshot().shell_integration.enabled.then(|| crate::shell_integration::launch(spec)).flatten();
+    match &integration {
+        Some(launch) => {
+            cmd.args(&launch.args);
+            for (key, value) in &launch.env {
+                cmd.env(key, value);
+            }
+        }
+        None => cmd.args(&spec.args),
+    }
     cmd.env("TERM", TERM_NAME);
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TETHER_SESSION", &term.tag);
@@ -55,6 +64,8 @@ pub fn run_local_pty(
     let writer = pair.master.take_writer()?;
     let master: SharedMaster = Arc::new(Mutex::new(Some(pair.master)));
     if let Ok(mut s) = term.shared.lock() {
+        // ConPTY passes escape sequences through ahead of the text it renders.
+        s.parser.callbacks_mut().shell.set_lazy_marks(cfg!(windows));
         s.pid = child.process_id();
         s.opened_at = Some(Instant::now());
         s.state = LinkState::Connected;
@@ -100,7 +111,7 @@ fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle) {
         let chunk = &buf[..n];
         let mut cursor_report = None;
         if let Ok(mut s) = term.shared.lock() {
-            s.parser.process(chunk);
+            crate::ssh::terminal::feed(&mut s.parser, chunk);
             s.generation = s.generation.wrapping_add(1);
             s.last_output = Some(Instant::now());
             if contains(chunk, CURSOR_QUERY) {

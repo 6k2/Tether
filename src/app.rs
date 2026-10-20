@@ -92,13 +92,15 @@ pub struct TetherApp {
     prompt: Option<Prompt>,
     confirm_delete: Option<Uuid>,
     toasts: Toasts,
-    last_layout: Vec<(Uuid, TabKind)>,
+    last_layout: Vec<workspace::TabSpec>,
     live_profiles: HashSet<Uuid>,
     /// Profiles with open tabs, shared with pending disconnect tasks (see `track_layout`).
     in_use: Arc<Mutex<HashSet<Uuid>>>,
     focused_terminal: Option<u64>,
     /// Tabs dragged out into their own native windows (see `ui::detach`).
     detached: Detacher,
+    /// Minimized pop-up windows and the movable mini-dock bar with Genie animations.
+    mini_dock: crate::ui::mini_dock::MiniDock,
     /// AI agent sessions and the resource monitor (`app_agents.rs`).
     agents: crate::agents::AgentHub,
 }
@@ -169,6 +171,7 @@ impl TetherApp {
             in_use: Arc::default(),
             focused_terminal: None,
             detached: Detacher::default(),
+            mini_dock: Default::default(),
             agents,
         })
     }
@@ -205,14 +208,27 @@ impl TetherApp {
                 self.dock.push_to_focused_leaf(tab);
             }
             OpenKind::Sftp => {
+                let can_attach = self.dock.find_active_focused().is_some_and(|(_, active)| {
+                    !active.is_local()
+                        && active.profile.id == profile.id
+                        && matches!(active.body, TabBody::Terminal(_))
+                        && active.linked_sftp.is_none()
+                });
+                if can_attach {
+                    let view = self.spawn_sftp(&profile, secret, ctx);
+                    if let Some((_, active)) = self.dock.find_active_focused() {
+                        active.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(view));
+                    }
+                    return;
+                }
                 let tab = self.sftp_tab(&profile, secret, ctx);
                 self.dock.push_to_focused_leaf(tab);
             }
             OpenKind::Both => {
-                let term = self.terminal_tab(&profile, secret.clone(), ctx);
-                let files = self.sftp_tab(&profile, secret, ctx);
+                let mut term = self.terminal_tab(&profile, secret.clone(), ctx);
+                let sftp_view = self.spawn_sftp(&profile, secret, ctx);
+                term.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(sftp_view));
                 self.dock.push_to_focused_leaf(term);
-                self.split_focused(files, Split::Right);
             }
         }
     }
@@ -264,9 +280,37 @@ impl TetherApp {
     }
 
     fn sftp_tab(&self, profile: &Profile, secret: Option<String>, ctx: &egui::Context) -> Tab {
+        let view = self.spawn_sftp(profile, secret, ctx);
+        Tab::new(profile.clone(), TabBody::Sftp(Box::new(view)))
+    }
+
+    fn spawn_sftp(&self, profile: &Profile, secret: Option<String>, ctx: &egui::Context) -> SftpView {
         let view = SftpView::new(profile.clone(), self.rt.handle().clone(), ctx.clone());
         view.connect(self.pool.clone(), secret, self.toasts.clone());
-        Tab::new(profile.clone(), TabBody::Sftp(Box::new(view)))
+        view
+    }
+
+    /// `Ctrl+Shift+F`: links an SFTP browser to the right side of the focused SSH terminal
+    /// tab (or closes it if already open on that terminal).
+    pub(super) fn open_linked_sftp(&mut self, ctx: &egui::Context) {
+        let Some((_, tab)) = self.dock.find_active_focused() else { return };
+        if tab.is_local() {
+            return;
+        }
+        if matches!(tab.body, TabBody::Terminal(_)) {
+            if tab.linked_sftp.is_some() {
+                tab.linked_sftp = None;
+                return;
+            }
+            let profile = self.store.get(tab.profile.id).cloned().unwrap_or_else(|| tab.profile.clone());
+            let secret = secret::get(profile.secret_id());
+            let view = self.spawn_sftp(&profile, secret, ctx);
+            if let Some((_, active)) = self.dock.find_active_focused() {
+                active.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(view));
+            }
+            return;
+        }
+        self.duplicate_focused(Split::Right, TabKind::Sftp, ctx);
     }
 
     fn reconnect(&mut self, uid: u64, secret_override: Option<String>, ctx: &egui::Context) {
@@ -284,10 +328,25 @@ impl TetherApp {
         }
         let secret = secret_override.or_else(|| secret::get(profile.secret_id()));
         let new_view = is_terminal.then(|| self.spawn_terminal(&profile, secret.clone(), ctx));
-        let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).find(|t| t.uid == uid) else { return };
+        let Some(tab) = self
+            .dock
+            .iter_all_tabs_mut()
+            .map(|(_, t)| t)
+            .chain(self.detached.tabs_mut())
+            .chain(self.mini_dock.tabs_mut())
+            .find(|t| t.uid == uid)
+        else {
+            return;
+        };
         tab.profile = profile;
         match (&mut tab.body, new_view) {
-            (TabBody::Terminal(view), Some(v)) => *view = v,
+            (TabBody::Terminal(view), Some(v)) => {
+                *view = v;
+                if let Some(linked) = &mut tab.linked_sftp {
+                    linked.view.profile = tab.profile.clone();
+                    linked.view.connect(self.pool.clone(), secret, self.toasts.clone());
+                }
+            }
             (TabBody::Sftp(view), _) => {
                 view.profile = tab.profile.clone();
                 view.connect(self.pool.clone(), secret, self.toasts.clone());
@@ -306,14 +365,18 @@ impl TetherApp {
             }
             return;
         }
+        let remote_cwd = tab.current_cwd();
         let profile = tab.profile.clone();
         let secret = secret::get(profile.secret_id());
-        let tab = match kind {
+        let mut new_tab = match kind {
             TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
             TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
             TabKind::Unknown => return,
         };
-        self.split_focused(tab, split);
+        if let (Some(dir), TabBody::Terminal(view)) = (remote_cwd, &mut new_tab.body) {
+            send_initial_remote_cd(view, &dir);
+        }
+        self.split_focused(new_tab, split);
     }
 
     /// Closes the focused tab the way its close button would (editors may refuse).
@@ -347,20 +410,21 @@ impl TetherApp {
 
     // ---- detached windows ---------------------------------------------------------
 
-    /// Tabs of the main dock and of every detached window. Anything that must see
-    /// every open tab (connection tracking, counts, lookups) iterates this.
+    /// Tabs of the main dock, every detached window, and the mini-dock bar. Anything
+    /// that must see every open tab (connection tracking, counts, lookups) iterates this.
     fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
-        self.dock.iter_all_tabs().map(|(_, t)| t).chain(self.detached.tabs())
+        self.dock.iter_all_tabs().map(|(_, t)| t).chain(self.detached.tabs()).chain(self.mini_dock.tabs())
     }
 
     /// Shows the native windows of detached tabs and applies their tab output like
     /// `workspace_area` does for the main dock.
     fn detached_windows(&mut self, ctx: &egui::Context) {
         let mut viewer = Viewer { time: ctx.input(|i| i.time), ..Viewer::default() };
-        self.detached.frame(ctx, &mut self.dock, &mut viewer);
+        self.detached.frame(ctx, &mut self.dock, &mut viewer, &mut self.mini_dock);
         if viewer.focused_uid.is_some() {
             self.focused_terminal = viewer.focused_uid;
         }
+        self.apply_linked_sftp_actions(std::mem::take(&mut viewer.linked_sftp_actions), ctx);
         self.route_input(viewer.inputs);
         for uid in viewer.reconnect {
             self.reconnect(uid, None, ctx);
@@ -407,13 +471,24 @@ impl TetherApp {
         let Some(layout) = self.workspaces.get(name).cloned() else { return };
         let restored = workspace::rebuild(&layout, &mut |spec| {
             let mut tab = if let TabKind::Local { shell_id } = &spec.kind {
-                crate::pty::shells::find(shell_id).map(|shell| self.local_tab(shell, None, ctx))?
+                let cwd = spec.cwd.as_deref().map(PathBuf::from);
+                crate::pty::shells::find(shell_id).map(|shell| self.local_tab(shell, cwd, ctx))?
             } else {
                 let profile = self.store.get(spec.profile_id)?.clone();
                 let secret = secret::get(profile.secret_id());
                 match spec.kind {
                     TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
-                    TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
+                    TabKind::Terminal | TabKind::Local { .. } => {
+                        let mut term = self.terminal_tab(&profile, secret.clone(), ctx);
+                        if let (Some(dir), TabBody::Terminal(view)) = (&spec.cwd, &mut term.body) {
+                            send_initial_remote_cd(view, dir);
+                        }
+                        if spec.with_sftp {
+                            let sftp_view = self.spawn_sftp(&profile, secret, ctx);
+                            term.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(sftp_view));
+                        }
+                        term
+                    }
                     TabKind::Unknown => return None,
                 }
             };
@@ -432,13 +507,7 @@ impl TetherApp {
 
     /// Keeps "Last session" current and closes transports nobody uses any more.
     fn track_layout(&mut self) {
-        let layout: Vec<(Uuid, TabKind)> = self
-            .all_tabs()
-            .map(|t| {
-                let s = t.spec();
-                (s.profile_id, s.kind)
-            })
-            .collect();
+        let layout: Vec<workspace::TabSpec> = self.all_tabs().map(|t| t.spec()).collect();
         if layout != self.last_layout {
             if !layout.is_empty() {
                 let _ = self.workspaces.put(LAST_SESSION.into(), self.layout_specs());
@@ -446,7 +515,7 @@ impl TetherApp {
             self.last_layout = layout;
         }
         // Local shells (nil id) hold no pooled connection.
-        let in_use: HashSet<Uuid> = self.last_layout.iter().map(|(id, _)| *id).filter(|id| !id.is_nil()).collect();
+        let in_use: HashSet<Uuid> = self.last_layout.iter().map(|s| s.profile_id).filter(|id| !id.is_nil()).collect();
         if let Ok(mut shared) = self.in_use.lock() {
             shared.clone_from(&in_use);
         }
@@ -476,11 +545,19 @@ impl TetherApp {
         let margin = if vertical { egui::Margin { left: 0, right: 0, top: 0, bottom: 6 } } else { egui::Margin { left: 0, right: 6, top: 0, bottom: 6 } };
         let frame = egui::Frame::new().fill(fill).inner_margin(margin);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            if self.dock.iter_all_tabs().next().is_none() {
+            let area = ui.available_rect_before_wrap();
+            if self.dock.iter_all_tabs().next().is_none() && self.mini_dock.is_empty() {
                 self.zoomed = None;
                 self.welcome(ui);
                 return;
             }
+            if self.dock.iter_all_tabs().next().is_none() {
+                self.zoomed = None;
+                self.welcome(ui);
+                self.mini_dock.frame(ui.ctx(), &mut self.dock, area);
+                return;
+            }
+            self.absorb_same_server_sftp_splits();
             let mut style = theme::dock_style(ui.style());
             if see_through {
                 style.tab.tab_body.bg_fill = theme::surface().gamma_multiply(crate::themes::window_opacity());
@@ -492,7 +569,6 @@ impl TetherApp {
                 style.buttons.show_tab_bar_size = 0.0;
                 style.tab.tab_body.hidden_tab_bar_drag_height = Some(0.0);
             }
-            let area = ui.available_rect_before_wrap();
             self.focus_new_tab();
             let mut viewer = Viewer::with_panes(self.pane_fx(ui.ctx()));
             viewer.time = ui.input(|i| i.time);
@@ -514,12 +590,14 @@ impl TetherApp {
                     viewer.tab_actions.push(action);
                 }
             }
+            self.mini_dock.frame(ui.ctx(), &mut self.dock, area);
             self.after_views(&mut viewer);
             self.open_local_in(std::mem::take(&mut viewer.new_local), ui.ctx());
             self.open_agents_in(std::mem::take(&mut viewer.new_agent), ui.ctx());
             if viewer.focused_uid.is_some() {
                 self.focused_terminal = viewer.focused_uid;
             }
+            self.apply_linked_sftp_actions(std::mem::take(&mut viewer.linked_sftp_actions), ui.ctx());
             self.apply_tab_actions(std::mem::take(&mut viewer.tab_actions), ui.ctx());
             self.route_input(viewer.inputs);
             for uid in viewer.reconnect {
@@ -529,6 +607,80 @@ impl TetherApp {
                 self.open_terminal_files(uid, files, ui.ctx());
             }
         });
+    }
+
+    /// Handles separating (`Detach`) or minimizing (`Minimize`) a terminal tab's linked
+    /// right-hand SFTP pane when dragged or clicked in its header.
+    fn apply_linked_sftp_actions(&mut self, actions: Vec<crate::ui::tabs::LinkedSftpAction>, ctx: &egui::Context) {
+        use crate::ui::tabs::LinkedSftpAction;
+        for action in actions {
+            match action {
+                LinkedSftpAction::Detach { uid, pos, rect } => {
+                    let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).find(|t| t.uid == uid) else {
+                        continue;
+                    };
+                    let Some(linked) = tab.linked_sftp.take() else { continue };
+                    let sftp_tab = Tab::new(tab.profile.clone(), TabBody::Sftp(linked.view));
+                    let size = rect.size().max(egui::vec2(420.0, 320.0));
+                    let min = pos.map(|p| p - egui::vec2(size.x * 0.4, 14.0)).unwrap_or(rect.min);
+                    let surf = self.dock.add_window(vec![sftp_tab]);
+                    if let Some(state) = self.dock.get_window_state_mut(surf) {
+                        state.set_position(min).set_size(size);
+                    }
+                    self.last_layout.clear();
+                }
+                LinkedSftpAction::Minimize { uid, rect } => {
+                    let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).find(|t| t.uid == uid) else {
+                        continue;
+                    };
+                    let Some(linked) = tab.linked_sftp.take() else { continue };
+                    let sftp_tab = Tab::new(tab.profile.clone(), TabBody::Sftp(linked.view));
+                    self.mini_dock.minimize_tabs(ctx, vec![sftp_tab], rect);
+                    self.last_layout.clear();
+                }
+            }
+        }
+    }
+
+    /// When a same-server SFTP pane sits in a main-surface split right beside its SSH
+    /// terminal, links it directly into that SSH terminal tab (`linked_sftp`) so switching
+    /// away to another terminal hides the right-hand SFTP automatically.
+    fn absorb_same_server_sftp_splits(&mut self) {
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        let leaves: Vec<_> = self
+            .dock
+            .iter_leaves()
+            .filter(|(p, l)| p.surface.is_main() && !l.tabs.is_empty())
+            .collect();
+        if leaves.len() < 2 {
+            return;
+        }
+        for i in 0..leaves.len() {
+            let (_, left_leaf) = leaves[i];
+            let Some(active_term) = left_leaf.tabs.get(left_leaf.active.0) else { continue };
+            if active_term.is_local() || !matches!(active_term.body, TabBody::Terminal(_)) || active_term.linked_sftp.is_some() {
+                continue;
+            }
+            for (j, (_, right_leaf)) in leaves.iter().enumerate() {
+                if i == j || right_leaf.tabs.len() != 1 {
+                    continue;
+                }
+                let sftp_tab = &right_leaf.tabs[0];
+                if matches!(sftp_tab.body, TabBody::Sftp(_)) && sftp_tab.profile.id == active_term.profile.id {
+                    pairs.push((active_term.uid, sftp_tab.uid));
+                    break;
+                }
+            }
+        }
+        for (term_uid, sftp_uid) in pairs {
+            let Some(sftp_path) = self.dock.find_tab_from(|t| t.uid == sftp_uid) else { continue };
+            let Some(sftp_tab) = self.dock.remove_tab(sftp_path) else { continue };
+            let TabBody::Sftp(sftp_view) = sftp_tab.body else { continue };
+            if let Some(term_tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == term_uid) {
+                term_tab.linked_sftp = Some(crate::ui::tabs::LinkedSftp { view: sftp_view, split_fraction: 0.54 });
+                self.last_layout.clear();
+            }
+        }
     }
 
     fn route_input(&mut self, inputs: Vec<(u64, Vec<u8>)>) {
@@ -755,12 +907,27 @@ impl eframe::App for TetherApp {
 
     /// Ends every shell (and what it started) instead of leaving them orphaned.
     fn on_exit(&mut self) {
+        if let Some(specs) = self.layout_specs() {
+            let _ = self.workspaces.put(LAST_SESSION.into(), Some(specs));
+        }
         for tab in self.all_tabs() {
             if let TabBody::Terminal(t) = &tab.body {
                 t.handle.close();
             }
         }
     }
+}
+
+fn send_initial_remote_cd(view: &mut TerminalView, dir: &str) {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return;
+    }
+    if let Ok(mut s) = view.handle.shared.lock() {
+        s.parser.callbacks_mut().cwd = Some(trimmed.to_string());
+    }
+    let quoted = format!("'{}'", trimmed.replace('\'', "'\\''"));
+    view.handle.send(format!("cd -- {quoted}\n").into_bytes());
 }
 
 /// A terminal tab as seen by [`link_terminals`].
@@ -793,15 +960,23 @@ fn link_terminals(docks: &mut [&mut DockState<Tab>], focused: Option<u64>) {
     for (d, dock) in docks.iter_mut().enumerate() {
         for (path, leaf) in dock.iter_leaves_mut() {
             for tab in leaf.tabs.iter_mut() {
-                if let TabBody::Sftp(view) = &mut tab.body {
-                    let same_host = |t: &&TermRef| t.profile == tab.profile.id;
-                    let elsewhere = |t: &&TermRef| t.dock != d || t.leaf != path;
-                    let linked = terms
-                        .iter()
-                        .filter(same_host)
-                        .max_by_key(|t| (Some(t.uid) == focused && t.visible, t.visible && elsewhere(t), elsewhere(t)))
-                        .map(|t| t.handle.clone());
-                    view.set_linked_terminal(linked);
+                match &mut tab.body {
+                    TabBody::Terminal(term) => {
+                        if let Some(linked_sftp) = &mut tab.linked_sftp {
+                            linked_sftp.view.set_linked_terminal(Some(term.handle.clone()));
+                        }
+                    }
+                    TabBody::Sftp(view) => {
+                        let same_host = |t: &&TermRef| t.profile == tab.profile.id;
+                        let elsewhere = |t: &&TermRef| t.dock != d || t.leaf != path;
+                        let linked = terms
+                            .iter()
+                            .filter(same_host)
+                            .max_by_key(|t| (Some(t.uid) == focused && t.visible, t.visible && elsewhere(t), elsewhere(t)))
+                            .map(|t| t.handle.clone());
+                        view.set_linked_terminal(linked);
+                    }
+                    TabBody::Editor(_) => {}
                 }
             }
         }

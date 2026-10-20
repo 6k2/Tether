@@ -22,7 +22,13 @@ impl TetherApp {
     pub(super) fn apply_tab_actions(&mut self, actions: Vec<TabAction>, ctx: &egui::Context) {
         for a in actions {
             match a {
-                TabAction::Focus(uid) => self.show_tab(uid),
+                TabAction::Focus(uid) => {
+                    if self.mini_dock.restore_by_uid(ctx, &mut self.dock, uid) {
+                        self.show_tab(uid);
+                    } else if !self.detached.focus_tab(ctx, uid) {
+                        self.show_tab(uid);
+                    }
+                }
                 TabAction::Close(uid) => self.close_tab(uid),
                 TabAction::CloseOthers(uid) => {
                     let others: Vec<u64> = self.dock.iter_all_tabs().filter(|(p, t)| p.surface.is_main() && t.uid != uid).map(|(_, t)| t.uid).collect();
@@ -32,12 +38,26 @@ impl TetherApp {
                     self.show_tab(uid);
                 }
                 TabAction::StartRename(uid) => {
-                    if let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid) {
+                    if let Some(tab) = self
+                        .dock
+                        .iter_all_tabs_mut()
+                        .map(|(_, t)| t)
+                        .chain(self.detached.tabs_mut())
+                        .chain(self.mini_dock.tabs_mut())
+                        .find(|t| t.uid == uid)
+                    {
                         self.rename = Some((uid, tab.display_title()));
                     }
                 }
                 TabAction::Rename(uid, name) => {
-                    if let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid) {
+                    if let Some(tab) = self
+                        .dock
+                        .iter_all_tabs_mut()
+                        .map(|(_, t)| t)
+                        .chain(self.detached.tabs_mut())
+                        .chain(self.mini_dock.tabs_mut())
+                        .find(|t| t.uid == uid)
+                    {
                         tab.rename(name);
                     }
                     // Custom titles are part of the saved layout.
@@ -63,8 +83,25 @@ impl TetherApp {
                     if let Some(path) = self.dock.find_tab_from(|t| t.uid == uid)
                         && let Some(tab) = self.dock.remove_tab(path)
                     {
-                        let origin = ctx.input(|i| i.viewport().inner_rect).map_or(egui::pos2(120.0, 120.0), |r| r.min + egui::vec2(120.0, 90.0));
-                        self.detached.pop_out(tab, origin);
+                        let rect = crate::ui::mini_dock::default_floating_rect(ctx.content_rect());
+                        let surf = self.dock.add_window(vec![tab]);
+                        if let Some(state) = self.dock.get_window_state_mut(surf) {
+                            state.set_position(rect.min).set_size(rect.size());
+                        }
+                    }
+                }
+                TabAction::MinimizeWindow(uid) => {
+                    let fallback_rect = crate::ui::mini_dock::default_floating_rect(ctx.content_rect());
+                    if let Some(path) = self.dock.find_tab_from(|t| t.uid == uid) {
+                        if !path.surface.is_main() {
+                            let area_id = egui::Id::new(format!("window {:?}", path.surface));
+                            let rect = ctx.memory(|m| m.area_rect(area_id)).unwrap_or(fallback_rect);
+                            self.mini_dock.minimize_surface(ctx, &mut self.dock, path.surface, rect);
+                        } else if let Some(tab) = self.dock.remove_tab(path) {
+                            self.mini_dock.minimize_tabs(ctx, vec![tab], fallback_rect);
+                        }
+                    } else if let Some(tab) = self.detached.remove_tab_by_uid(uid) {
+                        self.mini_dock.minimize_tabs(ctx, vec![tab], fallback_rect);
                     }
                 }
                 TabAction::Move { uid, target } => self.move_tab(uid, target),
@@ -94,20 +131,34 @@ impl TetherApp {
         }
     }
 
-    /// Closes a tab of the main dock the way its ✕ would (editors may refuse).
+    /// Closes a tab of the main dock, a floating window, a detached window, or a minimized
+    /// window the way its ✕ would (editors may refuse).
     pub(super) fn close_tab(&mut self, uid: u64) {
-        let Some(path) = self.dock.find_tab_from(|t| t.uid == uid) else { return };
-        let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid) else { return };
-        let close = match &mut tab.body {
-            TabBody::Terminal(t) => {
-                t.handle.close();
-                true
+        if let Some(path) = self.dock.find_tab_from(|t| t.uid == uid) {
+            let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid) else { return };
+            let close = match &mut tab.body {
+                TabBody::Terminal(t) => {
+                    t.handle.close();
+                    true
+                }
+                TabBody::Editor(e) => e.request_close(),
+                TabBody::Sftp(_) => true,
+            };
+            if close {
+                self.dock.remove_tab(path);
             }
-            TabBody::Editor(e) => e.request_close(),
-            TabBody::Sftp(_) => true,
-        };
-        if close {
-            self.dock.remove_tab(path);
+            return;
+        }
+        if let Some(mut tab) = self.detached.remove_tab_by_uid(uid) {
+            if let TabBody::Terminal(t) = &mut tab.body {
+                t.handle.close();
+            }
+            return;
+        }
+        if let Some(mut tab) = self.mini_dock.remove_tab_by_uid(uid)
+            && let TabBody::Terminal(t) = &mut tab.body
+        {
+            t.handle.close();
         }
     }
 
@@ -340,12 +391,12 @@ pub(super) fn set_sidebar_side(side: Side) {
     let _ = settings::update(|s| s.layout.sidebar_side = side);
 }
 
-/// The dock with tab bars hidden while vertical tabs are on screen; returns whether
-/// they are hidden.
+/// The dock with tab bars hidden on main-surface panes while vertical tabs are on
+/// screen; floating `Surface::Window` panes always keep their tab bar and close button.
 pub(super) fn sync_tab_bars(dock: &mut DockState<Tab>) -> bool {
     let hide = settings::snapshot().layout.tab_bars_hidden();
-    for (_, leaf) in dock.iter_leaves_mut() {
-        leaf.tab_bar_hidden = hide;
+    for (path, leaf) in dock.iter_leaves_mut() {
+        leaf.tab_bar_hidden = if path.surface.is_main() { hide } else { false };
     }
     hide
 }

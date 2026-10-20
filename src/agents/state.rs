@@ -67,7 +67,9 @@ pub enum HookKind {
         permission: bool,
     },
     Stop,
+    SubagentStart,
     SubagentStop,
+    ToolActivity,
     SessionEnd,
     /// Codex `agent-turn-complete`.
     TurnComplete,
@@ -83,7 +85,9 @@ impl HookKind {
             "notification" => HookKind::Notification { permission: is_permission(notification_type, message) },
             "permissionrequest" => HookKind::Notification { permission: true },
             "stop" => HookKind::Stop,
+            "subagentstart" => HookKind::SubagentStart,
             "subagentstop" => HookKind::SubagentStop,
+            "posttooluse" | "posttoolusefailure" => HookKind::ToolActivity,
             "sessionend" => HookKind::SessionEnd,
             "agentturncomplete" | "turncomplete" => HookKind::TurnComplete,
             _ => return None,
@@ -123,6 +127,9 @@ pub struct Observation {
     pub title_busy: Option<bool>,
     /// When the terminal last printed anything.
     pub last_output: Option<Instant>,
+    /// True when the agent process has active child processes (subagents, shells, scripts,
+    /// tools) or significant CPU work in its process tree.
+    pub subprocs_busy: bool,
 }
 
 /// `(from, to)` whenever the state changes.
@@ -145,6 +152,12 @@ pub struct Tracker {
     prev_title_busy: Option<bool>,
     /// The current `Working` came from output activity (so silence can end it).
     by_activity: bool,
+    /// The current `Working` is held open by active child processes (shells/scripts/subagents).
+    by_subprocs: bool,
+    /// Whether child processes (shells/scripts/subagents) are currently running under the agent.
+    subprocs_busy: bool,
+    /// Count of subagents currently active from `SubagentStart`..`SubagentStop`.
+    active_subagents: u32,
 }
 
 impl Tracker {
@@ -160,11 +173,15 @@ impl Tracker {
             prev_output: None,
             prev_title_busy: None,
             by_activity: false,
+            by_subprocs: false,
+            subprocs_busy: false,
+            active_subagents: 0,
         }
     }
 
     fn set(&mut self, to: AgentState, now: Instant) -> Option<Transition> {
         self.by_activity = false;
+        self.by_subprocs = false;
         if self.state == to {
             return None;
         }
@@ -181,7 +198,14 @@ impl Tracker {
                 if self.state.needs_attention() { self.set(AgentState::Idle, now) } else { None }
             }
             Event::Bell => match self.state {
-                AgentState::Working | AgentState::Idle => self.set(AgentState::NeedsInput, now),
+                // Child scripts and shells often ring `\x07` while Claude is working; never
+                // let a bell interrupt a hooked turn, an active spinner, or running subprocesses.
+                AgentState::Idle if !self.subprocs_busy && self.active_subagents == 0 => self.set(AgentState::NeedsInput, now),
+                AgentState::Working
+                    if !self.hooked && !self.subprocs_busy && self.active_subagents == 0 && self.prev_title_busy != Some(true) =>
+                {
+                    self.set(AgentState::NeedsInput, now)
+                }
                 _ => None,
             },
             Event::Notify(text) => {
@@ -193,6 +217,13 @@ impl Tracker {
                 } else {
                     AgentState::NeedsInput
                 };
+                // Ignore non-permission terminal notifications while child processes or subagents are still running.
+                if to != AgentState::NeedsPermission
+                    && self.state == AgentState::Working
+                    && (self.subprocs_busy || self.active_subagents > 0 || self.prev_title_busy == Some(true))
+                {
+                    return None;
+                }
                 self.message = Some(text);
                 self.message_from_terminal = true;
                 self.set(to, now)
@@ -204,18 +235,51 @@ impl Tracker {
                     self.message_from_terminal = false;
                 }
                 match kind {
-                    HookKind::SessionStart | HookKind::SessionEnd => self.set(AgentState::Idle, now),
-                    HookKind::PromptSubmit => self.set(AgentState::Working, now),
+                    HookKind::SessionStart | HookKind::SessionEnd => {
+                        self.active_subagents = 0;
+                        self.set(AgentState::Idle, now)
+                    }
+                    HookKind::PromptSubmit | HookKind::ToolActivity => self.set(AgentState::Working, now),
+                    HookKind::SubagentStart => {
+                        self.active_subagents = self.active_subagents.saturating_add(1);
+                        self.set(AgentState::Working, now)
+                    }
                     HookKind::Notification { permission: true } => self.set(AgentState::NeedsPermission, now),
-                    HookKind::Notification { permission: false } => self.set(AgentState::NeedsInput, now),
-                    HookKind::Stop | HookKind::TurnComplete => self.set(AgentState::Done, now),
-                    HookKind::SubagentStop => None,
+                    HookKind::Notification { permission: false } => {
+                        // Do not mark as NeedsInput if subagents, child scripts, or the spinner are still active.
+                        if self.subprocs_busy || self.active_subagents > 0 || self.prev_title_busy == Some(true) {
+                            return None;
+                        }
+                        self.set(AgentState::NeedsInput, now)
+                    }
+                    HookKind::Stop | HookKind::TurnComplete => {
+                        self.active_subagents = 0;
+                        if self.subprocs_busy {
+                            let t = self.set(AgentState::Working, now);
+                            self.by_subprocs = true;
+                            return t;
+                        }
+                        self.set(AgentState::Done, now)
+                    }
+                    HookKind::SubagentStop => {
+                        self.active_subagents = self.active_subagents.saturating_sub(1);
+                        // If a subagent finished while the session was mistakenly marked Done or NeedsInput,
+                        // parent Claude is now continuing its turn.
+                        if matches!(self.state, AgentState::Done | AgentState::NeedsInput) {
+                            self.set(AgentState::Working, now)
+                        } else {
+                            None
+                        }
+                    }
                 }
             }
-            Event::Exited(code) => match code {
-                Some(0) => self.set(AgentState::Done, now),
-                _ => self.set(AgentState::Error, now),
-            },
+            Event::Exited(code) => {
+                self.active_subagents = 0;
+                match code {
+                    Some(0) => self.set(AgentState::Done, now),
+                    _ => self.set(AgentState::Error, now),
+                }
+            }
         }
     }
 
@@ -227,6 +291,7 @@ impl Tracker {
 
     /// Applies the heuristics to what the terminal shows now.
     pub fn observe(&mut self, obs: Observation, now: Instant) -> Option<Transition> {
+        self.subprocs_busy = obs.subprocs_busy;
         if let Some(t) = obs.last_output
             && self.prev_output != Some(t)
         {
@@ -235,23 +300,61 @@ impl Tracker {
             }
             self.prev_output = Some(t);
         }
+        // While child processes (shells, scripts, subagents) are running under the agent,
+        // keep the activity clock warm and keep the session in `Working` (unless awaiting permission).
+        if obs.subprocs_busy {
+            self.prev_output = Some(now);
+            if self.state != AgentState::Working && self.state != AgentState::NeedsPermission {
+                let t = self.set(AgentState::Working, now);
+                self.by_subprocs = true;
+                return t;
+            }
+        }
         let prev_busy = std::mem::replace(&mut self.prev_title_busy, obs.title_busy);
         match obs.title_busy {
-            Some(true) if self.state == AgentState::Idle => return self.set(AgentState::Working, now),
-            Some(false) if prev_busy == Some(true) && self.state == AgentState::Working => return self.set(AgentState::Done, now),
+            // Whenever the braille spinner is spinning in the title, the agent is working
+            // (even if it was previously marked Done or NeedsInput).
+            Some(true) if self.state != AgentState::Working && self.state != AgentState::NeedsPermission => {
+                return self.set(AgentState::Working, now);
+            }
+            // Only let `✳` (title_busy == Some(false)) mark Done when hooks are NOT active
+            // and no child processes or subagents are still running.
+            Some(false)
+                if prev_busy == Some(true)
+                    && self.state == AgentState::Working
+                    && !self.hooked
+                    && !obs.subprocs_busy
+                    && self.active_subagents == 0 =>
+            {
+                return self.set(AgentState::Done, now);
+            }
             _ => {}
         }
+        if self.state == AgentState::Working
+            && self.by_subprocs
+            && !obs.subprocs_busy
+            && self.active_subagents == 0
+            && obs.title_busy != Some(true)
+            && self.quiet_for(now) >= QUIET_DONE
+        {
+            return self.set(AgentState::Done, now);
+        }
         // The title speaks for programs that set one; hooks speak for hooked sessions.
-        if self.hooked || obs.title_busy.is_some() {
+        if self.hooked || obs.title_busy == Some(true) {
+            return None;
+        }
+        if obs.title_busy.is_some() && !self.output_is_work(now) {
             return None;
         }
         match self.state {
-            AgentState::Idle if self.output_is_work(now) => {
+            AgentState::Idle | AgentState::Done | AgentState::NeedsInput if self.output_is_work(now) => {
                 let t = self.set(AgentState::Working, now);
                 self.by_activity = true;
                 t
             }
-            AgentState::Working if self.by_activity && self.quiet_for(now) >= QUIET_DONE => self.set(AgentState::Done, now),
+            AgentState::Working if self.by_activity && !obs.subprocs_busy && self.active_subagents == 0 && self.quiet_for(now) >= QUIET_DONE => {
+                self.set(AgentState::Done, now)
+            }
             _ => None,
         }
     }
@@ -269,11 +372,13 @@ impl Tracker {
     /// How soon `observe` should run again even if nothing is printed (a silence can
     /// end a turn). `None` when only new output or events can change anything.
     pub fn recheck_in(&self, now: Instant) -> Option<Duration> {
-        if self.hooked {
+        if self.hooked && !self.by_subprocs {
             return None;
         }
         match self.state {
-            AgentState::Working if self.by_activity => Some(QUIET_DONE.saturating_sub(self.quiet_for(now)).max(Duration::from_millis(100))),
+            AgentState::Working if (self.by_activity || self.by_subprocs) && !self.subprocs_busy => {
+                Some(QUIET_DONE.saturating_sub(self.quiet_for(now)).max(Duration::from_millis(100)))
+            }
             AgentState::Idle if self.quiet_for(now) < BURST_GAP => Some(Duration::from_millis(250)),
             _ => None,
         }
@@ -305,7 +410,7 @@ mod tests {
         let mut at = from;
         while at < to {
             let now = start + ms(at);
-            out.extend(t.observe(Observation { title_busy: None, last_output: Some(now) }, now));
+            out.extend(t.observe(Observation { title_busy: None, last_output: Some(now), subprocs_busy: false }, now));
             at += 100;
         }
         out
@@ -313,7 +418,7 @@ mod tests {
 
     fn quiet(t: &mut Tracker, start: Instant, at: u64) -> Option<Transition> {
         let last = t.prev_output;
-        t.observe(Observation { title_busy: None, last_output: last }, start + ms(at))
+        t.observe(Observation { title_busy: None, last_output: last, subprocs_busy: false }, start + ms(at))
     }
 
     #[test]
@@ -347,16 +452,44 @@ mod tests {
     fn claude_title_spinner_drives_working_and_done() {
         let t0 = Instant::now();
         let mut t = Tracker::new(t0);
-        let busy = |b| Observation { title_busy: Some(b), last_output: Some(t0) };
+        let busy = |b| Observation { title_busy: Some(b), last_output: Some(t0), subprocs_busy: false };
         assert_eq!(t.observe(busy(false), t0), None);
         assert_eq!(t.observe(busy(true), t0 + ms(10)), Some((AgentState::Idle, AgentState::Working)));
         assert_eq!(t.observe(busy(true), t0 + ms(20)), None);
         assert_eq!(t.observe(busy(false), t0 + ms(30)), Some((AgentState::Working, AgentState::Done)));
+        // If spinner resumes after Done, it returns to Working!
+        assert_eq!(t.observe(busy(true), t0 + ms(40)), Some((AgentState::Done, AgentState::Working)));
         assert_eq!(title_activity(Some(AgentKind::Claude), "⠐ Fix the build"), Some(true));
         assert_eq!(title_activity(Some(AgentKind::Claude), "✳ Fix the build"), Some(false));
         assert_eq!(title_activity(Some(AgentKind::Codex), "✳ x"), None);
         assert_eq!(title_activity(None, "pwsh"), None);
         assert_eq!(title_activity(None, ""), None);
+    }
+
+    #[test]
+    fn subagents_and_running_scripts_keep_claude_working() {
+        let t0 = Instant::now();
+        let mut t = Tracker::new(t0);
+        let hook = |kind| Event::Hook { kind, message: None };
+        t.apply(hook(HookKind::PromptSubmit), t0);
+        assert_eq!(t.state, AgentState::Working);
+
+        // Title reverting to `✳` (Some(false)) or a child script ringing Bell while hooked
+        // or while subprocs_busy is true must NOT end the Working state.
+        let obs_script = Observation { title_busy: Some(false), last_output: Some(t0), subprocs_busy: true };
+        assert_eq!(t.observe(obs_script, t0 + ms(2000)), None);
+        assert_eq!(t.apply(Event::Bell, t0 + ms(2500)), None);
+        assert_eq!(t.apply(hook(HookKind::Notification { permission: false }), t0 + ms(3000)), None);
+        assert_eq!(t.state, AgentState::Working);
+
+        // Even if Stop arrives while a background subagent/script is still running, it stays Working.
+        assert_eq!(t.apply(hook(HookKind::Stop), t0 + ms(4000)), None);
+        assert_eq!(t.state, AgentState::Working);
+
+        // Once the child script/subagent finishes and QUIET_DONE elapses, it settles to Done.
+        let obs_idle = Observation { title_busy: Some(false), last_output: Some(t0 + ms(4000)), subprocs_busy: false };
+        assert_eq!(t.observe(obs_idle, t0 + ms(4500)), None);
+        assert_eq!(t.observe(obs_idle, t0 + ms(8000)), Some((AgentState::Working, AgentState::Done)));
     }
 
     #[test]

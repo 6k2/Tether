@@ -34,6 +34,27 @@ pub enum TabBody {
     Editor(Box<EditorView>),
 }
 
+/// An SFTP browser linked directly to the right side of an SSH terminal tab so it
+/// only shows while that SSH terminal tab is active, unless dragged/popped out.
+pub struct LinkedSftp {
+    pub view: Box<SftpView>,
+    pub split_fraction: f32,
+}
+
+impl LinkedSftp {
+    pub fn new(view: SftpView) -> Self {
+        Self { view: Box::new(view), split_fraction: 0.54 }
+    }
+}
+
+/// User action on a terminal tab's linked right-hand SFTP pane.
+pub enum LinkedSftpAction {
+    /// Separate the linked SFTP into an independent floating window at `pos`.
+    Detach { uid: u64, pos: Option<egui::Pos2>, rect: egui::Rect },
+    /// Minimize the linked SFTP into the mini-dock bar with the Genie animation.
+    Minimize { uid: u64, rect: egui::Rect },
+}
+
 pub struct Tab {
     pub uid: u64,
     /// The host; for a local shell, a stand-in (`pty::local_profile`) with a nil id.
@@ -45,11 +66,13 @@ pub struct Tab {
     pub local: Option<ShellSpec>,
     /// A name the user gave the tab; replaces the automatic title.
     pub custom_title: Option<String>,
+    /// Optional companion SFTP pane linked to this SSH terminal instance.
+    pub linked_sftp: Option<LinkedSftp>,
 }
 
 impl Tab {
     pub fn new(profile: Profile, body: TabBody) -> Self {
-        Self { uid: next_uid(), profile, body, born: None, local: None, custom_title: None }
+        Self { uid: next_uid(), profile, body, born: None, local: None, custom_title: None, linked_sftp: None }
     }
 
     pub fn new_local(spec: ShellSpec, view: TerminalView) -> Self {
@@ -60,9 +83,41 @@ impl Tab {
         self.local.is_some()
     }
 
+    /// Best-known working directory for this tab (AI agent hook -> OSC 7 -> live OS process
+    /// CWD -> initial fallback CWD).
+    pub fn current_cwd(&self) -> Option<String> {
+        let TabBody::Terminal(t) = &self.body else { return None };
+        if self.is_local()
+            && let Some(cwd) = crate::agents::hub::agent_cwd(self.uid)
+        {
+            return Some(cwd);
+        }
+        let osc_cwd = t
+            .handle
+            .shared
+            .try_lock()
+            .ok()
+            .and_then(|s| s.parser.callbacks().cwd.clone())
+            .or_else(|| t.remote_cwd().map(str::to_string));
+        if osc_cwd.is_some() {
+            return osc_cwd;
+        }
+        if self.is_local()
+            && let Some(cwd) = crate::procmon::usage_for(self.uid).and_then(|u| u.cwd.clone())
+        {
+            return Some(cwd);
+        }
+        t.fallback_cwd.clone()
+    }
+
     pub fn spec(&self) -> TabSpec {
+        let cwd = self.current_cwd();
         if let Some(shell) = &self.local {
-            return TabSpec { title: self.custom_title.clone(), ..TabSpec::new(uuid::Uuid::nil(), TabKind::Local { shell_id: shell.id.clone() }) };
+            return TabSpec {
+                title: self.custom_title.clone(),
+                cwd,
+                ..TabSpec::new(uuid::Uuid::nil(), TabKind::Local { shell_id: shell.id.clone() })
+            };
         }
         let kind = match self.body {
             TabBody::Terminal(_) => TabKind::Terminal,
@@ -70,7 +125,12 @@ impl Tab {
             // SFTP keeps the host's connection counted as in use while a file is open.
             TabBody::Sftp(_) | TabBody::Editor(_) => TabKind::Sftp,
         };
-        TabSpec { title: self.custom_title.clone(), ..TabSpec::new(self.profile.id, kind) }
+        TabSpec {
+            title: self.custom_title.clone(),
+            cwd,
+            with_sftp: self.linked_sftp.is_some(),
+            ..TabSpec::new(self.profile.id, kind)
+        }
     }
 
     /// Whether the tab belongs in a saved workspace layout (editor tabs do not).
@@ -132,7 +192,15 @@ impl Tab {
     /// full name), address for remote ones, the file path for editors.
     pub fn subtitle(&self) -> String {
         match (&self.body, &self.local) {
-            (TabBody::Terminal(t), Some(shell)) => t.shell_context().map_or_else(|| shell.name.clone(), |(cwd, branch)| context_line(&short_path(cwd), branch)),
+            (TabBody::Terminal(t), Some(shell)) => {
+                if let Some((cwd, branch)) = t.shell_context() {
+                    context_line(&short_path(cwd), branch)
+                } else if let Some(cwd) = self.current_cwd() {
+                    short_path(&cwd)
+                } else {
+                    shell.name.clone()
+                }
+            }
             (TabBody::Terminal(_), None) => self.profile.address(),
             (TabBody::Sftp(_), _) => format!("SFTP · {}", self.profile.address()),
             (TabBody::Editor(e), _) => e.remote_path().to_string(),
@@ -231,6 +299,8 @@ pub struct Viewer {
     /// Agent tabs' title layouts this frame: where `on_tab_button` paints the agent
     /// icon and status pill.
     pub agent_titles: HashMap<u64, AgentTitle>,
+    /// Detach / minimize requests from a terminal tab's linked right-hand SFTP pane.
+    pub linked_sftp_actions: Vec<LinkedSftpAction>,
 }
 
 /// A dock tab title with room left for the painted agent icon and status pill.
@@ -399,7 +469,12 @@ impl egui_dock::TabViewer for Viewer {
         }
         let icon = tab.icon();
         agent_badge::append_title_mark(&mut job, tab.uid, tab.status_color(), self.time);
-        RichText::new(format!("{icon}  {name}")).size(12.5).append_to(&mut job, &egui::Style::default(), egui::FontSelection::Default, egui::Align::Center);
+        let label = if tab.linked_sftp.is_some() {
+            format!("{icon}  {name}  · 📁")
+        } else {
+            format!("{icon}  {name}")
+        };
+        RichText::new(label).size(12.5).append_to(&mut job, &egui::Style::default(), egui::FontSelection::Default, egui::Align::Center);
         if tab.is_local() {
             usage_chip::append_to_title(&mut job, tab.uid, HOVERED_TAB.load(Ordering::Relaxed) == tab.uid);
         }
@@ -418,24 +493,117 @@ impl egui_dock::TabViewer for Viewer {
             ui.set_opacity(eased);
             ui.add_space((1.0 - eased) * 10.0);
         }
+        let is_local = tab.is_local();
+        let tab_uid = tab.uid;
+        let profile = tab.profile.clone();
         match &mut tab.body {
             TabBody::Terminal(view) => {
-                let term_id = ui.id().with("terminal");
-                self.terminal_ids.push(term_id);
-                let out = view.ui(ui, &tab.profile);
-                if !out.input.is_empty() {
-                    self.inputs.push((tab.uid, out.input));
+                if is_local {
+                    if let Some(cwd) = crate::agents::hub::agent_cwd(tab_uid)
+                        .or_else(|| crate::procmon::usage_for(tab_uid).and_then(|u| u.cwd.clone()))
+                    {
+                        view.fallback_cwd = Some(cwd);
+                    }
+                } else {
+                    view.fallback_cwd = None;
                 }
-                if !out.open_files.is_empty() {
-                    self.open_files.push((tab.uid, out.open_files));
+                if let Some(linked) = &mut tab.linked_sftp {
+                    let avail = ui.available_rect_before_wrap();
+                    let sep_w = 6.0;
+                    let left_w = ((avail.width() - sep_w) * linked.split_fraction).clamp(160.0, (avail.width() - sep_w - 180.0).max(160.0));
+                    let term_rect = egui::Rect::from_min_max(avail.min, egui::pos2(avail.left() + left_w, avail.bottom()));
+                    let sep_rect = egui::Rect::from_min_max(egui::pos2(term_rect.right(), avail.top()), egui::pos2(term_rect.right() + sep_w, avail.bottom()));
+                    let sftp_rect = egui::Rect::from_min_max(egui::pos2(sep_rect.right(), avail.top()), avail.max);
+
+                    // 1. Terminal on the left
+                    let mut term_ui = ui.new_child(egui::UiBuilder::new().max_rect(term_rect).id_salt(("linked_term", tab_uid)));
+                    term_ui.set_clip_rect(term_rect.intersect(ui.clip_rect()));
+                    let term_id = term_ui.id().with("terminal");
+                    self.terminal_ids.push(term_id);
+                    let out = view.ui(&mut term_ui, &profile);
+                    if !out.input.is_empty() {
+                        self.inputs.push((tab_uid, out.input));
+                    }
+                    if !out.open_files.is_empty() {
+                        self.open_files.push((tab_uid, out.open_files));
+                    }
+                    if out.reconnect {
+                        self.reconnect.push(tab_uid);
+                    }
+                    if ui.memory(|m| m.focused().is_some_and(|f| f == term_id)) {
+                        self.focused_uid = Some(tab_uid);
+                    }
+                    self.pane_status_pill(&mut term_ui, tab_uid, term_rect);
+
+                    // 2. Resizable vertical splitter
+                    let sep_id = ui.id().with(("linked_sftp_sep", tab_uid));
+                    let sep_resp = ui.interact(sep_rect, sep_id, egui::Sense::drag());
+                    if sep_resp.hovered() || sep_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if sep_resp.dragged()
+                        && let Some(pos) = sep_resp.interact_pointer_pos()
+                    {
+                        linked.split_fraction = ((pos.x - avail.left()) / avail.width().max(1.0)).clamp(0.2, 0.8);
+                    }
+                    let sep_col = if sep_resp.hovered() || sep_resp.dragged() {
+                        theme::accent()
+                    } else {
+                        theme::border().gamma_multiply(0.55)
+                    };
+                    ui.painter().vline(sep_rect.center().x, sep_rect.y_range(), egui::Stroke::new(1.5, sep_col));
+
+                    // 3. Linked SFTP on the right (with draggable header to separate/minimize/close)
+                    let header_h = 26.0;
+                    let header_rect = egui::Rect::from_min_max(sftp_rect.min, egui::pos2(sftp_rect.right(), sftp_rect.top() + header_h));
+                    let sftp_body_rect = egui::Rect::from_min_max(egui::pos2(sftp_rect.left(), header_rect.bottom()), sftp_rect.max);
+
+                    let mut close_linked = false;
+                    let mut detach_linked = None;
+                    let mut minimize_linked = false;
+
+                    paint_linked_sftp_header(
+                        ui,
+                        tab_uid,
+                        &profile,
+                        header_rect,
+                        &mut close_linked,
+                        &mut detach_linked,
+                        &mut minimize_linked,
+                    );
+
+                    let mut sftp_ui = ui.new_child(egui::UiBuilder::new().max_rect(sftp_body_rect).id_salt(("linked_sftp", tab_uid)));
+                    sftp_ui.set_clip_rect(sftp_body_rect.intersect(ui.clip_rect()));
+                    let sftp_out = linked.view.ui(&mut sftp_ui);
+                    if sftp_out.reconnect {
+                        self.reconnect.push(tab_uid);
+                    }
+                    if sftp_out.close || close_linked {
+                        tab.linked_sftp = None;
+                    } else if minimize_linked {
+                        self.linked_sftp_actions.push(LinkedSftpAction::Minimize { uid: tab_uid, rect: sftp_rect });
+                    } else if let Some(pos) = detach_linked {
+                        self.linked_sftp_actions.push(LinkedSftpAction::Detach { uid: tab_uid, pos, rect: sftp_rect });
+                    }
+                    ui.advance_cursor_after_rect(avail);
+                } else {
+                    let term_id = ui.id().with("terminal");
+                    self.terminal_ids.push(term_id);
+                    let out = view.ui(ui, &profile);
+                    if !out.input.is_empty() {
+                        self.inputs.push((tab_uid, out.input));
+                    }
+                    if !out.open_files.is_empty() {
+                        self.open_files.push((tab_uid, out.open_files));
+                    }
+                    if out.reconnect {
+                        self.reconnect.push(tab_uid);
+                    }
+                    if ui.memory(|m| m.focused().is_some_and(|f| f == term_id)) {
+                        self.focused_uid = Some(tab_uid);
+                    }
+                    self.pane_status_pill(ui, tab_uid, body);
                 }
-                if out.reconnect {
-                    self.reconnect.push(tab.uid);
-                }
-                if ui.memory(|m| m.focused().is_some_and(|f| f == term_id)) {
-                    self.focused_uid = Some(tab.uid);
-                }
-                self.pane_status_pill(ui, tab.uid, body);
             }
             TabBody::Sftp(view) => {
                 let out = view.ui(ui);
@@ -544,6 +712,98 @@ impl egui_dock::TabViewer for Viewer {
 
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
+    }
+}
+
+/// Compact draggable header bar for an SSH terminal's linked right-hand SFTP view.
+/// Dragging the header away (or clicking Pop-out `🗗`) un-links the SFTP into its own
+/// floating window; `—` minimizes it to the mini-bar; `✕` closes it.
+fn paint_linked_sftp_header(
+    ui: &mut Ui,
+    tab_uid: u64,
+    profile: &Profile,
+    rect: egui::Rect,
+    close_linked: &mut bool,
+    detach_linked: &mut Option<Option<egui::Pos2>>,
+    minimize_linked: &mut bool,
+) {
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::ZERO, theme::surface_2());
+    p.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, theme::border().gamma_multiply(0.55)));
+
+    let buttons_w = 72.0;
+    let drag_rect = egui::Rect::from_min_max(rect.min, egui::pos2((rect.right() - buttons_w).max(rect.left() + 20.0), rect.bottom()));
+    let drag_id = ui.id().with(("linked_sftp_hdr_drag", tab_uid));
+    let drag_resp = ui
+        .interact(drag_rect, drag_id, egui::Sense::click_and_drag())
+        .on_hover_text("Linked SFTP · Drag to separate into an independent window");
+    if drag_resp.hovered() || drag_resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if drag_resp.dragged()
+        && let Some(ptr) = ui.ctx().pointer_latest_pos()
+        && !rect.expand(16.0).contains(ptr)
+    {
+        *detach_linked = Some(Some(ptr));
+    }
+
+    let tint = theme::hue_color(profile.hue);
+    let label = format!("📁  SFTP · {}", profile.display_name());
+    let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.5), theme::text());
+    ui.painter().circle_filled(egui::pos2(rect.left() + 10.0, rect.center().y), 3.0, tint);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        theme::text(),
+    );
+
+    // Header buttons: Minimize (`—`), Separate/Pop-out (`🗗`), Close (`✕`)
+    let btn_size = egui::vec2(20.0, 18.0);
+    let y = rect.center().y - btn_size.y * 0.5;
+    let min_rect = egui::Rect::from_min_size(egui::pos2(rect.right() - 68.0, y), btn_size);
+    let pop_rect = egui::Rect::from_min_size(egui::pos2(rect.right() - 46.0, y), btn_size);
+    let cls_rect = egui::Rect::from_min_size(egui::pos2(rect.right() - 24.0, y), btn_size);
+
+    let min_resp = ui.interact(min_rect, drag_id.with("min"), egui::Sense::click()).on_hover_text("Minimize SFTP to mini-bar");
+    if min_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(min_rect, egui::CornerRadius::same(4), theme::accent_soft());
+    }
+    let mc = min_rect.center();
+    let mcol = if min_resp.hovered() { theme::accent() } else { theme::text_dim() };
+    ui.painter().line_segment([mc + egui::vec2(-4.0, 1.0), mc + egui::vec2(4.0, 1.0)], egui::Stroke::new(1.5, mcol));
+    if min_resp.clicked() {
+        *minimize_linked = true;
+    }
+
+    let pop_resp = ui.interact(pop_rect, drag_id.with("pop"), egui::Sense::click()).on_hover_text("Separate SFTP into floating window");
+    if pop_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(pop_rect, egui::CornerRadius::same(4), theme::surface_3());
+    }
+    let pcol = if pop_resp.hovered() { theme::text() } else { theme::text_dim() };
+    ui.painter().rect_stroke(
+        egui::Rect::from_center_size(pop_rect.center(), egui::vec2(9.0, 7.0)),
+        egui::CornerRadius::same(2),
+        egui::Stroke::new(1.3, pcol),
+        egui::StrokeKind::Inside,
+    );
+    if pop_resp.clicked() {
+        *detach_linked = Some(None);
+    }
+
+    let cls_resp = ui.interact(cls_rect, drag_id.with("cls"), egui::Sense::click()).on_hover_text("Close linked SFTP");
+    if cls_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(cls_rect, egui::CornerRadius::same(4), theme::danger().gamma_multiply(0.24));
+    }
+    let ccol = if cls_resp.hovered() { theme::danger() } else { theme::text_dim() };
+    let cc = cls_rect.center();
+    let d = 3.2;
+    ui.painter().line_segment([cc + egui::vec2(-d, -d), cc + egui::vec2(d, d)], egui::Stroke::new(1.4, ccol));
+    ui.painter().line_segment([cc + egui::vec2(d, -d), cc + egui::vec2(-d, d)], egui::Stroke::new(1.4, ccol));
+    if cls_resp.clicked() {
+        *close_linked = true;
     }
 }
 

@@ -40,9 +40,13 @@ pub struct Snapshot {
 type VisibleKey = (i32, u64, Option<AgentKind>);
 
 impl Snapshot {
-    fn visible_keys(&self) -> (Vec<(u64, VisibleKey)>, VisibleKey) {
-        let mut v: Vec<_> = self.per_tab.iter().map(|(k, u)| (*k, u.visible_key())).collect();
-        v.sort_unstable_by_key(|(k, _)| *k);
+    fn visible_keys(&self) -> (Vec<(u64, VisibleKey, bool, Option<String>)>, VisibleKey) {
+        let mut v: Vec<_> = self
+            .per_tab
+            .iter()
+            .map(|(k, u)| (*k, u.visible_key(), u.subprocs_busy, u.cwd.clone()))
+            .collect();
+        v.sort_unstable_by_key(|(k, ..)| *k);
         (v, self.total.visible_key())
     }
 }
@@ -202,6 +206,16 @@ impl Sampler {
         let mut ours: Vec<u32> = roots.flat_map(|root| table.descendants(root)).collect();
         ours.sort_unstable();
         ours.dedup();
+        // Refresh CWD for root watched shells so `Ctrl+Shift+T` and session restore always
+        // know the live working directory even when OSC 7 is off.
+        let watched_pids: Vec<Pid> = watch.values().copied().map(Pid::from_u32).collect();
+        if !watched_pids.is_empty() {
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&watched_pids),
+                false,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            );
+        }
         // Command lines only for launchers in our trees we have not classified yet.
         let mut unknown = Vec::new();
         for &pid in &ours {
@@ -212,6 +226,7 @@ impl Sampler {
             }
             if let Some(row) = table.row_mut(pid) {
                 row.name = name;
+                row.cwd = p.cwd().and_then(|c| c.to_str()).map(str::to_string).filter(|s| !s.is_empty());
             }
         }
         if !unknown.is_empty() {
@@ -253,6 +268,7 @@ impl Sampler {
                 mem: p.memory(),
                 start: p.start_time(),
                 agent: None,
+                cwd: None,
             })
             .collect();
         Table::new(rows)

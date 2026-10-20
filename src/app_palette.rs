@@ -208,7 +208,7 @@ impl TetherApp {
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
             Action::SplitRight => self.duplicate_focused(Split::Right, TabKind::Terminal, ctx),
             Action::SplitDown => self.duplicate_focused(Split::Below, TabKind::Terminal, ctx),
-            Action::OpenSftp => self.duplicate_focused(Split::Right, TabKind::Sftp, ctx),
+            Action::OpenSftp => self.open_linked_sftp(ctx),
             Action::CloseTab => self.close_focused(),
             Action::NextTab => self.cycle_tab(true),
             Action::PrevTab => self.cycle_tab(false),

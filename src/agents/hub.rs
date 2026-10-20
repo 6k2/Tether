@@ -268,7 +268,16 @@ impl AgentHub {
             if session.seen_cwd.is_some() && session.hook_kind.is_none() && session.cwd != session.seen_cwd {
                 session.cwd.clone_from(&session.seen_cwd);
             }
-            let sample = snap.as_ref().and_then(|s| s.per_tab.get(&t.uid).map(|u| (u.agent, s.at.unwrap_or(now))));
+            let usage = snap.as_ref().and_then(|s| s.per_tab.get(&t.uid));
+            let sample = usage.and_then(|u| snap.as_ref().map(|s| (u.agent, s.at.unwrap_or(now))));
+            let subprocs_busy = usage.is_some_and(|u| u.subprocs_busy);
+            if session.seen_cwd.is_none()
+                && session.hook_kind.is_none()
+                && let Some(proc_cwd) = usage.and_then(|u| u.cwd.as_ref())
+                && session.cwd.as_ref() != Some(proc_cwd)
+            {
+                session.cwd = Some(proc_cwd.clone());
+            }
             update_kind(session, sample);
             if let Some(kind) = session.kind {
                 // The agent's own title ("✳ Fix the login bug") names the task best.
@@ -306,7 +315,11 @@ impl AgentHub {
                 session.ended = true;
                 transitions.extend(session.tracker.apply(Event::Exited(code), now));
             }
-            let obs = Observation { title_busy: title_activity(Some(kind), &session.seen_title), last_output: seen.last_output };
+            let obs = Observation {
+                title_busy: title_activity(Some(kind), &session.seen_title),
+                last_output: seen.last_output,
+                subprocs_busy,
+            };
             transitions.extend(session.tracker.observe(obs, now));
             transitions.extend(settle_done(session, focused, now));
             for (_, to) in transitions {

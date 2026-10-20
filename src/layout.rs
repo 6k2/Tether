@@ -65,6 +65,33 @@ impl Side {
     }
 }
 
+/// Which edge of the main window the movable mini-dock bar snaps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MiniBarSide {
+    #[default]
+    Bottom,
+    Top,
+    Left,
+    Right,
+}
+
+impl MiniBarSide {
+    pub const ALL: [MiniBarSide; 4] = [MiniBarSide::Bottom, MiniBarSide::Top, MiniBarSide::Left, MiniBarSide::Right];
+
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, MiniBarSide::Bottom | MiniBarSide::Top)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MiniBarSide::Bottom => "Bottom",
+            MiniBarSide::Top => "Top",
+            MiniBarSide::Left => "Left",
+            MiniBarSide::Right => "Right",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "RawLayout")]
 pub struct LayoutSettings {
@@ -83,6 +110,10 @@ pub struct LayoutSettings {
     pub dim_amount: f32,
     /// Hovering a pane focuses it.
     pub focus_follows_mouse: bool,
+    /// Edge where the mini-dock bar for popped-up / minimized windows is docked.
+    pub mini_bar_side: MiniBarSide,
+    /// 0..=1 offset along the edge where the mini-dock bar sits.
+    pub mini_bar_offset: f32,
 }
 
 impl LayoutSettings {
@@ -129,6 +160,8 @@ impl Default for LayoutSettings {
             dim_inactive_panes: false,
             dim_amount: 0.35,
             focus_follows_mouse: false,
+            mini_bar_side: MiniBarSide::Bottom,
+            mini_bar_offset: 0.5,
         }
     }
 }
@@ -161,6 +194,8 @@ struct RawLayout {
     dim_inactive_panes: bool,
     dim_amount: f32,
     focus_follows_mouse: bool,
+    mini_bar_side: MiniBarSide,
+    mini_bar_offset: f32,
     // Older: one sidebar with stacked sections and an optional activity bar.
     sections: Option<Vec<LegacySection>>,
     activity_bar: bool,
@@ -182,6 +217,8 @@ impl Default for RawLayout {
             dim_inactive_panes: d.dim_inactive_panes,
             dim_amount: d.dim_amount,
             focus_follows_mouse: d.focus_follows_mouse,
+            mini_bar_side: d.mini_bar_side,
+            mini_bar_offset: d.mini_bar_offset,
             sections: None,
             activity_bar: false,
             active_view: None,
@@ -212,6 +249,8 @@ impl From<RawLayout> for LayoutSettings {
             dim_inactive_panes: r.dim_inactive_panes,
             dim_amount: r.dim_amount,
             focus_follows_mouse: r.focus_follows_mouse,
+            mini_bar_side: r.mini_bar_side,
+            mini_bar_offset: sane(r.mini_bar_offset, 0.05, 0.95, 0.5),
         }
     }
 }

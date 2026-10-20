@@ -55,7 +55,8 @@ pub fn run_local_pty(
     for (key, value) in crate::agents::ipc::session_env() {
         cmd.env(key, value);
     }
-    if let Some(dir) = cwd.filter(|d| d.is_dir()).or_else(home_dir) {
+    let initial_cwd = cwd.filter(|d| d.is_dir()).or_else(home_dir);
+    if let Some(dir) = &initial_cwd {
         cmd.cwd(dir);
     }
     let mut child = pair.slave.spawn_command(cmd).with_context(|| format!("starting {}", spec.program.display()))?;
@@ -69,6 +70,11 @@ pub fn run_local_pty(
     if let Ok(mut s) = term.shared.lock() {
         // ConPTY passes escape sequences through ahead of the text it renders.
         s.parser.callbacks_mut().shell.set_lazy_marks(cfg!(windows));
+        if s.parser.callbacks().cwd.is_none()
+            && let Some(dir) = &initial_cwd
+        {
+            s.parser.callbacks_mut().cwd = Some(dir.display().to_string());
+        }
         s.pid = child.process_id();
         s.opened_at = Some(Instant::now());
         s.state = LinkState::Connected;

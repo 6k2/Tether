@@ -57,11 +57,17 @@ pub struct TabSpec {
     /// A name the user gave the tab (renamed in the tab list).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Working directory of the terminal when saved, restored on session restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// True when an SSH terminal tab has a companion SFTP pane linked to its right side.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_sftp: bool,
 }
 
 impl TabSpec {
     pub fn new(profile_id: Uuid, kind: TabKind) -> Self {
-        Self { profile_id, kind, title: None }
+        Self { profile_id, kind, title: None, cwd: None, with_sftp: false }
     }
 }
 
@@ -321,6 +327,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<TabSpec>(&text).unwrap(), titled);
         let plain = serde_json::to_string(&spec(Uuid::nil(), TabKind::Sftp)).unwrap();
         assert!(!plain.contains("title"), "{plain}");
+    }
+
+    #[test]
+    fn cwd_round_trips_and_stays_optional() {
+        let with_cwd = TabSpec {
+            cwd: Some(r"D:\Projects\Personal\tether".into()),
+            ..spec(Uuid::nil(), TabKind::Local { shell_id: "pwsh".into() })
+        };
+        let text = serde_json::to_string(&with_cwd).unwrap();
+        assert!(text.contains(r"D:\\Projects\\Personal\\tether"), "{text}");
+        assert_eq!(serde_json::from_str::<TabSpec>(&text).unwrap(), with_cwd);
+        let plain = serde_json::to_string(&spec(Uuid::nil(), TabKind::Terminal)).unwrap();
+        assert!(!plain.contains("cwd"), "{plain}");
     }
 
     #[test]

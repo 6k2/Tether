@@ -49,6 +49,7 @@ struct DetachedWindow {
 
 struct WindowOut {
     close_requested: bool,
+    minimize_requested: bool,
     drop: Option<OutDrop>,
 }
 
@@ -76,10 +77,41 @@ impl Detacher {
         self.windows.iter_mut().map(|w| &mut w.dock)
     }
 
+    /// Removes and returns a tab with `uid` from any detached window.
+    pub fn remove_tab_by_uid(&mut self, uid: u64) -> Option<Tab> {
+        for w in &mut self.windows {
+            if let Some(path) = w.dock.find_tab_from(|t| t.uid == uid) {
+                let tab = w.dock.remove_tab(path);
+                self.windows.retain(|win| win.dock.iter_all_tabs().next().is_some());
+                return tab;
+            }
+        }
+        None
+    }
+
+    /// Activates and focuses the detached window holding `uid`.
+    pub fn focus_tab(&mut self, ctx: &egui::Context, uid: u64) -> bool {
+        for w in &mut self.windows {
+            if let Some(path) = w.dock.find_tab_from(|t| t.uid == uid) {
+                let _ = w.dock.set_active_tab(path);
+                w.dock.set_focused_node_and_surface(path.node_path());
+                ctx.send_viewport_cmd_to(w.viewport, ViewportCommand::Focus);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Runs once per frame of the main window, after the main dock was shown.
     /// Renders the detached windows (their tab output is collected into `viewer`),
     /// moves tabs between windows, and docks windows that rest over the app.
-    pub fn frame(&mut self, ctx: &egui::Context, main: &mut DockState<Tab>, viewer: &mut Viewer) {
+    pub fn frame(
+        &mut self,
+        ctx: &egui::Context,
+        main: &mut DockState<Tab>,
+        viewer: &mut Viewer,
+        mini_dock: &mut super::mini_dock::MiniDock,
+    ) {
         let (main_inner, main_outer, content, now) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().outer_rect, i.content_rect(), i.time));
         let mut drops: Vec<(Option<u64>, OutDrop)> = Vec::new();
         if let Some(d) = track_drag(ctx, main, Id::new(MAIN_DOCK_ID), &mut self.main_track) {
@@ -91,13 +123,22 @@ impl Detacher {
             }
         }
         let mut closed = Vec::new();
+        let mut minimized = Vec::new();
         for w in &mut self.windows {
             let out = show_window(ctx, w, viewer);
             if out.close_requested {
                 closed.push(w.key);
+            } else if out.minimize_requested {
+                minimized.push(w.key);
             }
             if let Some(d) = out.drop {
                 drops.push((Some(w.key), d));
+            }
+        }
+        for key in minimized {
+            if let Some(w) = self.remove(key) {
+                let from_rect = super::mini_dock::default_floating_rect(content);
+                mini_dock.minimize_tabs(ctx, dock_tabs(w.dock), from_rect);
             }
         }
         for key in closed {
@@ -258,8 +299,10 @@ fn show_window(ctx: &egui::Context, w: &mut DetachedWindow, viewer: &mut Viewer)
         let ctx = ui.ctx().clone();
         let (outer, close_requested) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().close_requested()));
         w.outer = outer;
+        let mut minimize_requested = false;
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::same(0));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            let full_rect = ui.max_rect();
             let style = theme::dock_style(ui.style());
             DockArea::new(&mut w.dock)
                 .id(w.dock_id)
@@ -268,9 +311,27 @@ fn show_window(ctx: &egui::Context, w: &mut DetachedWindow, viewer: &mut Viewer)
                 .show_leaf_collapse_buttons(false)
                 .show_leaf_close_all_buttons(false)
                 .show_inside(ui, viewer);
+
+            // Minimize to mini-dock bar button in the top-right header of the detached window.
+            let btn_rect = Rect::from_min_size(Pos2::new(full_rect.right() - 32.0, full_rect.top() + 5.0), Vec2::new(24.0, 20.0));
+            let min_resp = ui
+                .interact(btn_rect, w.dock_id.with("min_to_bar"), egui::Sense::click())
+                .on_hover_text("Minimize to mini-bar");
+            let bg = if min_resp.hovered() { theme::accent_soft() } else { theme::surface_2().gamma_multiply(0.85) };
+            ui.painter().rect_filled(btn_rect, CornerRadius::same(5), bg);
+            ui.painter().rect_stroke(btn_rect, CornerRadius::same(5), Stroke::new(1.0, theme::border().gamma_multiply(0.5)), StrokeKind::Inside);
+            let col = if min_resp.hovered() { theme::accent() } else { theme::text_dim() };
+            let c = btn_rect.center();
+            ui.painter().line_segment([c + vec2(-5.0, 1.0), c + vec2(5.0, 1.0)], Stroke::new(1.6, col));
+            if min_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if min_resp.clicked() {
+                minimize_requested = true;
+            }
         });
         let drop = track_drag(&ctx, &w.dock, w.dock_id, &mut w.track);
-        WindowOut { close_requested, drop }
+        WindowOut { close_requested, minimize_requested, drop }
     })
 }
 

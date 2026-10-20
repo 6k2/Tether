@@ -40,7 +40,7 @@ impl Host<'_, '_> {
     fn count(&self, v: View) -> Option<usize> {
         match v {
             View::Hosts => Some(Sidebar::host_count(self.data)),
-            View::Sessions => Some(self.dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count()),
+            View::Sessions => Some(self.dock.iter_all_tabs().count() + self.vtabs.extra_rows.len()),
             View::Workspaces => Some(self.data.workspaces.len()),
             View::Agents => Some(self.agents.len()),
         }
@@ -130,7 +130,30 @@ impl TetherApp {
         let has_tabs = self.layout_specs().is_some();
         let shells = crate::pty::shells::detected().unwrap_or_default();
         let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live, shells };
-        let tabs = self.dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count();
+        self.vtabs.extra_rows.clear();
+        for tab in self.detached.tabs_mut() {
+            self.vtabs.extra_rows.push(crate::ui::vertical_tabs::ExtraSessionRow {
+                uid: tab.uid,
+                title: tab.display_title(),
+                subtitle: tab.subtitle(),
+                icon: crate::ui::vertical_tabs::row_icon_for(tab),
+                hue: tab.profile.hue,
+                status: tab.status_color(),
+                minimized: false,
+            });
+        }
+        for tab in self.mini_dock.tabs_mut() {
+            self.vtabs.extra_rows.push(crate::ui::vertical_tabs::ExtraSessionRow {
+                uid: tab.uid,
+                title: tab.display_title(),
+                subtitle: tab.subtitle(),
+                icon: crate::ui::vertical_tabs::row_icon_for(tab),
+                hue: tab.profile.hue,
+                status: tab.status_color(),
+                minimized: true,
+            });
+        }
+        let tabs = self.dock.iter_all_tabs().count() + self.vtabs.extra_rows.len();
         let waiting = self.agents.attention_count();
         // The badge takes the status colour of the most urgent session.
         let urgent = self.agents.sessions().iter().map(|s| s.state).filter(|s| s.needs_attention()).min_by_key(|s| s.urgency());

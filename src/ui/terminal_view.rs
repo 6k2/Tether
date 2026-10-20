@@ -72,6 +72,8 @@ pub struct TerminalView {
     pub intercept_nano: bool,
     /// Take keyboard focus on the next frame (the agents panel jumping to this tab).
     pub want_focus: bool,
+    /// Fallback working directory (e.g. from an AI agent hook when OSC 7 hasn't fired).
+    pub fallback_cwd: Option<String>,
     /// Boxed to keep `TabBody` small.
     cache: Box<ViewCache>,
 }
@@ -86,6 +88,8 @@ struct ViewCache {
     link: LinkState,
     /// Shell-integration blocks on screen (marks, selection, sticky header).
     blocks: super::blocks::BlocksView,
+    /// Warp-style clickable file paths and URLs under the pointer.
+    links: super::term_links::LinksState,
 }
 
 /// What a frame needs from the shared terminal state, copied out under the lock.
@@ -129,7 +133,15 @@ impl TerminalView {
             typed_line: String::new(),
             intercept_nano: true,
             want_focus: false,
-            cache: Box::new(ViewCache { grid: GridCache::default(), title: None, cwd: None, link: LinkState::Connecting, blocks: Default::default() }),
+            fallback_cwd: None,
+            cache: Box::new(ViewCache {
+                grid: GridCache::default(),
+                title: None,
+                cwd: None,
+                link: LinkState::Connecting,
+                blocks: Default::default(),
+                links: Default::default(),
+            }),
         }
     }
 
@@ -201,7 +213,13 @@ impl TerminalView {
         self.handle.repaint.mark_painted(ui.ctx());
         super::backdrop::paint(&painter, rect);
 
-        let Some(frame) = self.sync_grid((rows, cols), &font, &palette, RenderKey::of(ui.ctx())) else { return out };
+        let hover_cell = response.hovered().then(|| ui.ctx().pointer_hover_pos()).flatten().filter(|p| inner.contains(*p)).map(|p| {
+            let r = (((p.y - inner.top()) / m.cell_h).floor().max(0.0) as u16).min(rows - 1);
+            let c = (((p.x - inner.left()) / m.cell_w).floor().max(0.0) as u16).min(cols - 1);
+            (r, c)
+        });
+
+        let Some(frame) = self.sync_grid((rows, cols), &font, &palette, RenderKey::of(ui.ctx()), hover_cell) else { return out };
         // Glyph layout for new rows happens with the lock released.
         self.cache.grid.layout(ui.ctx());
         let FrameInfo { state, stage, bells, history, app_cursor, bracketed, alt_screen, cursor } = frame;
@@ -217,6 +235,9 @@ impl TerminalView {
         let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         self.cache.grid.paint(&painter, inner.min, m, |row| selection_cols(sel, row, cols));
         if !alt_screen {
+            if let Some(super::term_links::LinkAction::OpenRemote(path)) = self.cache.links.paint_and_menu(ui, &painter, inner, m, accent) {
+                out.open_files.push(path);
+            }
             let geom = super::blocks::Geom { rect, inner, cell_h: m.cell_h, rows };
             if let Some(req) = self.cache.blocks.paint(ui, geom, &settings.shell_integration, accent) {
                 self.block_request(req, ui.ctx(), &mut out);
@@ -272,7 +293,14 @@ impl TerminalView {
 
     /// Locks the terminal just long enough to clamp the scroll offset, refresh the row
     /// cache and copy out what the rest of the frame needs. `None` if the lock is poisoned.
-    fn sync_grid(&mut self, size: (u16, u16), font: &FontId, palette: &theme::Palette, render: RenderKey) -> Option<FrameInfo> {
+    fn sync_grid(
+        &mut self,
+        size: (u16, u16),
+        font: &FontId,
+        palette: &theme::Palette,
+        render: RenderKey,
+        hover_cell: Option<(u16, u16)>,
+    ) -> Option<FrameInfo> {
         let shared_arc = self.handle.shared.clone();
         let mut shared = shared_arc.lock().ok()?;
         let generation = shared.generation;
@@ -292,7 +320,13 @@ impl TerminalView {
         if shared.parser.callbacks().title != self.cache.title {
             self.cache.title.clone_from(&shared.parser.callbacks().title);
         }
+        if shared.parser.callbacks().cwd != self.cache.cwd {
+            self.cache.cwd.clone_from(&shared.parser.callbacks().cwd);
+        }
         self.cache.blocks.sync(&shared.parser.callbacks().shell, self.scroll, size.0);
+        let effective_cwd = self.cache.cwd.as_deref().or(self.fallback_cwd.as_deref());
+        let hover = if screen.alternate_screen() { None } else { hover_cell };
+        self.cache.links.sync(screen, generation, self.scroll, hover, effective_cwd, !self.intercept_nano);
         Some(FrameInfo {
             state: shared.state.clone(),
             stage: shared.stage,
@@ -494,6 +528,19 @@ impl TerminalView {
                 self.selection = Some((start, to_cell(p)));
             }
         } else if response.clicked() {
+            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if !alt_screen
+                && let Some(p) = response.interact_pointer_pos()
+            {
+                let (intercepted, action) = self.cache.links.on_click(p, ctrl, ui.ctx());
+                if intercepted {
+                    self.selection = None;
+                    if let Some(super::term_links::LinkAction::OpenRemote(path)) = action {
+                        out.open_files.push(path);
+                    }
+                    return;
+                }
+            }
             self.selection = None;
         }
 

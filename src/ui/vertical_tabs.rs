@@ -49,6 +49,8 @@ pub enum TabAction {
     SplitWith(u64, Split),
     /// Into its own native window.
     PopOut(u64),
+    /// Minimize a popped-out / floating window (or tab) into the mini-dock bar.
+    MinimizeWindow(u64),
     Move { uid: u64, target: TabTarget },
     /// A local shell by id; `None` = the default shell.
     NewShell(Option<String>),
@@ -86,13 +88,28 @@ struct RowModel {
 struct Group {
     leaf: NodePath,
     focused: bool,
+    label: Option<&'static str>,
     rows: Vec<RowModel>,
+}
+
+/// Summary of a tab living outside `dock` (in a native detached window or minimized
+/// in the mini-dock bar) so the Sessions sidebar can still list, focus, and close it.
+#[derive(Clone)]
+pub struct ExtraSessionRow {
+    pub uid: u64,
+    pub title: String,
+    pub subtitle: String,
+    pub icon: String,
+    pub hue: f32,
+    pub status: egui::Color32,
+    pub minimized: bool,
 }
 
 #[derive(Default)]
 pub struct VerticalTabs {
     renaming: Option<(u64, String)>,
     badges: TabBadges,
+    pub extra_rows: Vec<ExtraSessionRow>,
 }
 
 impl VerticalTabs {
@@ -102,7 +119,7 @@ impl VerticalTabs {
 
     /// Height the list needs with `tabs` rows in `panes` panes.
     pub fn list_height(dock: &DockState<Tab>, opts: ListOptions) -> f32 {
-        let leaves: Vec<usize> = dock.iter_leaves().filter(|(p, _)| p.surface.is_main()).map(|(_, l)| l.tabs.len()).filter(|n| *n > 0).collect();
+        let leaves: Vec<usize> = dock.iter_leaves().map(|(_, l)| l.tabs.len()).filter(|n| *n > 0).collect();
         let rows: usize = leaves.iter().sum();
         let headers = if opts.grouped && leaves.len() > 1 { leaves.len() as f32 * GROUP_H } else { 0.0 };
         rows as f32 * row_h(opts) + headers
@@ -126,7 +143,7 @@ impl VerticalTabs {
     /// The Sessions view body in a side bar: the list (scrolling), an empty state.
     pub fn body(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions, position: TabPosition) -> Vec<TabAction> {
         let mut actions = Vec::new();
-        if dock.iter_all_tabs().filter(|(p, _)| p.surface.is_main()).count() == 0 {
+        if dock.iter_all_tabs().count() == 0 && self.extra_rows.is_empty() {
             empty_state(ui, &mut actions);
             return actions;
         }
@@ -153,7 +170,7 @@ impl VerticalTabs {
     /// columns, one per pane when grouped, otherwise flowing left to right.
     pub fn columns(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions) -> Vec<TabAction> {
         let mut actions = Vec::new();
-        let groups = collect(dock);
+        let groups = collect(dock, &self.extra_rows);
         if groups.is_empty() {
             empty_state(ui, &mut actions);
             return actions;
@@ -190,15 +207,17 @@ impl VerticalTabs {
 
     fn list_into(&mut self, ui: &mut Ui, dock: &mut DockState<Tab>, opts: ListOptions, actions: &mut Vec<TabAction>) {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let groups = collect(dock);
-        let headers = opts.grouped && groups.len() > 1;
+        let groups = collect(dock, &self.extra_rows);
+        let headers = opts.grouped && (groups.len() > 1 || groups.iter().any(|g| g.label.is_some()));
         for (gi, group) in groups.iter().enumerate() {
             if headers {
                 if gi > 0 {
                     ui.add_space(2.0);
                 }
                 let resp = group_header(ui, gi, group);
-                drop_zone(ui, &resp, TabTarget::Append(group.leaf), actions);
+                if group.leaf.surface.is_main() {
+                    drop_zone(ui, &resp, TabTarget::Append(group.leaf), actions);
+                }
             }
             for row in &group.rows {
                 let tab = dock.iter_all_tabs().find(|(_, t)| t.uid == row.uid).map(|(_, t)| t);
@@ -385,6 +404,10 @@ pub fn tab_menu_items(ui: &mut Ui, uid: u64, actions: &mut Vec<TabAction>) {
         actions.push(TabAction::PopOut(uid));
         ui.close();
     }
+    if item(ui, "—  Minimize to mini-bar", None) {
+        actions.push(TabAction::MinimizeWindow(uid));
+        ui.close();
+    }
     ui.separator();
     if item(ui, "Close others", None) {
         actions.push(TabAction::CloseOthers(uid));
@@ -473,15 +496,16 @@ fn row_h(opts: ListOptions) -> f32 {
     if opts.compact { ROW_H_COMPACT } else { ROW_H }
 }
 
-fn collect(dock: &mut DockState<Tab>) -> Vec<Group> {
+fn collect(dock: &mut DockState<Tab>, extra: &[ExtraSessionRow]) -> Vec<Group> {
     let focused = dock.focused_leaf();
     let mut groups = Vec::new();
     for (path, leaf) in dock.iter_leaves_mut() {
-        if !path.surface.is_main() || leaf.tabs.is_empty() {
+        if leaf.tabs.is_empty() {
             continue;
         }
         let active = leaf.active.0;
         let is_focused = focused == Some(path);
+        let label = (!path.surface.is_main()).then_some("POP-OUT WINDOW");
         let rows = leaf
             .tabs
             .iter_mut()
@@ -499,9 +523,64 @@ fn collect(dock: &mut DockState<Tab>) -> Vec<Group> {
                 focused: is_focused && index == active,
             })
             .collect();
-        groups.push(Group { leaf: path, focused: is_focused, rows });
+        groups.push(Group { leaf: path, focused: is_focused, label, rows });
+    }
+    let detached_rows: Vec<RowModel> = extra
+        .iter()
+        .filter(|e| !e.minimized)
+        .enumerate()
+        .map(|(index, e)| RowModel {
+            uid: e.uid,
+            title: e.title.clone(),
+            subtitle: e.subtitle.clone(),
+            icon: e.icon.clone(),
+            hue: e.hue,
+            status: e.status,
+            leaf: NodePath { surface: egui_dock::SurfaceIndex(usize::MAX - 1), node: egui_dock::NodeIndex::root() },
+            index,
+            visible: true,
+            focused: false,
+        })
+        .collect();
+    if !detached_rows.is_empty() {
+        groups.push(Group {
+            leaf: NodePath { surface: egui_dock::SurfaceIndex(usize::MAX - 1), node: egui_dock::NodeIndex::root() },
+            focused: false,
+            label: Some("POP-OUT WINDOW"),
+            rows: detached_rows,
+        });
+    }
+    let min_rows: Vec<RowModel> = extra
+        .iter()
+        .filter(|e| e.minimized)
+        .enumerate()
+        .map(|(index, e)| RowModel {
+            uid: e.uid,
+            title: e.title.clone(),
+            subtitle: format!("Minimized · {}", e.subtitle),
+            icon: e.icon.clone(),
+            hue: e.hue,
+            status: e.status,
+            leaf: NodePath { surface: egui_dock::SurfaceIndex(usize::MAX), node: egui_dock::NodeIndex::root() },
+            index,
+            visible: false,
+            focused: false,
+        })
+        .collect();
+    if !min_rows.is_empty() {
+        groups.push(Group {
+            leaf: NodePath { surface: egui_dock::SurfaceIndex(usize::MAX), node: egui_dock::NodeIndex::root() },
+            focused: false,
+            label: Some("MINIMIZED"),
+            rows: min_rows,
+        });
     }
     groups
+}
+
+/// Shell glyph for local shells, the host's initial for SSH terminals.
+pub fn row_icon_for(tab: &Tab) -> String {
+    row_icon(tab)
 }
 
 /// Shell glyph for local shells, the host's initial for SSH terminals.
@@ -528,7 +607,10 @@ fn group_header(ui: &mut Ui, index: usize, group: &Group) -> egui::Response {
     } else {
         p.rect_stroke(glyph, CornerRadius::same(2), Stroke::new(1.0, col), egui::StrokeKind::Inside);
     }
-    let label = format!("PANE {}", index + 1);
+    let label = match group.label {
+        Some(custom) => custom.to_string(),
+        None => format!("PANE {}", index + 1),
+    };
     p.text(Pos2::new(rect.left() + 22.0, y), Align2::LEFT_CENTER, label, FontId::proportional(10.5), col);
     let n = group.rows.len();
     p.text(Pos2::new(rect.right() - 6.0, y), Align2::RIGHT_CENTER, format!("{n} tab{}", if n == 1 { "" } else { "s" }), FontId::proportional(10.5), theme::text_faint().gamma_multiply(0.8));

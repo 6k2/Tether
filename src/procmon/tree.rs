@@ -22,6 +22,7 @@ pub struct ProcRow {
     /// Seconds since the epoch; a "child" older than its parent is a reused pid.
     pub start: u64,
     pub agent: Option<AgentKind>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +43,11 @@ pub struct Usage {
     pub top: Vec<ProcUsage>,
     /// The agent closest to the shell, if one runs in the tree.
     pub agent: Option<AgentKind>,
+    /// True when the agent process has active child processes (subagents, shells, scripts,
+    /// tools) or significant CPU activity in its subtree.
+    pub subprocs_busy: bool,
+    /// Current working directory of the shell or foreground child process.
+    pub cwd: Option<String>,
 }
 
 impl Usage {
@@ -112,15 +118,93 @@ impl Table {
         let mut top: Vec<ProcUsage> = rows.iter().map(|r| ProcUsage { pid: r.pid, name: r.name.clone(), cpu: r.cpu, mem: r.mem }).collect();
         top.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)));
         top.truncate(TOP_N);
+        let agent_row = rows.iter().copied().find(|r| r.agent.is_some());
+        let subprocs_busy = match agent_row {
+            Some(ap) => {
+                let desc_pids = self.descendants(ap.pid);
+                let has_active_child = desc_pids.iter().copied().filter(|&p| p != ap.pid).filter_map(|p| self.row(p)).any(|r| {
+                    !is_passive_helper(&r.name)
+                        && (r.agent.is_some()
+                            || is_tool_or_shell_proc(&r.name)
+                            || r.start > ap.start.saturating_add(2)
+                            || r.cpu >= 0.8)
+                });
+                has_active_child || ap.cpu >= 2.0
+            }
+            None => false,
+        };
+        let cwd = agent_row
+            .and_then(|r| r.cwd.clone())
+            .or_else(|| rows.first().and_then(|r| r.cwd.clone()));
         Some(Usage {
             cpu: rows.iter().map(|r| r.cpu).sum(),
             mem: rows.iter().map(|r| r.mem).sum(),
             procs: rows.len(),
             top,
             // Breadth-first order: the shallowest agent is the one the user started.
-            agent: rows.iter().find_map(|r| r.agent),
+            agent: agent_row.and_then(|r| r.agent),
+            subprocs_busy,
+            cwd,
         })
     }
+}
+
+fn is_passive_helper(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let stem = n.strip_suffix(".exe").unwrap_or(&n);
+    matches!(stem, "conhost" | "openconsole" | "tether")
+}
+
+fn is_tool_or_shell_proc(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let stem = n.strip_suffix(".exe").unwrap_or(&n);
+    matches!(
+        stem,
+        "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "cargo"
+            | "rustc"
+            | "rustup"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "bun"
+            | "deno"
+            | "python"
+            | "python3"
+            | "py"
+            | "pytest"
+            | "uv"
+            | "git"
+            | "rg"
+            | "grep"
+            | "find"
+            | "fd"
+            | "make"
+            | "cmake"
+            | "ninja"
+            | "go"
+            | "dotnet"
+            | "msbuild"
+            | "cl"
+            | "link"
+            | "jest"
+            | "vitest"
+            | "tsc"
+            | "eslint"
+            | "prettier"
+            | "curl"
+            | "wget"
+            | "ssh"
+            | "scp"
+            | "tar"
+    )
 }
 
 #[cfg(test)]
@@ -128,7 +212,7 @@ mod tests {
     use super::*;
 
     fn row(pid: u32, parent: Option<u32>, name: &str, cpu: f32, mem_mb: u64) -> ProcRow {
-        ProcRow { pid, parent, name: name.into(), cpu, mem: mem_mb << 20, start: 100 + pid as u64, agent: AgentKind::detect(name, &[]) }
+        ProcRow { pid, parent, name: name.into(), cpu, mem: mem_mb << 20, start: 100 + pid as u64, agent: AgentKind::detect(name, &[]), cwd: None }
     }
 
     fn table() -> Table {

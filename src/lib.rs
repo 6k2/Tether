@@ -4,6 +4,7 @@ pub mod actions;
 pub mod agents;
 pub mod app;
 pub mod commands;
+pub mod crashlog;
 pub mod folders;
 pub mod fonts;
 pub mod import;

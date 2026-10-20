@@ -11,6 +11,7 @@ fn main() -> eframe::Result {
         tether::agents::hook::run(&args[2..]);
         return Ok(());
     }
+    tether::crashlog::install();
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("tether")
         .with_inner_size([1360.0, 840.0])
@@ -20,5 +21,9 @@ fn main() -> eframe::Result {
         viewport = viewport.with_icon(Arc::new(icon));
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("tether", options, Box::new(|cc| Ok(Box::new(app::TetherApp::new(cc)?))))
+    let res = eframe::run_native("tether", options, Box::new(|cc| Ok(Box::new(app::TetherApp::new(cc)?))));
+    if let Err(ref e) = res {
+        tether::crashlog::record_fatal("eframe::run_native", e);
+    }
+    res
 }

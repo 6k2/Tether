@@ -123,6 +123,9 @@ impl TetherApp {
         crate::pty::shells::warm_up(move || ctx.request_repaint());
         crate::agents::launch::warm_up();
         let toasts = Toasts::default();
+        if let Some((summary, path)) = crate::crashlog::take_last_crash_summary() {
+            toasts.error(format!("Previous session crashed: {summary}\nCrash log saved to {}", path.display()));
+        }
         let mut store = ProfileStore::load(dir.join("profiles.json")).unwrap_or_else(|e| {
             toasts.error(format!("Could not read profiles: {e:#}"));
             ProfileStore::default()

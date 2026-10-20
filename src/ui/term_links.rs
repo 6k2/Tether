@@ -200,7 +200,6 @@ impl LinksState {
                     }
                     LinkTarget::RemotePath { path, .. } => format!("Remote: {path}\nClick for options · Ctrl+click to edit"),
                 };
-                ui.ctx().debug_painter();
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("term_link_tip"), egui::PopupAnchor::Pointer)
                     .gap(10.0)
                     .show(|ui| {
@@ -499,7 +498,11 @@ pub fn find_link_in_str(
     is_local: bool,
     cache: &mut PathProbeCache,
 ) -> Option<(String, LinkTarget, (usize, usize))> {
-    if byte_idx >= text.len() || text.as_bytes()[byte_idx].is_ascii_whitespace() {
+    if byte_idx >= text.len() || !text.is_char_boundary(byte_idx) {
+        return None;
+    }
+    let ch_at = text[byte_idx..].chars().next()?;
+    if ch_at.is_whitespace() {
         return None;
     }
     // 1. Check if cursor is inside a quoted span ("...", '...', `...`) that resolves as a path/URL.
@@ -516,8 +519,11 @@ pub fn find_link_in_str(
 }
 
 fn enclosing_quotes(text: &str, byte_idx: usize) -> Option<(usize, usize)> {
+    if !text.is_char_boundary(byte_idx) {
+        return None;
+    }
     for quote in ['"', '\'', '`'] {
-        let before = text[..=byte_idx.min(text.len().saturating_sub(1))].rfind(quote);
+        let before = text[..byte_idx].rfind(quote);
         if let Some(open) = before {
             let inner_start = open + 1;
             if inner_start <= byte_idx
@@ -817,5 +823,17 @@ mod tests {
         let (raw, r_target, _) = find_link_in_str(text, p_idx, Some("/var"), false, &mut cache).unwrap();
         assert_eq!(raw, "/etc/nginx/nginx.conf");
         assert_eq!(r_target, LinkTarget::RemotePath { path: "/etc/nginx/nginx.conf".into(), line: Some(10) });
+    }
+
+    #[test]
+    fn multibyte_utf8_claude_lines_never_panic() {
+        let mut cache = PathProbeCache::default();
+        let line = "╭─── ✳ Claude Code ● ⎿ Read(\"src/main.rs\") ─── 📁 🚀 áéíóú ───╮";
+        for idx in 0..=line.len() + 2 {
+            let _ = find_link_in_str(line, idx, None, false, &mut cache);
+        }
+        let target_idx = line.find("main.rs").unwrap();
+        let (raw, _, _) = find_link_in_str(line, target_idx, Some("/app"), false, &mut cache).unwrap();
+        assert_eq!(raw, "src/main.rs");
     }
 }

@@ -219,6 +219,17 @@ pub enum Icon {
     Key,
     Server,
     Plus,
+    /// Panes in a split arrangement (layout settings, workspaces).
+    Layout,
+    /// A sparkle (AI agents).
+    Sparkle,
+    /// Magnifier (command palette, search).
+    Search,
+    /// A window with a side panel; `SidebarRight` mirrors it.
+    SidebarLeft,
+    SidebarRight,
+    /// Stacked rows (a tab list).
+    Rows,
 }
 
 /// Frameless icon button (e.g. the gear that opens Settings in the top bar).
@@ -326,6 +337,48 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         }
         Icon::Check => {
             p.add(egui::Shape::line(vec![at(0.12, 0.52), at(0.4, 0.78), at(0.88, 0.24)], s));
+        }
+        Icon::Layout => {
+            p.rect_stroke(Rect::from_min_max(at(0.06, 0.1), at(0.94, 0.9)), CornerRadius::same(3), s, StrokeKind::Middle);
+            p.line_segment([at(0.5, 0.1), at(0.5, 0.9)], s);
+            p.line_segment([at(0.5, 0.5), at(0.94, 0.5)], s);
+        }
+        Icon::Sparkle => {
+            let star = |cx: f32, cy: f32, k: f32| {
+                let c0 = at(cx, cy);
+                let (a, b) = (r.width() * 0.36 * k, r.width() * 0.09 * k);
+                let pts = vec![
+                    c0 + Vec2::new(0.0, -a),
+                    c0 + Vec2::new(b, -b),
+                    c0 + Vec2::new(a, 0.0),
+                    c0 + Vec2::new(b, b),
+                    c0 + Vec2::new(0.0, a),
+                    c0 + Vec2::new(-b, b),
+                    c0 + Vec2::new(-a, 0.0),
+                    c0 + Vec2::new(-b, -b),
+                ];
+                p.add(egui::Shape::closed_line(pts, s));
+            };
+            star(0.42, 0.56, 1.0);
+            star(0.8, 0.2, 0.45);
+        }
+        Icon::Search => {
+            p.circle_stroke(at(0.42, 0.42), r.width() * 0.3, s);
+            p.line_segment([at(0.64, 0.64), at(0.92, 0.92)], s);
+        }
+        Icon::SidebarLeft | Icon::SidebarRight => {
+            p.rect_stroke(Rect::from_min_max(at(0.04, 0.14), at(0.96, 0.86)), CornerRadius::same(3), s, StrokeKind::Middle);
+            let x = if icon == Icon::SidebarLeft { 0.38 } else { 0.62 };
+            p.line_segment([at(x, 0.14), at(x, 0.86)], s);
+            let (a, b) = if icon == Icon::SidebarLeft { (0.14, 0.28) } else { (0.72, 0.86) };
+            for y in [0.34, 0.5] {
+                p.line_segment([at(a, y), at(b, y)], Stroke::new(w * 0.8, c));
+            }
+        }
+        Icon::Rows => {
+            for y in [0.2, 0.5, 0.8] {
+                p.rect_stroke(Rect::from_min_max(at(0.06, y - 0.11), at(0.94, y + 0.11)), CornerRadius::same(2), s, StrokeKind::Middle);
+            }
         }
     }
 }

@@ -125,7 +125,7 @@ fn sidebar_menus(h: &mut Harness<'_, TetherApp>) {
     h.run_steps(10);
 
     // Right-click on the empty space below the hosts.
-    let empty = egui::pos2(130.0, 560.0);
+    let empty = egui::pos2(130.0, 470.0);
     h.hover_at(empty);
     h.run_steps(2);
     for pressed in [true, false] {

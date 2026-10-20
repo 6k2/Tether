@@ -131,11 +131,38 @@ impl Sidebar {
         self.focus_search = true;
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
+    /// The brand row with "New" and "⋯", above the sections.
+    pub fn title_bar(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
         let mut actions = Vec::new();
         ui.add_space(6.0);
         self.title_row(ui, data.shells, &mut actions);
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+        actions
+    }
+
+    /// Hosts that aren't archived (the section header's count).
+    pub fn host_count(data: &SidebarData) -> usize {
+        data.store.profiles.iter().filter(|p| !p.archived).count()
+    }
+
+    pub fn workspaces_height(&self, data: &SidebarData) -> f32 {
+        self.workspaces.body_height(data.workspaces)
+    }
+
+    pub fn workspaces_header(&mut self, ui: &mut Ui, data: &SidebarData) {
+        self.workspaces.header_buttons(ui, data.has_tabs);
+    }
+
+    pub fn workspaces_body(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
+        let mut actions = Vec::new();
+        self.workspaces.body(ui, data.workspaces, data.has_tabs, &mut actions);
+        actions
+    }
+
+    /// Quick connect, search and the host tree, filling `ui`.
+    pub fn hosts_body(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
+        let mut actions = Vec::new();
+        ui.add_space(2.0);
         self.quick_connect(ui, data.store, &mut actions);
         ui.add_space(4.0);
         let search = ui
@@ -146,10 +173,9 @@ impl Sidebar {
         if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.search.clear();
         }
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
-        let bottom_h = self.workspaces.height(data.workspaces);
-        egui::ScrollArea::vertical().max_height(ui.available_height() - bottom_h).auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("sidebar_hosts").max_height(ui.available_height()).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if data.store.profiles.is_empty() && data.folders.folders.is_empty() {
                 empty_hint(ui);
@@ -171,8 +197,6 @@ impl Sidebar {
             }
         });
         drag_ghost(ui, data);
-
-        self.workspaces.show(ui, data.workspaces, data.has_tabs, &mut actions);
         actions
     }
 
@@ -233,11 +257,8 @@ impl Sidebar {
 
     /// The folder tree, then top-level hosts, then the archive drawer.
     fn tree(&mut self, ui: &mut Ui, data: &SidebarData, actions: &mut Vec<SidebarAction>) {
-        let active = data.store.profiles.iter().filter(|p| !p.archived).count();
-        let header = section_header(ui, "HOSTS", active, None);
-        drop_target(ui, &header, None, actions, data);
-        header.context_menu(|ui| self.background_menu(ui, actions));
-        ui.add_space(2.0);
+        // The section header above says "HOSTS"; dropping on the space below the tree
+        // files an item at the top level.
         self.contents(ui, data, None, 0, actions);
 
         let archived: Vec<&Profile> = sorted(data.store.profiles.iter().filter(|p| p.archived));
@@ -584,12 +605,11 @@ fn host_row(ui: &mut Ui, p: &Profile, live: bool, depth: usize, path: Option<&st
     let initial = p.display_name().chars().next().unwrap_or('?').to_uppercase().to_string();
     painter.text(avatar.center(), Align2::CENTER_CENTER, initial, FontId::proportional(13.0), accent.gamma_multiply(alpha));
     if live {
-        let pulse = (ctx.input(|i| i.time) * 2.0).sin() as f32 * 0.5 + 0.5;
+        // A static dot with a soft halo: a pulsing one would repaint the app forever.
         let c = Pos2::new(avatar.right() - 1.0, avatar.bottom() - 1.0);
         painter.circle_filled(c, 4.5, theme::bg());
         painter.circle_filled(c, 3.0, theme::accent());
-        painter.circle_stroke(c, 3.0 + pulse * 2.5, Stroke::new(1.0, theme::accent().gamma_multiply(1.0 - pulse)));
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        painter.circle_stroke(c, 4.5, Stroke::new(1.0, theme::accent().gamma_multiply(0.35)));
     }
 
     let text_left = avatar.right() + 10.0;

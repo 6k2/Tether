@@ -20,6 +20,7 @@ const SECTION_FADE_SECS: f32 = 0.2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Appearance,
+    Layout,
     Terminal,
     Sftp,
     Editor,
@@ -30,12 +31,22 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 8] =
-        [Section::Appearance, Section::Terminal, Section::Sftp, Section::Editor, Section::FileTypes, Section::Keyboard, Section::Agents, Section::About];
+    pub const ALL: [Section; 9] = [
+        Section::Appearance,
+        Section::Layout,
+        Section::Terminal,
+        Section::Sftp,
+        Section::Editor,
+        Section::FileTypes,
+        Section::Keyboard,
+        Section::Agents,
+        Section::About,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Section::Appearance => "Appearance",
+            Section::Layout => "Layout",
             Section::Terminal => "Terminal",
             Section::Sftp => "SFTP",
             Section::Editor => "Editor",
@@ -49,6 +60,7 @@ impl Section {
     pub fn subtitle(self) -> &'static str {
         match self {
             Section::Appearance => "Themes, interface scale and motion",
+            Section::Layout => "Tabs, sidebar and panes, arranged your way",
             Section::Terminal => "Typography, cursor and behaviour of every terminal",
             Section::Sftp => "How file panes look and behave",
             Section::Editor => "The built-in remote file editor",
@@ -62,6 +74,7 @@ impl Section {
     fn icon(self) -> Icon {
         match self {
             Section::Appearance => Icon::Appearance,
+            Section::Layout => Icon::Layout,
             Section::Terminal => Icon::Terminal,
             Section::Sftp => Icon::Folder,
             Section::Editor => Icon::Editor,

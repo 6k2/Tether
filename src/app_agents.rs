@@ -11,8 +11,9 @@ use super::TetherApp;
 use crate::agents::hub::{Alert, TermInfo};
 use crate::agents::{AgentState, notify};
 use crate::keybindings::{self, Action};
+use crate::layout::SidebarSection;
 use crate::theme;
-use crate::ui::agents_panel::{self, LaunchPick, PanelAction};
+use crate::ui::agents_panel::{LaunchPick, PanelAction};
 use crate::ui::tabs::{Tab, TabBody};
 
 /// Local terminals of `dock`, with whether each is the visible tab of its pane.
@@ -112,36 +113,44 @@ impl TetherApp {
         let text = if waiting > 0 {
             RichText::new(format!("✳ Agents · {waiting}")).size(12.0).color(theme::warn())
         } else {
-            RichText::new("✳ Agents").size(12.0).color(if self.agents_open { theme::text() } else { theme::text_dim() })
+            RichText::new("✳ Agents").size(12.0).color(if self.agents_shown() { theme::text() } else { theme::text_dim() })
         };
         if ui.add(egui::Button::new(text).frame(false)).on_hover_text(keybindings::hint("Agent sessions", Action::ToggleAgents)).clicked() {
-            self.agents_open = !self.agents_open;
+            self.toggle_agents();
         }
         crate::ui::usage_chip::total(ui);
     }
 
-    pub(super) fn agents_side_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.agents_open {
-            return;
-        }
-        let sessions = self.agents.sessions();
-        let now = Instant::now();
-        let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 8, right: 10, top: 6, bottom: 10 });
-        let action = egui::Panel::right("agents_panel")
-            .resizable(true)
-            .default_size(agents_panel::WIDTH)
-            .size_range(240.0..=460.0)
-            .frame(frame)
-            .show_separator_line(false)
-            .show(ui, |ui| agents_panel::show(ui, &sessions, now))
-            .inner;
-        // Elapsed times tick while the panel is open.
-        if !sessions.is_empty() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-        }
+    /// Whether the "Agents" sidebar section is on screen (sidebar open, section shown).
+    pub(super) fn agents_shown(&self) -> bool {
+        let l = &crate::settings::snapshot().layout;
+        l.sidebar_visible && if l.activity_bar { l.active_view == SidebarSection::Agents } else { !l.is_collapsed(SidebarSection::Agents) }
+    }
+
+    /// Ctrl+Shift+J / the top-bar button: show the "Agents" section of the sidebar
+    /// (opening the sidebar if needed), or fold it away when it is already showing.
+    pub(super) fn toggle_agents(&mut self) {
+        let shown = self.agents_shown();
+        let _ = crate::settings::update(|s| {
+            let l = &mut s.layout;
+            if shown {
+                if l.activity_bar {
+                    l.sidebar_visible = false;
+                } else {
+                    l.set_collapsed(SidebarSection::Agents, true);
+                }
+            } else {
+                l.sidebar_visible = true;
+                l.active_view = SidebarSection::Agents;
+                l.set_collapsed(SidebarSection::Agents, false);
+            }
+        });
+    }
+
+    pub(super) fn apply_agents_panel(&mut self, action: Option<PanelAction>, ctx: &egui::Context) {
         match action {
-            Some(PanelAction::Focus(uid)) => self.focus_tab(uid, ui.ctx()),
-            Some(PanelAction::Close) => self.agents_open = false,
+            Some(PanelAction::Focus(uid)) => self.focus_tab(uid, ctx),
+            Some(PanelAction::Close) => self.toggle_agents(),
             None => {}
         }
     }

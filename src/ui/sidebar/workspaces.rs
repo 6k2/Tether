@@ -39,12 +39,9 @@ impl WorkspaceInfo {
 }
 
 const ROW_H: f32 = 42.0;
-const HEADER_H: f32 = 30.0;
 const FIELD_H: f32 = 34.0;
 const EMPTY_H: f32 = 74.0;
 const VISIBLE_ROWS: usize = 4;
-/// Divider, item spacing and the panel's bottom margin.
-const CHROME_H: f32 = 28.0;
 
 #[derive(Default)]
 pub struct WorkspacePanel {
@@ -54,23 +51,51 @@ pub struct WorkspacePanel {
     confirm_delete: Option<String>,
 }
 
-impl WorkspacePanel {
-    /// Height the section needs, so the host list above can leave room for it.
-    pub fn height(&self, list: &[WorkspaceInfo]) -> f32 {
-        let body = if list.is_empty() { EMPTY_H } else { list.len().min(VISIBLE_ROWS) as f32 * ROW_H };
-        HEADER_H + body + if self.naming.is_some() { FIELD_H } else { 0.0 } + CHROME_H
-    }
+/// The "?" glyph with an explanation of workspaces on hover.
+fn help_glyph(ui: &mut Ui) {
+    let (rect, help) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+    let col = if help.hovered() { theme::text() } else { theme::text_faint() };
+    paint_glyph(ui.painter(), rect.center(), Glyph::Help, col);
+    help.on_hover_ui(|ui| {
+        ui.set_max_width(250.0);
+        ui.label(RichText::new("Workspaces").strong());
+        ui.label("A workspace saves your open tabs and how they are split, so you can reopen the whole arrangement in one click.");
+        ui.add_space(4.0);
+        ui.label(RichText::new("• Click a workspace to restore it (it replaces the open tabs).").color(theme::text_dim()));
+        ui.label(RichText::new("• + saves the current layout under a name.").color(theme::text_dim()));
+        ui.label(RichText::new(format!("• “{LAST_SESSION}” is kept automatically.")).color(theme::text_dim()));
+    });
+}
 
+impl WorkspacePanel {
     pub fn start_save(&mut self) {
         self.naming = Some(String::new());
         self.confirm_delete = None;
     }
 
-    pub fn show(&mut self, ui: &mut Ui, list: &[WorkspaceInfo], can_save: bool, actions: &mut Vec<SidebarAction>) {
-        ui.add_space(4.0);
-        let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, theme::border()));
-        self.header(ui, can_save);
+    /// Body height inside a sidebar section (the section draws the header).
+    pub fn body_height(&self, list: &[WorkspaceInfo]) -> f32 {
+        let rows = if list.is_empty() { EMPTY_H } else { list.len().min(VISIBLE_ROWS) as f32 * ROW_H };
+        rows + if self.naming.is_some() { FIELD_H } else { 0.0 } + 6.0
+    }
+
+    /// The section header's buttons ("+" save, help), for a right-to-left `ui`.
+    pub fn header_buttons(&mut self, ui: &mut Ui, can_save: bool) {
+        let tip = if can_save { "Save current layout as workspace…" } else { "Open a terminal or SFTP tab first" };
+        let add = ui.add_enabled_ui(can_save, |ui| glyph_button(ui, Glyph::Plus, tip)).inner;
+        if add.clicked() {
+            self.start_save();
+        }
+        help_glyph(ui);
+    }
+
+    /// The list (or empty state) and the inline "save as" field, without a header.
+    pub fn body(&mut self, ui: &mut Ui, list: &[WorkspaceInfo], can_save: bool, actions: &mut Vec<SidebarAction>) {
+        ui.add_space(2.0);
+        self.contents(ui, list, can_save, actions);
+    }
+
+    fn contents(&mut self, ui: &mut Ui, list: &[WorkspaceInfo], can_save: bool, actions: &mut Vec<SidebarAction>) {
         if self.naming.is_some() {
             self.name_field(ui, list, actions);
         }
@@ -89,32 +114,6 @@ impl WorkspacePanel {
                     self.row(ui, ws, can_save, actions);
                 }
             }
-        });
-    }
-
-    fn header(&mut self, ui: &mut Ui, can_save: bool) {
-        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), HEADER_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.add_space(2.0);
-            ui.label(RichText::new("WORKSPACES").size(10.5).color(theme::text_faint()));
-            let (rect, help) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-            let col = if help.hovered() { theme::text() } else { theme::text_faint() };
-            paint_glyph(ui.painter(), rect.center(), Glyph::Help, col);
-            help.on_hover_ui(|ui| {
-                ui.set_max_width(250.0);
-                ui.label(RichText::new("Workspaces").strong());
-                ui.label("A workspace saves your open tabs and how they are split, so you can reopen the whole arrangement in one click.");
-                ui.add_space(4.0);
-                ui.label(RichText::new("• Click a workspace to restore it (it replaces the open tabs).").color(theme::text_dim()));
-                ui.label(RichText::new("• + saves the current layout under a name.").color(theme::text_dim()));
-                ui.label(RichText::new(format!("• “{LAST_SESSION}” is kept automatically.")).color(theme::text_dim()));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let tip = if can_save { "Save current layout as workspace…" } else { "Open a terminal or SFTP tab first" };
-                let add = ui.add_enabled_ui(can_save, |ui| glyph_button(ui, Glyph::Plus, tip)).inner;
-                if add.clicked() {
-                    self.start_save();
-                }
-            });
         });
     }
 
@@ -319,10 +318,10 @@ mod tests {
         let mut panel = WorkspacePanel::default();
         let one = [info("a", 1, &[])];
         let many: Vec<WorkspaceInfo> = (0..9).map(|i| info(&i.to_string(), 1, &[])).collect();
-        assert!(panel.height(&many) > panel.height(&one));
-        assert_eq!(panel.height(&many), panel.height(&many[..VISIBLE_ROWS]), "scrolls past the visible rows");
-        let before = panel.height(&one);
+        assert!(panel.body_height(&many) > panel.body_height(&one));
+        assert_eq!(panel.body_height(&many), panel.body_height(&many[..VISIBLE_ROWS]), "scrolls past the visible rows");
+        let before = panel.body_height(&one);
         panel.start_save();
-        assert!(panel.height(&one) > before);
+        assert!(panel.body_height(&one) > before);
     }
 }

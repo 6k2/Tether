@@ -119,6 +119,11 @@ impl Detacher {
         self.paint_zone(ctx);
     }
 
+    /// Moves `tab` into a new native window near `screen_pos` (in screen points).
+    pub fn pop_out(&mut self, tab: Tab, screen_pos: Pos2) {
+        self.spawn(vec![tab], geom::spawn_rect(screen_pos, DEFAULT_SIZE));
+    }
+
     fn spawn(&mut self, tabs: Vec<Tab>, outer: Rect) {
         if tabs.is_empty() {
             return;

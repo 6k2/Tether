@@ -33,6 +33,15 @@ pub struct TabSpec {
     #[serde(default)]
     pub profile_id: Uuid,
     pub kind: TabKind,
+    /// A name the user gave the tab (renamed in the tab list).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl TabSpec {
+    pub fn new(profile_id: Uuid, kind: TabKind) -> Self {
+        Self { profile_id, kind, title: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,7 +202,7 @@ mod tests {
     use super::*;
 
     fn spec(id: Uuid, kind: TabKind) -> TabSpec {
-        TabSpec { profile_id: id, kind }
+        TabSpec::new(id, kind)
     }
 
     fn sample() -> (Uuid, DockState<TabSpec>) {
@@ -273,6 +282,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<Layout<TabSpec>>(&text).unwrap(), local);
         let no_profile: TabSpec = serde_json::from_str(r#"{"kind":{"Local":{"shell_id":"cmd"}}}"#).unwrap();
         assert!(no_profile.profile_id.is_nil());
+    }
+
+    #[test]
+    fn custom_titles_round_trip_and_stay_optional() {
+        let titled = TabSpec { title: Some("build box".into()), ..spec(Uuid::nil(), TabKind::Terminal) };
+        let text = serde_json::to_string(&titled).unwrap();
+        assert!(text.contains("build box"));
+        assert_eq!(serde_json::from_str::<TabSpec>(&text).unwrap(), titled);
+        let plain = serde_json::to_string(&spec(Uuid::nil(), TabKind::Sftp)).unwrap();
+        assert!(!plain.contains("title"), "{plain}");
     }
 
     #[test]

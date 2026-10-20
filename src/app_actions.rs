@@ -164,7 +164,7 @@ impl TetherApp {
             self.folders.set_collapsed(p, false);
         }
         self.save_folders();
-        self.sidebar_open = true;
+        let _ = crate::settings::update(|s| s.layout.sidebar_visible = true);
         self.sidebar.start_rename(id, "New folder");
     }
 

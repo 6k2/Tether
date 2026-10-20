@@ -35,6 +35,7 @@ impl SectionState {
 pub fn show(ui: &mut Ui, section: Section, s: &mut Settings, st: &mut SectionState, now: f64) {
     match section {
         Section::Appearance => appearance(ui, s, st),
+        Section::Layout => super::layout_settings::show(ui, s, CARD_GAP),
         Section::Terminal => terminal(ui, s, st, now),
         Section::Sftp => sftp(ui, s),
         Section::Editor => editor(ui, s),

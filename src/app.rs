@@ -13,8 +13,14 @@ use uuid::Uuid;
 mod actions;
 #[path = "app_agents.rs"]
 mod agents;
+#[path = "app_chrome.rs"]
+mod chrome;
+#[path = "app_layout.rs"]
+mod layout_ui;
 #[path = "app_local.rs"]
 mod local;
+#[path = "app_palette.rs"]
+mod palette_ui;
 
 use crate::folders::FolderStore;
 use crate::keybindings::{self, Action};
@@ -30,10 +36,11 @@ use crate::ui::editor::ProfileEditor;
 use crate::ui::import_view::{ImportDialog, ImportOutcome};
 use crate::ui::key_manager::KeyManager;
 use crate::ui::settings_view::SettingsView;
-use crate::ui::settings_widgets::{Icon, icon_button};
 use crate::ui::sftp_view::SftpView;
-use crate::ui::sidebar::{OpenKind, Sidebar, SidebarData, WorkspaceInfo};
+use crate::ui::palette::Palette;
+use crate::ui::sidebar::{OpenKind, Sidebar, WorkspaceInfo};
 use crate::ui::tabs::{Tab, TabBody, Viewer};
+use crate::ui::vertical_tabs::VerticalTabs;
 use crate::ui::terminal_view::TerminalView;
 use crate::ui::toast::Toasts;
 use crate::workspace::{self, LAST_SESSION, TabKind, Workspaces};
@@ -60,7 +67,19 @@ pub struct TetherApp {
     workspaces: Workspaces,
     dock: DockState<Tab>,
     sidebar: Sidebar,
-    sidebar_open: bool,
+    /// Rename state of the vertical tab list (inline editing).
+    vtabs: VerticalTabs,
+    palette: Option<Palette>,
+    /// A tab shown alone over the whole workspace (maximized pane).
+    zoomed: Option<u64>,
+    /// Give this tab's terminal the keyboard on the next frame.
+    focus_request: Option<u64>,
+    /// Terminal widget ids seen last frame (see `PaneFx::terminal_ids`).
+    terminal_ids: Vec<egui::Id>,
+    /// "Rename tab" dialog: the tab and the edited name.
+    rename: Option<(u64, String)>,
+    /// Tabs of the main dock last frame (a new one in the focused pane gets the keyboard).
+    seen_tabs: HashSet<u64>,
     broadcast: bool,
     editor: Option<ProfileEditor>,
     import: Option<ImportDialog>,
@@ -78,7 +97,6 @@ pub struct TetherApp {
     detached: Detacher,
     /// AI agent sessions and the resource monitor (`app_agents.rs`).
     agents: crate::agents::AgentHub,
-    agents_open: bool,
 }
 
 /// `TETHER_CONFIG_DIR` overrides the location (portable installs, tests).
@@ -125,7 +143,13 @@ impl TetherApp {
             workspaces: Workspaces::load(dir.join("workspaces.json")),
             dock: DockState::new(Vec::new()),
             sidebar: Sidebar::default(),
-            sidebar_open: true,
+            vtabs: VerticalTabs::default(),
+            palette: None,
+            zoomed: None,
+            focus_request: None,
+            terminal_ids: Vec::new(),
+            rename: None,
+            seen_tabs: HashSet::new(),
             broadcast: false,
             editor: None,
             import: None,
@@ -140,7 +164,6 @@ impl TetherApp {
             focused_terminal: None,
             detached: Detacher::default(),
             agents,
-            agents_open: false,
         })
     }
 
@@ -372,16 +395,20 @@ impl TetherApp {
     fn restore_workspace(&mut self, name: &str, ctx: &egui::Context) {
         let Some(layout) = self.workspaces.get(name).cloned() else { return };
         let restored = workspace::rebuild(&layout, &mut |spec| {
-            if let TabKind::Local { shell_id } = &spec.kind {
-                return crate::pty::shells::find(shell_id).map(|shell| self.local_tab(shell, None, ctx));
-            }
-            let profile = self.store.get(spec.profile_id)?.clone();
-            let secret = secret::get(profile.secret_id());
-            Some(match spec.kind {
-                TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
-                TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
-            })
+            let mut tab = if let TabKind::Local { shell_id } = &spec.kind {
+                crate::pty::shells::find(shell_id).map(|shell| self.local_tab(shell, None, ctx))?
+            } else {
+                let profile = self.store.get(spec.profile_id)?.clone();
+                let secret = secret::get(profile.secret_id());
+                match spec.kind {
+                    TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
+                    TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
+                }
+            };
+            tab.rename(spec.title.clone());
+            Some(tab)
         });
+        self.zoomed = None;
         for (_, tab) in self.dock.iter_all_tabs() {
             if let TabBody::Terminal(t) = &tab.body {
                 t.handle.close();
@@ -422,135 +449,10 @@ impl TetherApp {
     // ---- frame --------------------------------------------------------------------
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let pressed = |a: Action| keybindings::consume(ctx, a);
-        if pressed(Action::ToggleSidebar) {
-            self.sidebar_open = !self.sidebar_open;
-        }
-        if pressed(Action::OpenSettings) {
-            self.settings_view.get_or_insert_with(SettingsView::new);
-        }
-        if pressed(Action::KeyManager) && self.key_manager.is_none() {
-            self.key_manager = Some(KeyManager::new(&self.keys));
-        }
-        if pressed(Action::NewHost) && self.editor.is_none() {
-            self.open_editor_new(None);
-        }
-        if pressed(Action::NewFolder) {
-            self.new_folder(None);
-        }
-        if pressed(Action::QuickConnect) {
-            self.sidebar_open = true;
-            self.sidebar.focus_quick_connect();
-        }
-        if pressed(Action::SearchHosts) {
-            self.sidebar_open = true;
-            self.sidebar.focus_search();
-        }
-        if pressed(Action::NewLocalTerminal) {
-            self.open_local(None, ctx);
-        }
-        if pressed(Action::ToggleBroadcast) {
-            self.broadcast = !self.broadcast;
-        }
-        if pressed(Action::SplitRight) {
-            self.duplicate_focused(Split::Right, TabKind::Terminal, ctx);
-        }
-        if pressed(Action::SplitDown) {
-            self.duplicate_focused(Split::Below, TabKind::Terminal, ctx);
-        }
-        if pressed(Action::OpenSftp) {
-            self.duplicate_focused(Split::Right, TabKind::Sftp, ctx);
-        }
-        if pressed(Action::CloseTab) {
-            self.close_focused();
-        }
-        if pressed(Action::NextTab) {
-            self.cycle_tab(true);
-        }
-        if pressed(Action::PrevTab) {
-            self.cycle_tab(false);
-        }
-        if pressed(Action::NextAttention) {
-            self.focus_next_attention(ctx);
-        }
-        if pressed(Action::ToggleAgents) {
-            self.agents_open = !self.agents_open;
-        }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top").exact_size(38.0).frame(egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(10, 6))).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("☰").size(15.0)).frame(false))
-                    .on_hover_text(keybindings::hint("Toggle sidebar", Action::ToggleSidebar))
-                    .clicked()
-                {
-                    self.sidebar_open = !self.sidebar_open;
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("⬇ Import").size(12.0)).frame(false))
-                    .on_hover_text("Import hosts from Bitvise or an SSH config")
-                    .clicked()
-                {
-                    self.import = Some(ImportDialog::new(&self.store));
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("🔑 Keys").size(12.0)).frame(false))
-                    .on_hover_text(keybindings::hint("Key manager", Action::KeyManager))
-                    .clicked()
-                {
-                    self.key_manager = Some(KeyManager::new(&self.keys));
-                }
-                let tabs = self.all_tabs().count();
-                ui.label(RichText::new(format!("{tabs} session{}", if tabs == 1 { "" } else { "s" })).size(11.5).color(theme::text_faint()));
-                self.agents_top_bar(ui);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, Icon::Gear, 24.0).on_hover_text(keybindings::hint("Settings", Action::OpenSettings)).clicked() {
-                        self.settings_view.get_or_insert_with(SettingsView::new);
-                    }
-                    let glow = ui.ctx().animate_bool_with_time(egui::Id::new("bc_glow"), self.broadcast, 0.2);
-                    let fill = theme::danger().gamma_multiply(0.25 * glow);
-                    let text = RichText::new("📡 Broadcast").size(12.0).color(if self.broadcast { theme::danger() } else { theme::text_dim() });
-                    if ui
-                        .add(egui::Button::new(text).fill(fill))
-                        .on_hover_text(keybindings::hint("Type into every terminal at once", Action::ToggleBroadcast))
-                        .clicked()
-                    {
-                        self.broadcast = !self.broadcast;
-                    }
-                    crate::ui::update_banner::top_bar(ui);
-                    let hint = [(Action::SplitRight, "split"), (Action::SplitDown, "split down"), (Action::OpenSftp, "files")]
-                        .iter()
-                        .filter_map(|(a, what)| keybindings::binding(*a).map(|b| format!("{} {what}", b.label())))
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    ui.label(RichText::new(hint).size(11.0).color(theme::text_faint()));
-                });
-            });
-        });
-    }
-
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
-        let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 10 });
-        let workspaces = self.workspace_infos();
-        let pool = self.pool.clone();
-        let is_live = move |id| pool.has_live(id);
-        let has_tabs = self.layout_specs().is_some();
-        let shells = crate::pty::shells::available();
-        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live, shells };
-        let sidebar = &mut self.sidebar;
-        let actions = egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(260.0)
-            .size_range(200.0..=420.0)
-            .frame(frame)
-            .show_separator_line(false)
-            .show_collapsible(ui, &mut self.sidebar_open, |ui| sidebar.ui(ui, &data))
-            .map(|r| r.inner)
-            .unwrap_or_default();
-        for a in actions {
-            self.apply_sidebar(a, ui.ctx());
+        for a in Action::ALL {
+            if palette_ui::is_global(a) && keybindings::consume(ctx, a) {
+                self.run_action(a, ctx);
+            }
         }
     }
 
@@ -558,9 +460,12 @@ impl TetherApp {
         // Translucent window: the panel must not stack its fill under the terminals.
         let see_through = crate::themes::see_through() && self.dock.iter_all_tabs().next().is_some();
         let fill = if see_through { egui::Color32::TRANSPARENT } else { theme::bg() };
-        let frame = egui::Frame::new().fill(fill).inner_margin(egui::Margin { left: 0, right: 6, top: 0, bottom: 6 });
+        let vertical = crate::settings::snapshot().layout.tab_position.is_vertical();
+        let margin = if vertical { egui::Margin { left: 0, right: 0, top: 0, bottom: 6 } } else { egui::Margin { left: 0, right: 6, top: 0, bottom: 6 } };
+        let frame = egui::Frame::new().fill(fill).inner_margin(margin);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.dock.iter_all_tabs().next().is_none() {
+                self.zoomed = None;
                 self.welcome(ui);
                 return;
             }
@@ -569,23 +474,41 @@ impl TetherApp {
                 style.tab.tab_body.bg_fill = theme::surface().gamma_multiply(crate::themes::window_opacity());
                 crate::ui::backdrop::paint_frame(ui, egui::vec2(6.0, 6.0));
             }
-            let mut viewer = Viewer { time: ui.input(|i| i.time), ..Viewer::default() };
+            let hide_bars = layout_ui::sync_tab_bars(&mut self.dock);
+            if hide_bars {
+                // Vertical tabs: no strip, no reveal triangle, no drag margin.
+                style.buttons.show_tab_bar_size = 0.0;
+                style.tab.tab_body.hidden_tab_bar_drag_height = Some(0.0);
+            }
+            let area = ui.available_rect_before_wrap();
+            self.focus_new_tab();
+            let mut viewer = Viewer::with_panes(self.pane_fx(ui.ctx()));
+            viewer.time = ui.input(|i| i.time);
             crate::ui::tabs::apply_commands(&mut self.dock, self.rt.handle(), ui.ctx());
-            DockArea::new(&mut self.dock)
-                .style(style)
-                // Floating windows may leave the app: `Detacher` turns them into native windows.
-                .window_bounds(crate::ui::detach_geom::floating_bounds(ui.ctx().content_rect()))
-                // Each pane's "+" lists the local shells (`Viewer::add_popup`).
-                .show_add_buttons(true)
-                .show_add_popup(true)
-                .show_leaf_collapse_buttons(false)
-                .show_leaf_close_all_buttons(false)
-                .show_inside(ui, &mut viewer);
+            if !self.zoomed_view(ui, &mut viewer) {
+                DockArea::new(&mut self.dock)
+                    .style(style)
+                    // Floating windows may leave the app: `Detacher` turns them into native windows.
+                    .window_bounds(crate::ui::detach_geom::floating_bounds(ui.ctx().content_rect()))
+                    // Each pane's "+" lists the local shells (`Viewer::add_popup`).
+                    .show_add_buttons(true)
+                    .show_add_popup(true)
+                    .hidable_tab_bars(hide_bars)
+                    .show_leaf_collapse_buttons(false)
+                    .show_leaf_close_all_buttons(false)
+                    .show_inside(ui, &mut viewer);
+                // A row of the vertical tab list dropped onto the panes.
+                if let Some(action) = crate::ui::vertical_tabs::drop_on_panes(ui.ctx(), &self.dock, area) {
+                    viewer.tab_actions.push(action);
+                }
+            }
+            self.after_views(&mut viewer);
             self.open_local_in(std::mem::take(&mut viewer.new_local), ui.ctx());
             self.open_agents_in(std::mem::take(&mut viewer.new_agent), ui.ctx());
             if viewer.focused_uid.is_some() {
                 self.focused_terminal = viewer.focused_uid;
             }
+            self.apply_tab_actions(std::mem::take(&mut viewer.tab_actions), ui.ctx());
             self.route_input(viewer.inputs);
             for uid in viewer.reconnect {
                 self.reconnect(uid, None, ui.ctx());
@@ -681,58 +604,6 @@ impl TetherApp {
                 }
             }
             ctx.request_repaint();
-        });
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui) {
-        let t = ui.ctx().animate_bool_with_time(egui::Id::new("welcome"), true, 0.4);
-        ui.set_opacity(t);
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.22);
-            crate::ui::sidebar::logo(ui, 56.0);
-            ui.label(RichText::new("tether").size(28.0).strong());
-            ui.label(RichText::new("Local and SSH terminals, pipelined SFTP, side by side.").color(theme::text_dim()));
-            ui.add_space(22.0);
-            let mut shell = None;
-            if let Some(default) = crate::pty::shells::default_shell() {
-                let text = RichText::new(format!("{}  New {}", default.icon_kind.glyph(), default.name)).size(13.0);
-                let hint = keybindings::hint("Local terminal", Action::NewLocalTerminal);
-                if ui.add(egui::Button::new(text).min_size(egui::vec2(320.0, 34.0)).fill(theme::accent_soft())).on_hover_text(hint).clicked() {
-                    shell = Some(default);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.set_max_width(320.0);
-                    for s in crate::pty::shells::available().iter().filter(|s| s.id != default.id) {
-                        if ui.add(egui::Button::new(RichText::new(&s.name).size(11.5)).frame(false)).clicked() {
-                            shell = Some(s);
-                        }
-                    }
-                });
-                ui.add_space(10.0);
-            }
-            let mut recent: Vec<&Profile> = self.store.profiles.iter().filter(|p| p.last_used > 0 && !p.archived).collect();
-            recent.sort_by_key(|p| std::cmp::Reverse(p.last_used));
-            let mut open = None;
-            for p in recent.into_iter().take(4) {
-                let text = RichText::new(format!("⌨  {}   ·   {}", p.display_name(), p.address())).size(13.0);
-                if ui.add(egui::Button::new(text).min_size(egui::vec2(320.0, 34.0))).clicked() {
-                    open = Some(p.clone());
-                }
-            }
-            if ui.add(egui::Button::new(RichText::new("+  New host").size(13.0)).min_size(egui::vec2(320.0, 34.0)).fill(theme::accent_soft())).clicked() {
-                self.open_editor_new(None);
-            }
-            if ui.add(egui::Button::new(RichText::new("⬇  Import from Bitvise / SSH config").size(13.0)).min_size(egui::vec2(320.0, 34.0))).clicked() {
-                self.import = Some(ImportDialog::new(&self.store));
-            }
-            ui.add_space(18.0);
-            ui.label(RichText::new("Drag tabs to split · drop files onto a remote pane to upload").size(11.5).color(theme::text_faint()));
-            if let Some(p) = open {
-                self.request_open(p, OpenKind::Terminal, ui.ctx());
-            }
-            if let Some(s) = shell {
-                self.open_local(Some(s), ui.ctx());
-            }
         });
     }
 
@@ -845,9 +716,8 @@ impl eframe::App for TetherApp {
         crate::themes::follow_system(&ctx);
         self.handle_shortcuts(&ctx);
         self.top_bar(ui);
-        self.side_panel(ui);
         self.agents_frame(&ctx);
-        self.agents_side_panel(ui);
+        self.side_panels(ui);
         {
             let mut docks: Vec<&mut DockState<Tab>> = std::iter::once(&mut self.dock).chain(self.detached.docks_mut()).collect();
             link_terminals(&mut docks, self.focused_terminal);
@@ -855,6 +725,8 @@ impl eframe::App for TetherApp {
         self.workspace_area(ui);
         self.detached_windows(&ctx);
         self.modals(&ctx);
+        self.rename_modal(&ctx);
+        self.palette_frame(&ctx);
         if let Some(view) = &mut self.settings_view
             && !view.show(&ctx)
         {

@@ -268,6 +268,8 @@ pub struct Settings {
     pub default_open: OpenWith,
     /// User overrides of the default shortcuts (`None` = unbound).
     pub keybindings: BTreeMap<crate::keybindings::Action, Option<crate::keybindings::Binding>>,
+    /// Where tabs, the sidebar and its sections go; pane behaviour.
+    pub layout: crate::layout::LayoutSettings,
 }
 
 impl Settings {

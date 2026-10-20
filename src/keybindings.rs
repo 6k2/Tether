@@ -32,23 +32,34 @@ pub enum Action {
     SftpForward,
     SftpUp,
     SftpRefresh,
+    CommandPalette,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+    ZoomPane,
+    CycleTabPosition,
+    MoveSidebar,
+    RenameTab,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     General,
     Sessions,
+    Panes,
     Terminal,
     Sftp,
 }
 
 impl Group {
-    pub const ALL: [Group; 4] = [Group::General, Group::Sessions, Group::Terminal, Group::Sftp];
+    pub const ALL: [Group; 5] = [Group::General, Group::Sessions, Group::Panes, Group::Terminal, Group::Sftp];
 
     pub fn title(self) -> &'static str {
         match self {
             Group::General => "General",
             Group::Sessions => "Sessions & tabs",
+            Group::Panes => "Panes & layout",
             Group::Terminal => "Terminal",
             Group::Sftp => "SFTP",
         }
@@ -56,7 +67,8 @@ impl Group {
 }
 
 impl Action {
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 33] = [
+        Action::CommandPalette,
         Action::ToggleSidebar,
         Action::OpenSettings,
         Action::KeyManager,
@@ -81,6 +93,14 @@ impl Action {
         Action::SftpForward,
         Action::SftpUp,
         Action::SftpRefresh,
+        Action::FocusPaneLeft,
+        Action::FocusPaneRight,
+        Action::FocusPaneUp,
+        Action::FocusPaneDown,
+        Action::ZoomPane,
+        Action::CycleTabPosition,
+        Action::MoveSidebar,
+        Action::RenameTab,
     ];
 
     pub fn title(self) -> &'static str {
@@ -109,12 +129,22 @@ impl Action {
             Action::SftpForward => "Forward",
             Action::SftpUp => "Parent folder",
             Action::SftpRefresh => "Refresh listing",
+            Action::CommandPalette => "Command palette",
+            Action::FocusPaneLeft => "Focus pane to the left",
+            Action::FocusPaneRight => "Focus pane to the right",
+            Action::FocusPaneUp => "Focus pane above",
+            Action::FocusPaneDown => "Focus pane below",
+            Action::ZoomPane => "Maximize / restore pane",
+            Action::CycleTabPosition => "Cycle tab position (top, left, right)",
+            Action::MoveSidebar => "Move sidebar to the other side",
+            Action::RenameTab => "Rename tab",
         }
     }
 
     pub fn group(self) -> Group {
         match self {
-            Action::ToggleSidebar
+            Action::CommandPalette
+            | Action::ToggleSidebar
             | Action::OpenSettings
             | Action::KeyManager
             | Action::NewHost
@@ -130,7 +160,15 @@ impl Action {
             | Action::NextTab
             | Action::PrevTab
             | Action::NextAttention
-            | Action::ToggleAgents => Group::Sessions,
+            | Action::ToggleAgents
+            | Action::RenameTab => Group::Sessions,
+            Action::FocusPaneLeft
+            | Action::FocusPaneRight
+            | Action::FocusPaneUp
+            | Action::FocusPaneDown
+            | Action::ZoomPane
+            | Action::CycleTabPosition
+            | Action::MoveSidebar => Group::Panes,
             Action::FontBigger | Action::FontSmaller | Action::FontReset => Group::Terminal,
             Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => Group::Sftp,
         }
@@ -140,6 +178,7 @@ impl Action {
         let cs = |k| Some(Binding::new(k, true, true, false));
         let c = |k| Some(Binding::new(k, true, false, false));
         let a = |k| Some(Binding::new(k, false, false, true));
+        let ca = |k| Some(Binding::new(k, true, false, true));
         match self {
             Action::ToggleSidebar => cs(Key::B),
             Action::OpenSettings => c(Key::Comma),
@@ -147,7 +186,8 @@ impl Action {
             Action::NewHost => cs(Key::N),
             Action::NewFolder => None,
             Action::QuickConnect => cs(Key::L),
-            Action::SearchHosts => cs(Key::P),
+            // Ctrl+Shift+P is the command palette (as in Warp and VS Code).
+            Action::SearchHosts => cs(Key::H),
             Action::NewLocalTerminal => cs(Key::T),
             Action::SplitRight => cs(Key::D),
             Action::SplitDown => cs(Key::E),
@@ -165,6 +205,13 @@ impl Action {
             Action::SftpForward => a(Key::ArrowRight),
             Action::SftpUp => a(Key::ArrowUp),
             Action::SftpRefresh => Some(Binding::new(Key::F5, false, false, false)),
+            Action::CommandPalette => cs(Key::P),
+            Action::FocusPaneLeft => ca(Key::ArrowLeft),
+            Action::FocusPaneRight => ca(Key::ArrowRight),
+            Action::FocusPaneUp => ca(Key::ArrowUp),
+            Action::FocusPaneDown => ca(Key::ArrowDown),
+            Action::ZoomPane => cs(Key::Enter),
+            Action::CycleTabPosition | Action::MoveSidebar | Action::RenameTab => None,
         }
     }
 }

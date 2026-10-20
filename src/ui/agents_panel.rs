@@ -1,4 +1,4 @@
-//! The "Agents" side panel: every AI agent session across tabs and windows, most urgent
+//! The "Agents" sidebar section: every AI agent session across tabs and windows, most urgent
 //! first, with what it is doing, for how long, its last message and its CPU / memory.
 
 use std::time::{Duration, Instant};
@@ -62,27 +62,27 @@ pub fn elapsed(d: Duration) -> String {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option<PanelAction> {
+/// Sessions waiting for the user (the section header shows the count).
+pub fn waiting(sessions: &[SessionInfo]) -> usize {
+    sessions.iter().filter(|s| s.state.needs_attention() && s.state != AgentState::Done).count()
+}
+
+/// Height the session list wants (the sidebar section sizes itself with it).
+pub fn list_height(sessions: &[SessionInfo]) -> f32 {
+    if sessions.is_empty() { EMPTY_H } else { sessions.len() as f32 * (ROW_H + 4.0) }
+}
+
+const EMPTY_H: f32 = 92.0;
+
+/// The sessions without a header (the sidebar's "Agents" section draws its own).
+pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option<PanelAction> {
     let mut action = None;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Agents").size(14.0).strong());
-        let waiting = sessions.iter().filter(|s| s.state.needs_attention() && s.state != AgentState::Done).count();
-        if waiting > 0 {
-            ui.label(RichText::new(format!("{waiting} waiting")).size(11.0).color(theme::warn()));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new("×").size(15.0)).frame(false)).on_hover_text("Hide the agents panel").clicked() {
-                action = Some(PanelAction::Close);
-            }
-        });
-    });
-    ui.add_space(6.0);
     if sessions.is_empty() {
-        ui.add_space(12.0);
+        ui.add_space(4.0);
         ui.label(RichText::new("No agent sessions").color(theme::text_dim()));
         ui.label(
             RichText::new(
-                "Run claude, codex, gemini, opencode or aider in a local terminal and it shows up here. Settings → AI agents installs hooks for exact states.",
+                "Run claude, codex, gemini, opencode or aider in a local terminal and it shows up here. Settings › AI agents installs hooks for exact states.",
             )
             .size(11.5)
             .color(theme::text_faint()),
@@ -90,7 +90,7 @@ pub fn show(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option
         return action;
     }
     let time = ui.input(|i| i.time);
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("agents_list").auto_shrink([false, false]).show(ui, |ui| {
         for s in sessions {
             if row(ui, s, now, time) {
                 action = Some(PanelAction::Focus(s.uid));

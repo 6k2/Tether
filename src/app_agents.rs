@@ -45,12 +45,13 @@ impl TetherApp {
         let monitor = self.agents.monitor();
         monitor.set_focused(window_focused);
         monitor.set_interval(settings.agents.monitor_interval());
+        let toasts = self.toasts.clone();
         let mut terms = Vec::new();
         local_terms(&self.dock, &mut terms);
         for dock in self.detached.docks_mut() {
             local_terms(dock, &mut terms);
         }
-        self.command_notices(ctx, &terms, window_focused);
+        Self::command_notices(&toasts, ctx, &terms, window_focused);
         let alerts = self.agents.frame(ctx, terms, Instant::now());
         for alert in alerts {
             self.alert(ctx, alert, window_focused);
@@ -85,7 +86,7 @@ impl TetherApp {
 
     /// Shell integration: a long command finished in a hidden tab or while tether was in
     /// the background. Same channels as agent alerts (toast, or desktop + taskbar flash).
-    fn command_notices(&self, ctx: &egui::Context, terms: &[TermInfo], window_focused: bool) {
+    fn command_notices(toasts: &crate::ui::toast::Toasts, ctx: &egui::Context, terms: &[TermInfo], window_focused: bool) {
         let settings = crate::settings::snapshot();
         for t in terms {
             // Busy terminals are looked at next frame (`take_finished` keeps the news).
@@ -95,7 +96,7 @@ impl TetherApp {
             }
             let Some((title, body)) = crate::ui::blocks::long_command_notice(&done, &settings.shell_integration) else { continue };
             if window_focused {
-                self.toasts.info(format!("{title} in {}: {body}", t.label));
+                toasts.info(format!("{title} in {}: {body}", t.label));
                 continue;
             }
             if settings.agents.desktop_notifications {

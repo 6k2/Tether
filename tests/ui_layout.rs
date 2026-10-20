@@ -75,7 +75,7 @@ fn layout_screens() {
     layout(|l| l.tab_position = TabPosition::Left);
     settle(&mut h, 0.6);
     shot(&mut h, "21-vertical-tabs-left");
-    h.get_all_by_label_contains("Tab Windows").next().or_else(|| h.get_all_by_label_contains("Tab ").nth(1)).unwrap().hover();
+    h.get_all_by_label_contains("Tab ").nth(1).unwrap().hover();
     h.run_steps(10);
     shot(&mut h, "21b-vertical-tabs-hover");
 

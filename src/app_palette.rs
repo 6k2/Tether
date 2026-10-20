@@ -12,6 +12,7 @@ use crate::settings;
 use crate::ui::palette::{Palette, PaletteOutcome};
 use crate::ui::settings_view::SettingsView;
 use crate::ui::sidebar::OpenKind;
+use crate::ui::tabs::{Tab, TabBody};
 
 impl TetherApp {
     pub(super) fn open_palette(&mut self) {
@@ -44,7 +45,7 @@ impl TetherApp {
             r.add(Entry::new("Host", format!("Connect to {}", p.display_name()), Command::Connect(p.id)).detail(p.address()));
         }
         for a in Action::ALL {
-            if is_global(a) {
+            if is_global(a) || matches!(a, Action::PrevPrompt | Action::NextPrompt) {
                 r.add(Entry::action(category(a.group()), a));
             }
         }
@@ -197,6 +198,16 @@ impl TetherApp {
             Action::NextAttention => self.focus_next_attention(ctx),
             Action::ToggleAgents => self.toggle_agents(),
             // Handled by the focused terminal / hovered SFTP pane themselves.
+            Action::PrevPrompt | Action::NextPrompt => {
+                let up = a == Action::PrevPrompt;
+                let stepped = match self.dock.find_active_focused() {
+                    Some((_, Tab { body: TabBody::Terminal(view), .. })) => view.step_prompt(up, ctx),
+                    _ => false,
+                };
+                if !stepped {
+                    self.toasts.info("No command blocks in this terminal (shell integration is off or not loaded)");
+                }
+            }
             Action::FontBigger | Action::FontSmaller | Action::FontReset | Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => {}
         }
     }
@@ -225,5 +236,5 @@ fn category(g: Group) -> &'static str {
 
 /// Actions handled globally (others are left to the widget that has focus or hover).
 pub(super) fn is_global(a: Action) -> bool {
-    !matches!(a, Action::FontBigger | Action::FontSmaller | Action::FontReset) && a.group() != Group::Sftp
+    !matches!(a, Action::FontBigger | Action::FontSmaller | Action::FontReset | Action::PrevPrompt | Action::NextPrompt) && a.group() != Group::Sftp
 }

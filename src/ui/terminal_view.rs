@@ -613,6 +613,20 @@ impl TerminalView {
         self.scroll = lines;
     }
 
+    /// Previous / next prompt from outside the view (command palette). False when the
+    /// terminal has no command blocks.
+    pub fn step_prompt(&mut self, up: bool, ctx: &egui::Context) -> bool {
+        if !self.cache.blocks.active() {
+            return false;
+        }
+        let handle = self.handle.clone();
+        if let Some(bytes) = self.cache.blocks.apply(super::blocks::Request::Step(up), &handle, ctx, &mut self.scroll) {
+            handle.send(bytes);
+        }
+        ctx.request_repaint();
+        true
+    }
+
     /// A block mark, menu or Ctrl+Shift+Up/Down asked for something (see `ui::blocks`).
     fn block_request(&mut self, req: super::blocks::Request, ctx: &egui::Context, out: &mut ViewOutput) {
         let handle = self.handle.clone();

@@ -122,7 +122,7 @@ impl Tab {
     /// full name), address for remote ones, the file path for editors.
     pub fn subtitle(&self) -> String {
         match (&self.body, &self.local) {
-            (TabBody::Terminal(t), Some(shell)) => t.remote_cwd().map_or_else(|| shell.name.clone(), short_path),
+            (TabBody::Terminal(t), Some(shell)) => t.shell_context().map_or_else(|| shell.name.clone(), |(cwd, branch)| context_line(&short_path(cwd), branch)),
             (TabBody::Terminal(_), None) => self.profile.address(),
             (TabBody::Sftp(_), _) => format!("SFTP · {}", self.profile.address()),
             (TabBody::Editor(e), _) => e.remote_path().to_string(),
@@ -350,6 +350,12 @@ impl egui_dock::TabViewer for Viewer {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        // Where the shell is (shell integration / OSC 7), then the process tree's usage.
+        if let TabBody::Terminal(t) = &tab.body
+            && let Some((cwd, branch)) = t.shell_context()
+        {
+            response.clone().on_hover_text(context_line(cwd, branch));
+        }
         if tab.is_local() {
             super::usage_chip::tab_tooltip(tab.uid, response);
         }
@@ -408,6 +414,15 @@ impl egui_dock::TabViewer for Viewer {
 }
 
 /// `C:\Users\me\src\tether` -> `~\src\tether`; long paths keep their last parts.
+/// `~\src\app on main`: a folder and, inside a git repository, its branch. (The bundled
+/// fonts have no branch glyph.)
+pub fn context_line(folder: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some(b) => format!("{folder} on {b}"),
+        None => folder.to_string(),
+    }
+}
+
 pub fn short_path(path: &str) -> String {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     shorten_path(path, &home)
@@ -416,7 +431,10 @@ pub fn short_path(path: &str) -> String {
 fn shorten_path(path: &str, home: &str) -> String {
     const KEEP: usize = 3;
     let trimmed = path.trim_end_matches(['/', '\\']);
+    // Shells report `C:/Users/me` (OSC 7) for a `C:\Users\me` home: compare like with like.
     let home = home.trim_end_matches(['/', '\\']);
+    let home_alt = if trimmed.contains('/') { home.replace('\\', "/") } else { home.to_string() };
+    let home = home_alt.as_str();
     let shown = match trimmed.strip_prefix(home) {
         Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("~{rest}"),
         _ => trimmed.to_string(),
@@ -434,6 +452,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_lines_add_the_branch() {
+        assert_eq!(context_line("~/src/app", Some("main")), "~/src/app on main");
+        assert_eq!(context_line("~/src/app", None), "~/src/app");
+    }
+
+    #[test]
     fn short_paths_use_tilde_and_keep_the_tail() {
         assert_eq!(shorten_path("/srv/app/", ""), "/srv/app");
         assert_eq!(shorten_path("/a/b/c/d/e", ""), "…/c/d/e");
@@ -441,5 +465,6 @@ mod tests {
         assert_eq!(shorten_path(r"C:\Users\me\src", r"C:\Users\me"), r"~\src");
         assert_eq!(shorten_path(r"C:\Users\me", r"C:\Users\me\"), "~");
         assert_eq!(shorten_path(r"C:\Users\meow", r"C:\Users\me"), r"C:\Users\meow");
+        assert_eq!(shorten_path("C:/Users/me/src", r"C:\Users\me"), "~/src");
     }
 }

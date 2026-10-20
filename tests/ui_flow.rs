@@ -114,7 +114,9 @@ fn local_tabs_and_palette(h: &mut Harness<'_, TetherApp>) {
         h.run_steps(10);
     };
     palette(h);
-    h.get_by_label_contains("Vertical tabs on the left").click();
+    h.event(egui::Event::Text("vertical tabs left".into()));
+    h.run_steps(5);
+    h.key_press(Key::Enter);
     h.run_steps(10);
     for _ in 0..2 {
         h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::T);

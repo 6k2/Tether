@@ -375,15 +375,19 @@ fn sticky_header(ui: &mut Ui, painter: &egui::Painter, g: Geom, mark: &Mark, acc
     resp.on_hover_text("Scroll to this command").clicked().then_some(Request::ScrollTo(mark.prompt_line))
 }
 
-/// Ctrl+Shift+Up / Down in a terminal.
+/// The "previous / next prompt" shortcuts (Ctrl+Shift+Up / Down by default) in a terminal.
 pub fn step_key(key: egui::Key, mods: egui::Modifiers) -> Option<bool> {
-    if !(mods.ctrl || mods.command) || !mods.shift || mods.alt {
+    use crate::keybindings::{self, Action};
+    if keybindings::is_recording() {
         return None;
     }
-    match key {
-        egui::Key::ArrowUp => Some(true),
-        egui::Key::ArrowDown => Some(false),
-        _ => None,
+    let is = |a: Action| keybindings::binding(a).is_some_and(|b| b.matches(key, mods));
+    if is(Action::PrevPrompt) {
+        Some(true)
+    } else if is(Action::NextPrompt) {
+        Some(false)
+    } else {
+        None
     }
 }
 

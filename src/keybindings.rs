@@ -41,6 +41,8 @@ pub enum Action {
     CycleTabPosition,
     MoveSidebar,
     RenameTab,
+    PrevPrompt,
+    NextPrompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +69,7 @@ impl Group {
 }
 
 impl Action {
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 35] = [
         Action::CommandPalette,
         Action::ToggleSidebar,
         Action::OpenSettings,
@@ -89,6 +91,8 @@ impl Action {
         Action::FontBigger,
         Action::FontSmaller,
         Action::FontReset,
+        Action::PrevPrompt,
+        Action::NextPrompt,
         Action::SftpBack,
         Action::SftpForward,
         Action::SftpUp,
@@ -138,6 +142,8 @@ impl Action {
             Action::CycleTabPosition => "Cycle tab position (top, left, right)",
             Action::MoveSidebar => "Move sidebar to the other side",
             Action::RenameTab => "Rename tab",
+            Action::PrevPrompt => "Previous command (prompt)",
+            Action::NextPrompt => "Next command (prompt)",
         }
     }
 
@@ -169,7 +175,7 @@ impl Action {
             | Action::ZoomPane
             | Action::CycleTabPosition
             | Action::MoveSidebar => Group::Panes,
-            Action::FontBigger | Action::FontSmaller | Action::FontReset => Group::Terminal,
+            Action::FontBigger | Action::FontSmaller | Action::FontReset | Action::PrevPrompt | Action::NextPrompt => Group::Terminal,
             Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => Group::Sftp,
         }
     }
@@ -203,6 +209,10 @@ impl Action {
             Action::FontBigger => c(Key::Equals),
             Action::FontSmaller => cs(Key::Minus),
             Action::FontReset => c(Key::Num0),
+            // Steps between shell-integration command blocks (the shell gets the keys
+            // when the terminal has no blocks).
+            Action::PrevPrompt => cs(Key::ArrowUp),
+            Action::NextPrompt => cs(Key::ArrowDown),
             Action::SftpBack => a(Key::ArrowLeft),
             Action::SftpForward => a(Key::ArrowRight),
             Action::SftpUp => a(Key::ArrowUp),
@@ -390,6 +400,16 @@ mod tests {
         assert_eq!(s.keys.len(), 2);
         assert_eq!(s.keys[&Action::CloseTab], None);
         assert_eq!(s.keys[&Action::NextTab], Some(Binding::new(Key::Tab, true, false, false)));
+    }
+
+    #[test]
+    fn prompt_steps_and_pane_focus_do_not_collide() {
+        let up = Action::PrevPrompt.default_binding().unwrap();
+        let focus_up = Action::FocusPaneUp.default_binding().unwrap();
+        assert_eq!(up.label(), "Ctrl+Shift+↑");
+        assert_ne!(up, focus_up);
+        let cs = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        assert!(up.matches(Key::ArrowUp, cs) && !focus_up.matches(Key::ArrowUp, cs));
     }
 
     #[test]

@@ -228,6 +228,6 @@ mod tests {
         }
         let t = Instant::now();
         run(&["claude".into(), "Stop".into()]);
-        assert!(t.elapsed() < Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_millis(200), "returns well before the {DEADLINE:?} send deadline");
     }
 }

@@ -29,27 +29,81 @@ pub enum OpenWith {
     System,
 }
 
+/// An image painted behind the terminal text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BackgroundImage {
+    pub path: String,
+    /// 0..=1, how strongly the image shows through.
+    pub opacity: f32,
+}
+
+impl BackgroundImage {
+    pub fn opacity(&self) -> f32 {
+        sane(self.opacity, 0.0, 1.0, 0.3)
+    }
+}
+
+/// A terminal font file picked from the system fonts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FontChoice {
+    pub family: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
-    /// Name of a built-in theme.
+    /// Name of a built-in or user theme.
     pub theme: String,
     pub ui_scale: f32,
     pub animations: bool,
+    /// Follow the OS light/dark mode with `light_theme` / `dark_theme`.
+    pub sync_with_os: bool,
+    pub light_theme: String,
+    pub dark_theme: String,
+    /// 0.5..=1; below 1 the window background lets the desktop show through.
+    pub window_opacity: f32,
+    /// Lower-case theme name -> image painted behind its terminals.
+    pub background_images: BTreeMap<String, BackgroundImage>,
+    /// `None` keeps the bundled monospace font.
+    pub terminal_font: Option<FontChoice>,
 }
 
 impl Appearance {
     pub const SCALE_MIN: f32 = 0.75;
     pub const SCALE_MAX: f32 = 1.75;
 
+    pub const OPACITY_MIN: f32 = 0.5;
+
     pub fn ui_scale(&self) -> f32 {
         sane(self.ui_scale, Self::SCALE_MIN, Self::SCALE_MAX, 1.0)
+    }
+
+    pub fn window_opacity(&self) -> f32 {
+        sane(self.window_opacity, Self::OPACITY_MIN, 1.0, 1.0)
+    }
+
+    /// The user-chosen background image of `theme`, if any.
+    pub fn background_image(&self, theme: &str) -> Option<&BackgroundImage> {
+        self.background_images.get(&theme.trim().to_lowercase()).filter(|b| !b.path.trim().is_empty())
     }
 }
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { theme: "Tether Night".into(), ui_scale: 1.0, animations: true }
+        Self {
+            theme: "Tether Night".into(),
+            ui_scale: 1.0,
+            animations: true,
+            sync_with_os: false,
+            light_theme: "Tether Day".into(),
+            dark_theme: "Tether Night".into(),
+            window_opacity: 1.0,
+            background_images: BTreeMap::new(),
+            terminal_font: None,
+        }
     }
 }
 
@@ -273,6 +327,20 @@ mod tests {
         assert!(s.terminal.scrollbar);
         assert!(s.sftp.resume_last_dir);
         assert!(s.keybindings.is_empty());
+        assert_eq!(s.appearance.window_opacity(), 1.0);
+        assert!(!s.appearance.sync_with_os && s.appearance.terminal_font.is_none());
+    }
+
+    #[test]
+    fn appearance_extras_round_trip_and_clamp() {
+        let mut a = Appearance { window_opacity: 0.1, sync_with_os: true, ..Default::default() };
+        assert_eq!(a.window_opacity(), Appearance::OPACITY_MIN);
+        a.background_images.insert("nord".into(), BackgroundImage { path: "C:/bg.png".into(), opacity: 7.0 });
+        a.terminal_font = Some(FontChoice { family: "Cascadia Mono".into(), path: "C:/Windows/Fonts/CascadiaMono.ttf".into() });
+        assert_eq!(a.background_image(" Nord ").map(|b| b.opacity()), Some(1.0));
+        assert!(a.background_image("Dracula").is_none());
+        let back: Appearance = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(back, a);
     }
 
     #[test]

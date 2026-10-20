@@ -1,55 +1,271 @@
-//! Built-in theme catalog. Each theme is a full `Palette`: UI surfaces, text tiers,
-//! accent, semantic colours, terminal colours and the 16 ANSI colours.
+//! Theme catalog: the built-ins (see `theme_catalog`) plus user themes loaded from
+//! `<config>/themes/*.yaml|yml|json` (Warp's theme format, see `theme_import`).
+//! Each theme is a full `Palette` plus optional Warp-style decoration (gradient,
+//! background image).
 //!
-//! Themes are written as a compact `Spec` (the scheme's published colours) and the
-//! in-between tones (raised surfaces, borders, dim/faint text, translucent accents)
-//! are derived so every theme gets the same visual rhythm and readable contrast.
+//! Also owns the "live" side of theming: applying with a crossfade, window opacity,
+//! following the OS light/dark mode and the backdrop painted behind terminals.
 
-use std::sync::{LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use eframe::egui::{self, Color32};
 
-use crate::settings;
+use crate::settings::{self, BackgroundImage};
 use crate::theme::{self, Palette};
 
 /// Name of the theme used when the saved one is unknown.
 pub const DEFAULT_THEME: &str = "Tether Night";
 const CROSSFADE_SECS: f64 = 0.32;
-/// Minimum WCAG contrast the derived dim text keeps against every surface.
-const DIM_TARGET: f32 = 3.3;
-const FAINT_TARGET: f32 = 2.1;
+/// How often the themes folder is checked for changes while Settings is open.
+const POLL_SECS: f64 = 2.0;
 
+/// Two colour stops; `vertical` runs top -> bottom, otherwise left -> right.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Theme {
-    pub name: &'static str,
-    /// One-line flavour text shown in the theme picker.
-    pub tagline: &'static str,
-    pub palette: Palette,
+pub struct Gradient {
+    pub start: Color32,
+    pub end: Color32,
+    pub vertical: bool,
 }
 
-pub fn all() -> &'static [Theme] {
-    static THEMES: LazyLock<Vec<Theme>> = LazyLock::new(build_catalog);
-    &THEMES
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Builtin,
+    /// Loaded from this file in the themes folder.
+    User(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Theme {
+    pub name: String,
+    /// One-line flavour text shown in the theme picker.
+    pub tagline: String,
+    pub palette: Palette,
+    pub source: Source,
+    /// Terminal background gradient; `palette.term_bg` is its first stop.
+    pub gradient: Option<Gradient>,
+    /// Accent gradient of a Warp theme (`palette.accent` is its first stop).
+    pub accent_gradient: Option<Gradient>,
+    /// Image shipped with the theme (absolute path, opacity 0..=1).
+    pub background_image: Option<BackgroundImage>,
+}
+
+impl Theme {
+    pub fn new(name: impl Into<String>, tagline: impl Into<String>, palette: Palette, source: Source) -> Self {
+        Self { name: name.into(), tagline: tagline.into(), palette, source, gradient: None, accent_gradient: None, background_image: None }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self.source, Source::User(_))
+    }
+}
+
+// ---- catalog ------------------------------------------------------------------------
+
+fn builtins() -> &'static [Theme] {
+    static B: LazyLock<Vec<Theme>> = LazyLock::new(crate::theme_catalog::build);
+    &B
+}
+
+static CATALOG: RwLock<Option<Arc<Vec<Theme>>>> = RwLock::new(None);
+static LOAD_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Built-ins (default first) followed by the user themes.
+pub fn all() -> Arc<Vec<Theme>> {
+    if let Some(list) = CATALOG.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return list.clone();
+    }
+    let list = Arc::new(builtins().to_vec());
+    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(list.clone());
+    list
 }
 
 /// Case-insensitive lookup.
-pub fn by_name(name: &str) -> Option<&'static Theme> {
+pub fn by_name(name: &str) -> Option<Theme> {
     // Names used by earlier builds.
     let name = match name.trim() {
         "Termius Dark" => DEFAULT_THEME,
         "Termius Light" => "Tether Day",
         other => other,
     };
-    all().iter().find(|t| t.name.eq_ignore_ascii_case(name))
+    all().iter().find(|t| t.name.eq_ignore_ascii_case(name)).cloned()
+}
+
+/// Replaces the user themes. A name taken by a built-in (or an earlier file) gets a suffix.
+pub fn set_user_themes(user: Vec<Theme>) {
+    let mut list = builtins().to_vec();
+    for mut t in user {
+        let base = t.name.clone();
+        let mut n = 1;
+        while list.iter().any(|o| o.name.eq_ignore_ascii_case(&t.name)) {
+            n += 1;
+            t.name = if n == 2 { format!("{base} (custom)") } else { format!("{base} (custom {n})") };
+        }
+        list.push(t);
+    }
+    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(list));
+}
+
+/// `<config>/themes`, once settings are initialised.
+pub fn user_dir() -> Option<PathBuf> {
+    settings::path().and_then(|p| p.parent().map(|d| d.join("themes")))
+}
+
+/// Re-reads the themes folder. Returns how many themes loaded; failures are logged
+/// and listed by `load_errors`.
+pub fn reload_user_themes() -> usize {
+    let Some(dir) = user_dir() else { return 0 };
+    let (themes, errors) = crate::theme_import::load_dir(&dir);
+    for e in &errors {
+        eprintln!("tether: skipped theme {e}");
+    }
+    let n = themes.len();
+    set_user_themes(themes);
+    *LOAD_ERRORS.lock().unwrap_or_else(|e| e.into_inner()) = errors;
+    *poll_state() = PollState { stamp: crate::theme_import::dir_stamp(&dir), checked_at: f64::NEG_INFINITY };
+    n
+}
+
+/// Files in the themes folder that could not be read (`"file: reason"`).
+pub fn load_errors() -> Vec<String> {
+    LOAD_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[derive(Default)]
+struct PollState {
+    stamp: u64,
+    checked_at: f64,
+}
+
+fn poll_state() -> std::sync::MutexGuard<'static, PollState> {
+    static P: Mutex<PollState> = Mutex::new(PollState { stamp: 0, checked_at: f64::NEG_INFINITY });
+    P.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hot reload: every couple of seconds, reloads the user themes if the folder changed
+/// (and re-applies the active theme if it is one of them). Call while Settings is open.
+pub fn poll_user_themes(ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    let Some(dir) = user_dir() else { return };
+    {
+        let mut st = poll_state();
+        if now - st.checked_at < POLL_SECS {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(POLL_SECS));
+            return;
+        }
+        st.checked_at = now;
+        if crate::theme_import::dir_stamp(&dir) == st.stamp {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(POLL_SECS));
+            return;
+        }
+    }
+    reload_user_themes();
+    poll_state().checked_at = now;
+    let current = settings::get().appearance.theme;
+    if by_name(&current).is_some_and(|t| t.is_custom()) {
+        apply_animated(ctx, &current);
+    }
+}
+
+/// Validates `file` as a theme, copies it (and a relative background image) into the
+/// themes folder and reloads. Returns the imported theme's name.
+pub fn import_file(file: &Path) -> anyhow::Result<String> {
+    let dir = user_dir().ok_or_else(|| anyhow::anyhow!("settings are not initialised"))?;
+    let parsed = crate::theme_import::load_file(file, file.parent()).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::create_dir_all(&dir)?;
+    let file_name = file.file_name().ok_or_else(|| anyhow::anyhow!("not a file"))?;
+    let dest = dir.join(file_name);
+    if dest != file {
+        std::fs::copy(file, &dest)?;
+    }
+    if let Some(rel) = crate::theme_import::relative_image(file)? {
+        let (src, dst) = (file.parent().unwrap_or(Path::new(".")).join(&rel), dir.join(&rel));
+        if src.is_file() && src != dst {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    reload_user_themes();
+    let name = all().iter().rev().find(|t| t.source == Source::User(dest.clone())).map_or(parsed.name, |t| t.name.clone());
+    Ok(name)
+}
+
+// ---- applying -----------------------------------------------------------------------
+
+/// The active palette before window opacity is applied (what crossfades start from).
+static BASE: Mutex<Palette> = Mutex::new(Palette::TETHER_NIGHT);
+/// Window opacity as f32 bits (1.0 = opaque).
+static OPACITY: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+/// What `ui::backdrop` paints behind terminal text.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Backdrop {
+    pub gradient: Option<Gradient>,
+    pub image: Option<BackgroundImage>,
+}
+
+static BACKDROP: RwLock<Option<Backdrop>> = RwLock::new(None);
+static ACTIVE: RwLock<Option<Theme>> = RwLock::new(None);
+
+/// The gradient/image of the active theme, if it has any.
+pub fn backdrop() -> Option<Backdrop> {
+    BACKDROP.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Window opacity in effect (1.0 = opaque).
+pub fn window_opacity() -> f32 {
+    f32::from_bits(OPACITY.load(Ordering::Relaxed))
+}
+
+/// True when the window background is translucent.
+pub fn see_through() -> bool {
+    window_opacity() < 0.999
+}
+
+/// `p` with the window opacity applied to the window and terminal backgrounds.
+fn with_opacity(mut p: Palette, opacity: f32) -> Palette {
+    if opacity < 0.999 {
+        p.bg = p.bg.gamma_multiply(opacity);
+        p.term_bg = p.term_bg.gamma_multiply(opacity);
+    }
+    p
+}
+
+fn set_base(ctx: &egui::Context, p: Palette) {
+    *BASE.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    theme::set_palette(with_opacity(p, window_opacity()));
+    theme::install(ctx);
+}
+
+fn base() -> Palette {
+    *BASE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_active(t: Option<Theme>) {
+    *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = t;
+    update_backdrop(&settings::get().appearance);
+}
+
+fn update_backdrop(a: &settings::Appearance) {
+    let active = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let spec = active.and_then(|t| {
+        let image = a.background_image(&t.name).cloned().or(t.background_image.clone()).filter(|b| b.opacity() > 0.0);
+        (t.gradient.is_some() || image.is_some()).then_some(Backdrop { gradient: t.gradient, image })
+    });
+    *BACKDROP.write().unwrap_or_else(|e| e.into_inner()) = spec;
 }
 
 /// Applies a theme instantly. Returns false (and applies the default) if `name` is unknown.
 pub fn apply(ctx: &egui::Context, name: &str) -> bool {
     *transition() = None;
     let found = by_name(name);
-    theme::set_palette(found.map_or(Palette::TETHER_NIGHT, |t| t.palette));
-    theme::install(ctx);
-    found.is_some()
+    set_base(ctx, found.as_ref().map_or(Palette::TETHER_NIGHT, |t| t.palette));
+    let ok = found.is_some();
+    set_active(found.or_else(|| by_name(DEFAULT_THEME)));
+    ok
 }
 
 /// Applies a theme with a short colour crossfade (instant when animations are off).
@@ -64,13 +280,66 @@ pub fn apply_animated(ctx: &egui::Context, name: &str) {
         return;
     }
     let start = ctx.input(|i| i.time);
-    *transition() = Some(Transition { from: theme::palette(), to: target.palette, start });
+    *transition() = Some(Transition { from: base(), to: target.palette, start });
+    set_active(Some(target));
     ctx.request_repaint();
 }
 
-/// Applies the theme saved in settings. Call once at startup, after `settings::init`.
+/// Applies the saved settings: user themes, theme (or the OS-synced one), opacity and
+/// terminal font. Call once at startup, after `settings::init`.
 pub fn apply_saved(ctx: &egui::Context) {
-    apply(ctx, &settings::get().appearance.theme);
+    reload_user_themes();
+    let a = settings::get().appearance;
+    OPACITY.store(a.window_opacity().to_bits(), Ordering::Relaxed);
+    let name = synced_theme(&a, ctx.system_theme()).unwrap_or(a.theme);
+    apply(ctx, &name);
+    crate::fonts::apply(ctx);
+}
+
+/// Re-applies the non-theme appearance settings (opacity, background images).
+pub fn refresh(ctx: &egui::Context) {
+    let a = settings::get().appearance;
+    OPACITY.store(a.window_opacity().to_bits(), Ordering::Relaxed);
+    update_backdrop(&a);
+    if transition().is_none() {
+        set_base(ctx, base());
+    }
+}
+
+/// With "Sync with OS" on, the theme to use for the OS mode `system`.
+pub fn synced_theme(a: &settings::Appearance, system: Option<egui::Theme>) -> Option<String> {
+    if !a.sync_with_os {
+        return None;
+    }
+    let name = match system? {
+        egui::Theme::Dark => &a.dark_theme,
+        egui::Theme::Light => &a.light_theme,
+    };
+    by_name(name).map(|t| t.name)
+}
+
+/// Follows OS light/dark switches when "Sync with OS" is on. Call every frame (cheap).
+pub fn follow_system(ctx: &egui::Context) {
+    static LAST: Mutex<Option<egui::Theme>> = Mutex::new(None);
+    let sys = ctx.system_theme();
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == sys {
+            return;
+        }
+        let first = last.is_none();
+        *last = sys;
+        if first && sys.is_none() {
+            return;
+        }
+    }
+    let a = settings::get().appearance;
+    if let Some(name) = synced_theme(&a, sys)
+        && !name.eq_ignore_ascii_case(&a.theme)
+    {
+        let _ = settings::update(|s| s.appearance.theme = name.clone());
+        apply_animated(ctx, &name);
+    }
 }
 
 /// Advances a running crossfade. Returns true while one is in progress.
@@ -80,14 +349,13 @@ pub fn tick(ctx: &egui::Context) -> bool {
     let now = ctx.input(|i| i.time);
     let t = (((now - tr.start) / CROSSFADE_SECS) as f32).clamp(0.0, 1.0);
     let eased = ease_out_cubic(t);
-    theme::set_palette(lerp(&tr.from, &tr.to, eased));
     if t >= 1.0 {
         *guard = None;
     } else {
         ctx.request_repaint();
     }
     drop(guard);
-    theme::install(ctx);
+    set_base(ctx, lerp(&tr.from, &tr.to, eased));
     t < 1.0
 }
 
@@ -95,8 +363,7 @@ pub fn tick(ctx: &egui::Context) -> bool {
 pub fn finish(ctx: &egui::Context) {
     let pending = transition().take();
     if let Some(tr) = pending {
-        theme::set_palette(tr.to);
-        theme::install(ctx);
+        set_base(ctx, tr.to);
     }
 }
 
@@ -175,399 +442,27 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-// ---- catalog ------------------------------------------------------------------------
-
-struct Spec {
-    name: &'static str,
-    tagline: &'static str,
-    dark: bool,
-    /// Window chrome behind panels.
-    bg: u32,
-    /// Cards, tab bodies.
-    surface: u32,
-    text: u32,
-    accent: u32,
-    blue: u32,
-    danger: u32,
-    warn: u32,
-    success: u32,
-    term_bg: u32,
-    term_fg: u32,
-    cursor: u32,
-    /// Solid selection colour; `None` derives a translucent accent.
-    selection: Option<u32>,
-    ansi: [u32; 16],
-}
-
-const fn hex(v: u32) -> Color32 {
-    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
-}
-
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    lerp_color(a, b, t)
-}
-
-fn with_alpha(c: Color32, alpha: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
-}
-
-/// Strongest blend of `fg` toward `base` that still keeps `target` contrast on all `backs`.
-fn readable_blend(fg: Color32, base: Color32, start: f32, target: f32, backs: &[Color32]) -> Color32 {
-    let mut t = start;
-    loop {
-        let c = mix(fg, base, t);
-        if t <= 0.0 || backs.iter().all(|b| contrast(c, *b) >= target) {
-            return c;
-        }
-        t = (t - 0.02).max(0.0);
-    }
-}
-
-impl Spec {
-    fn build(&self) -> Theme {
-        let (bg, surface, text) = (hex(self.bg), hex(self.surface), hex(self.text));
-        let accent = hex(self.accent);
-        let lift = |t: f32| mix(surface, text, t);
-        let (surface_2, surface_3) = if self.dark { (lift(0.045), lift(0.095)) } else { (lift(0.035), lift(0.075)) };
-        let border = lift(if self.dark { 0.14 } else { 0.13 });
-        let backs = [bg, surface, surface_2];
-        let text_dim = readable_blend(text, surface, 0.42, DIM_TARGET, &backs);
-        let text_faint = readable_blend(text, surface, 0.62, FAINT_TARGET, &backs);
-        let ink = if self.dark { mix(hex(self.term_bg), Color32::BLACK, 0.5) } else { mix(text, Color32::BLACK, 0.4) };
-        let on_accent = if contrast(ink, accent) >= contrast(Color32::WHITE, accent) { ink } else { Color32::WHITE };
-        let palette = Palette {
-            dark: self.dark,
-            bg,
-            surface,
-            surface_2,
-            surface_3,
-            border,
-            text,
-            text_dim,
-            text_faint,
-            accent,
-            accent_soft: with_alpha(accent, if self.dark { 0x5c } else { 0x3a }),
-            blue: hex(self.blue),
-            danger: hex(self.danger),
-            warn: hex(self.warn),
-            success: hex(self.success),
-            shadow: Color32::from_black_alpha(if self.dark { 140 } else { 36 }),
-            on_accent,
-            icon_page: lift(if self.dark { 0.2 } else { 0.16 }),
-            icon_page_edge: lift(if self.dark { 0.32 } else { 0.28 }),
-            row_separator: if self.dark { Color32::from_black_alpha(0x50) } else { with_alpha(text, 0x12) },
-            term_bg: hex(self.term_bg),
-            term_fg: hex(self.term_fg),
-            term_cursor: hex(self.cursor),
-            term_selection: self.selection.map_or(with_alpha(accent, if self.dark { 0x70 } else { 0x48 }), hex),
-            ansi: self.ansi.map(hex),
-        };
-        Theme { name: self.name, tagline: self.tagline, palette }
-    }
-}
-
-fn build_catalog() -> Vec<Theme> {
-    let mut out = vec![Theme { name: DEFAULT_THEME, tagline: "Deep navy, signature green", palette: Palette::TETHER_NIGHT }];
-    out.extend(SPECS.iter().map(Spec::build));
-    out
-}
-
-const SPECS: &[Spec] = &[
-    Spec {
-        name: "Tether Day",
-        tagline: "Crisp paper, the same green",
-        dark: false,
-        bg: 0xeceef3,
-        surface: 0xffffff,
-        text: 0x1e2133,
-        accent: 0x12a05a,
-        blue: 0x1f6fd1,
-        danger: 0xd63b40,
-        warn: 0xb5761a,
-        success: 0x12a05a,
-        term_bg: 0xfbfbfd,
-        term_fg: 0x2a2e3f,
-        cursor: 0x12a05a,
-        selection: Some(0xcdeedd),
-        ansi: [
-            0x2a2e3f, 0xd63b40, 0x0d8a50, 0xb5761a, 0x1b66c9, 0xb0307a, 0x0b8496, 0xa3a7b8, 0x5a5f7a, 0xe5534b, 0x17a862, 0xc98a20, 0x3384e6, 0xcc4499,
-            0x1a9fb0, 0xc9ccd6,
-        ],
-    },
-    Spec {
-        name: "Kanagawa Wave",
-        tagline: "Ink, fuji white and wave blue",
-        dark: true,
-        bg: 0x16161d,
-        surface: 0x1f1f28,
-        text: 0xdcd7ba,
-        accent: 0x7e9cd8,
-        blue: 0x7fb4ca,
-        danger: 0xe82424,
-        warn: 0xff9e3b,
-        success: 0x98bb6c,
-        term_bg: 0x1f1f28,
-        term_fg: 0xdcd7ba,
-        cursor: 0xc8c093,
-        selection: Some(0x2d4f67),
-        ansi: [
-            0x090618, 0xc34043, 0x76946a, 0xc0a36e, 0x7e9cd8, 0x957fb8, 0x6a9589, 0xc8c093, 0x727169, 0xe82424, 0x98bb6c, 0xe6c384, 0x7fb4ca, 0x938aa9,
-            0x7aa89f, 0xdcd7ba,
-        ],
-    },
-    Spec {
-        name: "Kanagawa Lotus",
-        tagline: "Warm parchment, lotus ink",
-        dark: false,
-        bg: 0xe5ddb0,
-        surface: 0xf2ecbc,
-        text: 0x43436c,
-        accent: 0x4d699b,
-        blue: 0x6693bf,
-        danger: 0xc84053,
-        warn: 0xcc6d00,
-        success: 0x6f894e,
-        term_bg: 0xf2ecbc,
-        term_fg: 0x545464,
-        cursor: 0x43436c,
-        selection: Some(0xc9cbd1),
-        ansi: [
-            0x1f1f28, 0xc84053, 0x6f894e, 0x77713f, 0x4d699b, 0xb35b79, 0x597b75, 0x545464, 0x8a8980, 0xd7474b, 0x6e915f, 0x836f4a, 0x6693bf, 0x624c83,
-            0x5e857a, 0x43436c,
-        ],
-    },
-    Spec {
-        name: "Flexoki Dark",
-        tagline: "Inky paper, analog tones",
-        dark: true,
-        bg: 0x100f0f,
-        surface: 0x1c1b1a,
-        text: 0xcecdc3,
-        accent: 0x3aa99f,
-        blue: 0x4385be,
-        danger: 0xd14d41,
-        warn: 0xd0a215,
-        success: 0x879a39,
-        term_bg: 0x1c1b1a,
-        term_fg: 0xcecdc3,
-        cursor: 0xcecdc3,
-        selection: Some(0x403e3c),
-        ansi: [
-            0x100f0f, 0xaf3029, 0x66800b, 0xad8301, 0x205ea6, 0xa02f6f, 0x24837b, 0x878580, 0x575653, 0xd14d41, 0x879a39, 0xd0a215, 0x4385be, 0xce5d97,
-            0x3aa99f, 0xcecdc3,
-        ],
-    },
-    Spec {
-        name: "Hacker Green",
-        tagline: "Phosphor on black",
-        dark: true,
-        bg: 0x030805,
-        surface: 0x07110a,
-        text: 0xc9f7d6,
-        accent: 0x2bff6b,
-        blue: 0x3ae0c4,
-        danger: 0xff5f56,
-        warn: 0xe3ff7a,
-        success: 0x2bff6b,
-        term_bg: 0x050c07,
-        term_fg: 0x33ff77,
-        cursor: 0x2bff6b,
-        selection: Some(0x0f3d1f),
-        ansi: [
-            0x0d1a12, 0xff5f56, 0x2bff6b, 0xc8f542, 0x3ae0c4, 0x7dffb0, 0x22d3a0, 0xa8f0bc, 0x2f5a3d, 0xff8a80, 0x6dff9a, 0xe3ff7a, 0x6ff5dc, 0xb0ffd0,
-            0x5cf0c0, 0xe6ffec,
-        ],
-    },
-    Spec {
-        name: "Nord",
-        tagline: "Arctic, north-bluish calm",
-        dark: true,
-        bg: 0x242933,
-        surface: 0x2e3440,
-        text: 0xeceff4,
-        accent: 0x88c0d0,
-        blue: 0x81a1c1,
-        danger: 0xbf616a,
-        warn: 0xebcb8b,
-        success: 0xa3be8c,
-        term_bg: 0x2e3440,
-        term_fg: 0xd8dee9,
-        cursor: 0xd8dee9,
-        selection: Some(0x434c5e),
-        ansi: [
-            0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0, 0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead,
-            0x8fbcbb, 0xeceff4,
-        ],
-    },
-    Spec {
-        name: "Dracula",
-        tagline: "Dark purple, vivid neon",
-        dark: true,
-        bg: 0x21222c,
-        surface: 0x282a36,
-        text: 0xf8f8f2,
-        accent: 0xbd93f9,
-        blue: 0x8be9fd,
-        danger: 0xff5555,
-        warn: 0xffb86c,
-        success: 0x50fa7b,
-        term_bg: 0x282a36,
-        term_fg: 0xf8f8f2,
-        cursor: 0xf8f8f2,
-        selection: Some(0x44475a),
-        ansi: [
-            0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2, 0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5, 0xd6acff, 0xff92df,
-            0xa4ffff, 0xffffff,
-        ],
-    },
-    Spec {
-        name: "Catppuccin Mocha",
-        tagline: "Soothing pastels after dark",
-        dark: true,
-        bg: 0x181825,
-        surface: 0x1e1e2e,
-        text: 0xcdd6f4,
-        accent: 0xcba6f7,
-        blue: 0x89b4fa,
-        danger: 0xf38ba8,
-        warn: 0xfab387,
-        success: 0xa6e3a1,
-        term_bg: 0x1e1e2e,
-        term_fg: 0xcdd6f4,
-        cursor: 0xf5e0dc,
-        selection: Some(0x45475a),
-        ansi: [
-            0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de, 0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7,
-            0x94e2d5, 0xa6adc8,
-        ],
-    },
-    Spec {
-        name: "Catppuccin Latte",
-        tagline: "Pastels in daylight",
-        dark: false,
-        bg: 0xe6e9ef,
-        surface: 0xeff1f5,
-        text: 0x4c4f69,
-        accent: 0x8839ef,
-        blue: 0x1e66f5,
-        danger: 0xd20f39,
-        warn: 0xfe640b,
-        success: 0x40a02b,
-        term_bg: 0xeff1f5,
-        term_fg: 0x4c4f69,
-        cursor: 0xdc8a78,
-        selection: Some(0xccd0da),
-        ansi: [
-            0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xacb0be, 0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb,
-            0x179299, 0xbcc0cc,
-        ],
-    },
-    Spec {
-        name: "Tokyo Night",
-        tagline: "Neon city lights",
-        dark: true,
-        bg: 0x16161e,
-        surface: 0x1a1b26,
-        text: 0xc0caf5,
-        accent: 0x7aa2f7,
-        blue: 0x7dcfff,
-        danger: 0xf7768e,
-        warn: 0xe0af68,
-        success: 0x9ece6a,
-        term_bg: 0x1a1b26,
-        term_fg: 0xc0caf5,
-        cursor: 0xc0caf5,
-        selection: Some(0x283457),
-        ansi: [
-            0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6, 0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7,
-            0x7dcfff, 0xc0caf5,
-        ],
-    },
-    Spec {
-        name: "Solarized Light",
-        tagline: "Precision colours, warm base",
-        dark: false,
-        bg: 0xeee8d5,
-        surface: 0xfdf6e3,
-        text: 0x073642,
-        accent: 0x268bd2,
-        blue: 0x268bd2,
-        danger: 0xdc322f,
-        warn: 0xb58900,
-        success: 0x859900,
-        term_bg: 0xfdf6e3,
-        term_fg: 0x586e75,
-        cursor: 0x586e75,
-        selection: None,
-        ansi: [
-            0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5, 0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4,
-            0x93a1a1, 0xfdf6e3,
-        ],
-    },
-    Spec {
-        name: "Rosé Pine",
-        tagline: "All natural pine, faux fur and soho vibes",
-        dark: true,
-        bg: 0x191724,
-        surface: 0x1f1d2e,
-        text: 0xe0def4,
-        accent: 0xebbcba,
-        blue: 0x9ccfd8,
-        danger: 0xeb6f92,
-        warn: 0xf6c177,
-        success: 0x9ccfd8,
-        term_bg: 0x191724,
-        term_fg: 0xe0def4,
-        cursor: 0xebbcba,
-        selection: Some(0x403d52),
-        ansi: [
-            0x26233a, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xebbcba, 0xe0def4, 0x6e6a86, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7,
-            0xebbcba, 0xe0def4,
-        ],
-    },
-    Spec {
-        name: "One Dark",
-        tagline: "The classic Atom editor look",
-        dark: true,
-        bg: 0x21252b,
-        surface: 0x282c34,
-        text: 0xd7dae0,
-        accent: 0x61afef,
-        blue: 0x61afef,
-        danger: 0xe06c75,
-        warn: 0xe5c07b,
-        success: 0x98c379,
-        term_bg: 0x282c34,
-        term_fg: 0xabb2bf,
-        cursor: 0x528bff,
-        selection: Some(0x3e4451),
-        ansi: [
-            0x3f4451, 0xe05561, 0x8cc265, 0xd18f52, 0x4aa5f0, 0xc162de, 0x42b3c2, 0xd7dae0, 0x4f5666, 0xff616e, 0xa5e075, 0xf0a45d, 0x4dc4ff, 0xde73ff,
-            0x4cd1e0, 0xe6e6e6,
-        ],
-    },
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn catalog_names_are_unique_and_default_is_first() {
-        let names: Vec<_> = all().iter().map(|t| t.name.to_ascii_lowercase()).collect();
+        let names: Vec<_> = builtins().iter().map(|t| t.name.to_lowercase()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len());
-        assert!(names.len() >= 12);
-        assert_eq!(all()[0].name, DEFAULT_THEME);
-        assert_eq!(all()[0].palette, Palette::TETHER_NIGHT);
+        assert!(names.len() >= 30, "only {} built-in themes", names.len());
+        assert_eq!(builtins()[0].name, DEFAULT_THEME);
+        assert_eq!(builtins()[0].palette, Palette::TETHER_NIGHT);
         assert_eq!(settings::Appearance::default().theme, DEFAULT_THEME);
+        assert!(builtins().iter().all(|t| !t.is_custom() && !t.tagline.is_empty()));
     }
 
     #[test]
     fn every_theme_has_readable_text() {
-        for t in all() {
+        for t in builtins() {
             let p = &t.palette;
             for (label, back) in [("bg", p.bg), ("surface", p.surface), ("surface_2", p.surface_2), ("surface_3", p.surface_3)] {
                 let c = contrast(p.text, back);
@@ -579,29 +474,36 @@ mod tests {
             }
             let c = contrast(p.term_fg, p.term_bg);
             assert!(c >= 4.5, "{}: terminal fg is {c:.2}", t.name);
+            if let Some(g) = t.gradient {
+                for stop in [g.start, g.end] {
+                    let c = contrast(p.term_fg, stop);
+                    assert!(c >= 4.5, "{}: terminal fg on gradient stop is {c:.2}", t.name);
+                }
+            }
             assert!(contrast(p.on_accent, p.accent) >= 3.0, "{}: on_accent", t.name);
         }
     }
 
     #[test]
     fn light_flag_matches_background() {
-        for t in all() {
+        for t in builtins() {
             let light_bg = luminance(t.palette.surface) > 0.5;
             assert_eq!(t.palette.dark, !light_bg, "{}", t.name);
         }
-        assert!(all().iter().filter(|t| !t.palette.dark).count() >= 3);
+        assert!(builtins().iter().filter(|t| !t.palette.dark).count() >= 8);
     }
 
     #[test]
     fn lookup_is_case_insensitive() {
-        assert_eq!(by_name("nord").map(|t| t.name), Some("Nord"));
-        assert_eq!(by_name(" Tokyo Night ").map(|t| t.name), Some("Tokyo Night"));
+        assert_eq!(by_name("nord").map(|t| t.name), Some("Nord".to_string()));
+        assert_eq!(by_name(" Tokyo Night ").map(|t| t.name), Some("Tokyo Night".to_string()));
+        assert_eq!(by_name("gruvbox dark").map(|t| t.name), Some("Gruvbox Dark".to_string()));
         assert!(by_name("nope").is_none());
     }
 
     #[test]
     fn lerp_hits_endpoints() {
-        let a = all()[0].palette;
+        let a = builtins()[0].palette;
         let b = by_name("Catppuccin Latte").unwrap().palette;
         assert_eq!(lerp(&a, &b, 0.0), a);
         assert_eq!(lerp(&a, &b, 1.0), b);
@@ -613,5 +515,24 @@ mod tests {
     fn contrast_reference_values() {
         assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
         assert!((contrast(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn opacity_only_touches_window_and_terminal_backgrounds() {
+        let p = Palette::TETHER_NIGHT;
+        assert_eq!(with_opacity(p, 1.0), p);
+        let q = with_opacity(p, 0.5);
+        assert!(q.bg.a() < 255 && q.term_bg.a() < 255);
+        assert_eq!((q.surface, q.text, q.ansi), (p.surface, p.text, p.ansi));
+    }
+
+    #[test]
+    fn sync_with_os_picks_the_matching_slot() {
+        let mut a = settings::Appearance { sync_with_os: true, light_theme: "github light".into(), dark_theme: "Nord".into(), ..Default::default() };
+        assert_eq!(synced_theme(&a, Some(egui::Theme::Light)).as_deref(), Some("GitHub Light"));
+        assert_eq!(synced_theme(&a, Some(egui::Theme::Dark)).as_deref(), Some("Nord"));
+        assert_eq!(synced_theme(&a, None), None);
+        a.sync_with_os = false;
+        assert_eq!(synced_theme(&a, Some(egui::Theme::Dark)), None);
     }
 }

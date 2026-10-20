@@ -187,6 +187,7 @@ impl TerminalView {
         let palette = theme::palette();
         painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), palette.term_bg);
         self.handle.repaint.mark_painted(ui.ctx());
+        super::backdrop::paint(&painter, rect);
 
         let Some(frame) = self.sync_grid((rows, cols), &font, &palette) else { return out };
         // Glyph layout for new rows happens with the lock released.

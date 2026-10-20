@@ -4,28 +4,18 @@
 use eframe::egui::{self, Align, CornerRadius, FontFamily, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use super::settings_view::Section;
-use super::settings_widgets::{self as w, Icon, SliderSpec};
+use super::settings_widgets::{self as w, SliderSpec};
 use super::terminal_view::{metrics, paint_cursor};
-use super::theme_preview;
+use super::theme_gallery;
 use crate::settings::{self, Appearance, CursorStyle, EditorSettings, OpenWith, Settings, TerminalSettings};
-use crate::{theme, themes};
+use crate::theme;
 
-const THEME_CARD_MIN_W: f32 = 168.0;
-const GRID_GAP: f32 = 12.0;
 const CARD_GAP: f32 = 14.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeFilter {
-    #[default]
-    All,
-    Dark,
-    Light,
-}
 
 /// UI state that is not a setting (text fields, confirmations, demos).
 #[derive(Default)]
 pub struct SectionState {
-    filter: ThemeFilter,
+    gallery: super::theme_gallery::GalleryState,
     new_ext: String,
     new_ext_open: OpenWith,
     ext_error: Option<String>,
@@ -56,13 +46,11 @@ pub fn show(ui: &mut Ui, section: Section, s: &mut Settings, st: &mut SectionSta
 // ---- appearance ------------------------------------------------------------------------
 
 fn appearance(ui: &mut Ui, s: &mut Settings, st: &mut SectionState) {
-    w::card(ui, Some("Theme"), |ui| {
-        w::row(ui, "Colour theme", "Applies instantly to the whole app and every terminal", |ui| {
-            w::segmented(ui, &mut st.filter, &[(ThemeFilter::All, "All"), (ThemeFilter::Dark, "Dark"), (ThemeFilter::Light, "Light")]);
-        });
-        ui.add_space(10.0);
-        theme_grid(ui, &mut s.appearance.theme, st.filter);
-    });
+    w::card(ui, Some("Theme"), |ui| theme_gallery::theme_section(ui, &mut s.appearance, &mut st.gallery));
+    ui.add_space(CARD_GAP);
+    w::card(ui, Some("System"), |ui| theme_gallery::sync_section(ui, &mut s.appearance));
+    ui.add_space(CARD_GAP);
+    w::card(ui, Some("Window and background"), |ui| theme_gallery::window_section(ui, &mut s.appearance));
     ui.add_space(CARD_GAP);
     w::card(ui, Some("Interface"), |ui| {
         let mut pct = s.appearance.ui_scale() * 100.0;
@@ -80,73 +68,15 @@ fn appearance(ui: &mut Ui, s: &mut Settings, st: &mut SectionState) {
     });
 }
 
-fn theme_grid(ui: &mut Ui, current: &mut String, filter: ThemeFilter) {
-    let list: Vec<&themes::Theme> = themes::all()
-        .iter()
-        .filter(|t| match filter {
-            ThemeFilter::All => true,
-            ThemeFilter::Dark => t.palette.dark,
-            ThemeFilter::Light => !t.palette.dark,
-        })
-        .collect();
-    let width = ui.available_width();
-    let cols = (((width + GRID_GAP) / (THEME_CARD_MIN_W + GRID_GAP)).floor() as usize).max(2);
-    let card_w = (width - GRID_GAP * (cols - 1) as f32) / cols as f32;
-    let card_h = card_w * 0.62 + 40.0;
-    for chunk in list.chunks(cols) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = GRID_GAP;
-            for t in chunk {
-                let selected = current.eq_ignore_ascii_case(t.name);
-                if theme_card(ui, t, Vec2::new(card_w, card_h), selected) && !selected {
-                    *current = t.name.to_string();
-                }
-            }
-        });
-        ui.add_space(GRID_GAP - 6.0);
-    }
-}
-
-/// One theme tile with a live mini-preview. Returns true when clicked.
-fn theme_card(ui: &mut Ui, t: &themes::Theme, size: Vec2, selected: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_text(t.tagline);
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), theme::anim_time(0.14));
-    let sel = ui.ctx().animate_bool_with_time(resp.id.with("sel"), selected, theme::anim_time(0.2));
-    let r = rect.translate(Vec2::new(0.0, -2.0 * h));
-    let p = ui.painter();
-    if h > 0.0 {
-        p.add(egui::Shadow { offset: [0, 8], blur: 20, spread: 0, color: theme::shadow().gamma_multiply(0.6 * h) }.as_shape(r, CornerRadius::same(12)));
-    }
-    p.rect_filled(r, CornerRadius::same(12), theme::surface());
-    let preview = Rect::from_min_size(r.min + Vec2::splat(6.0), Vec2::new(r.width() - 12.0, r.height() - 46.0));
-    theme_preview::paint(&p.with_clip_rect(preview), preview, &t.palette);
-
-    let name_pos = Pos2::new(r.left() + 12.0, preview.bottom() + 20.0);
-    p.text(name_pos, egui::Align2::LEFT_CENTER, t.name, FontId::proportional(12.5), theme::text());
-    let tag = if t.palette.dark { "Dark" } else { "Light" };
-    p.text(Pos2::new(r.right() - 12.0, name_pos.y), egui::Align2::RIGHT_CENTER, tag, FontId::proportional(10.5), theme::text_faint());
-
-    let ring = theme::border().gamma_multiply(0.6 + 0.4 * h).lerp_to_gamma(theme::accent(), sel);
-    p.rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0 + sel, ring), egui::StrokeKind::Inside);
-    if sel > 0.0 {
-        let c = Pos2::new(preview.right() - 12.0, preview.top() + 12.0);
-        p.circle_filled(c, 9.0 * sel, theme::accent());
-        w::paint_icon(p, Rect::from_center_size(c, Vec2::splat(9.0 * sel)), Icon::Check, theme::on_accent());
-    }
-    resp.clicked()
-}
-
 // ---- terminal --------------------------------------------------------------------------
 
 fn terminal(ui: &mut Ui, s: &mut Settings, st: &mut SectionState, now: f64) {
     terminal_preview(ui, &s.terminal, st.bell_demo_at, now);
     ui.add_space(CARD_GAP);
-    let t = &mut s.terminal;
+    let (t, font) = (&mut s.terminal, &mut s.appearance.terminal_font);
     w::card(ui, Some("Text"), |ui| {
+        theme_gallery::font_row(ui, font);
+        w::separator(ui);
         w::row(ui, "Font size", "Ctrl + / Ctrl Shift - / Ctrl 0 in a terminal", |ui| {
             let spec =
                 SliderSpec { min: TerminalSettings::FONT_MIN, max: TerminalSettings::FONT_MAX, step: 0.5, log: false, format: &|v| format!("{v:.1} pt") };

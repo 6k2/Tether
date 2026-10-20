@@ -264,6 +264,11 @@ impl egui_dock::TabViewer for Viewer {
         }
     }
 
+    /// With a translucent window, terminals paint their own (translucent) background.
+    fn clear_background(&self, tab: &Tab) -> bool {
+        !(crate::themes::see_through() && matches!(tab.body, TabBody::Terminal(_)))
+    }
+
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
     }

@@ -15,8 +15,16 @@
 //!
 //! The UI tones are derived from background/foreground/accent the same way the
 //! built-ins are (see `theme_catalog::derive_palette`).
+//!
+//! Theme files are shared and downloaded, so they are untrusted: a background image must
+//! be a relative path inside the theme's folder (an absolute or UNC path could make
+//! Windows authenticate to a remote server), and YAML anchors/aliases are refused (they
+//! let a tiny file expand exponentially while parsing).
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use eframe::egui::Color32;
 use serde::Deserialize;
@@ -130,8 +138,55 @@ pub fn parse(text: &str, json: bool, base_dir: Option<&Path>) -> Result<Theme, S
     parse_with(text, json, base_dir, None)
 }
 
+/// Whether YAML `text` uses an anchor (`&a`) or alias (`*a`) outside quotes and comments.
+/// Conservative: a false positive only refuses an unusual theme file.
+pub fn has_yaml_alias(text: &str) -> bool {
+    text.lines().any(|line| {
+        let chars: Vec<char> = line.chars().collect();
+        let mut quote: Option<char> = None;
+        for (i, &c) in chars.iter().enumerate() {
+            let prev = if i == 0 { ' ' } else { chars[i - 1] };
+            let at_token = prev.is_whitespace() || "[{,:-?".contains(prev);
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match c {
+                '#' if prev.is_whitespace() => break,
+                '\'' | '"' if at_token => quote = Some(c),
+                '&' | '*' if at_token && chars.get(i + 1).is_some_and(|n| !n.is_whitespace()) => return true,
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
+/// A theme's background image path: relative and inside `base_dir` (symlinks included).
+fn image_path(raw: &str, base_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let rel = PathBuf::from(raw.trim());
+    let plain = !rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    let outside = || format!("background_image: '{}' must be a path relative to the theme file, inside its folder", raw.trim());
+    if !plain {
+        return Err(outside());
+    }
+    let Some(dir) = base_dir else { return Ok(rel) };
+    let full = dir.join(&rel);
+    if let (Ok(real), Ok(real_dir)) = (full.canonicalize(), dir.canonicalize())
+        && !real.starts_with(&real_dir)
+    {
+        return Err(outside());
+    }
+    Ok(full)
+}
+
 /// `parse`, with a name to use when the file has none.
 fn parse_with(text: &str, json: bool, base_dir: Option<&Path>, default_name: Option<&str>) -> Result<Theme, String> {
+    if !json && has_yaml_alias(text) {
+        return Err("YAML anchors and aliases (&name / *name) are not allowed in theme files".into());
+    }
     let w: WarpTheme = if json { serde_json::from_str(text).map_err(|e| e.to_string())? } else { serde_norway::from_str(text).map_err(|e| e.to_string())? };
     let (background, gradient) = fill(&w.background, "background")?;
     let (accent, accent_gradient) = fill(&w.accent, "accent")?;
@@ -168,14 +223,13 @@ fn parse_with(text: &str, json: bool, base_dir: Option<&Path>, default_name: Opt
     let mut theme = Theme::new(name, if dark { "Custom dark theme" } else { "Custom light theme" }, derive_palette(&colors), Source::Builtin);
     theme.gradient = gradient;
     theme.accent_gradient = accent_gradient;
-    theme.background_image = w.background_image.map(|img| {
-        let path = PathBuf::from(img.path.trim());
-        let path = match base_dir {
-            Some(dir) if path.is_relative() => dir.join(path),
-            _ => path,
-        };
-        BackgroundImage { path: path.display().to_string(), opacity: (img.opacity.unwrap_or(30.0) / 100.0).clamp(0.0, 1.0) }
-    });
+    theme.background_image = match w.background_image {
+        Some(img) => {
+            let path = image_path(&img.path, base_dir)?;
+            Some(BackgroundImage { path: path.display().to_string(), opacity: (img.opacity.unwrap_or(30.0) / 100.0).clamp(0.0, 1.0) })
+        }
+        None => None,
+    };
     Ok(theme)
 }
 
@@ -211,17 +265,41 @@ pub fn load_file(path: &Path, base_dir: Option<&Path>) -> Result<Theme, String> 
     Ok(theme)
 }
 
+/// A file that failed to load: its size, mtime and the reason.
+type Failure = (u64, Option<SystemTime>, String);
+
 /// Loads every theme file in `dir` (sorted by name). Returns the themes and one
 /// `"file: reason"` line per file that failed. A missing folder is not an error.
 pub fn load_dir(dir: &Path) -> (Vec<Theme>, Vec<String>) {
+    /// Files that failed, by (size, mtime): hot reload doesn't parse them again until
+    /// they change (a hostile file costs one parse, not one per reload).
+    static FAILED: Mutex<Option<HashMap<PathBuf, Failure>>> = Mutex::new(None);
     let Ok(entries) = std::fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
     let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file() && is_theme_file(p)).collect();
     files.sort();
     let (mut themes, mut errors) = (Vec::new(), Vec::new());
+    let mut failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let failed = failed.get_or_insert_with(HashMap::new);
     for f in files {
+        let stamp = std::fs::metadata(&f).map(|m| (m.len(), m.modified().ok())).ok();
+        let label = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let (Some((len, modified)), Some((l, m, e))) = (stamp, failed.get(&f))
+            && (len, modified) == (*l, *m)
+        {
+            errors.push(format!("{label}: {e}"));
+            continue;
+        }
         match load_file(&f, Some(dir)) {
-            Ok(t) => themes.push(t),
-            Err(e) => errors.push(format!("{}: {e}", f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())),
+            Ok(t) => {
+                failed.remove(&f);
+                themes.push(t);
+            }
+            Err(e) => {
+                errors.push(format!("{label}: {e}"));
+                if let Some((len, modified)) = stamp {
+                    failed.insert(f, (len, modified, e));
+                }
+            }
         }
     }
     themes.sort_by_key(|t| t.name.to_lowercase());
@@ -388,6 +466,49 @@ terminal_colors:
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors.iter().any(|e| e.starts_with("badcolour.yaml: accent")));
         assert!(load_dir(&d.join("does-not-exist")).0.is_empty());
+    }
+
+    #[test]
+    fn yaml_aliases_are_refused_before_parsing() {
+        let bomb = "a: &a [x, x, x, x]\nb: &b [*a, *a, *a, *a]\nc: [*b, *b, *b, *b]\nname: Bomb\n";
+        assert!(has_yaml_alias(bomb));
+        let err = parse(bomb, false, None).unwrap_err();
+        assert!(err.contains("anchors"), "{err}");
+        // Quoted text, comments and in-word symbols are not aliases.
+        assert!(!has_yaml_alias("name: 'Rock & Roll *'\naccent: \"#ff0000\" # &not *an alias\nfoo: a*b&c\n"));
+        assert!(!has_yaml_alias(DRACULA) && !has_yaml_alias(NEON));
+        assert!(parse(DRACULA, true, None).is_err(), "JSON is parsed as JSON, not scanned");
+    }
+
+    #[test]
+    fn background_images_must_stay_inside_the_theme_folder() {
+        let theme = |path: &str| NEON.replace("neon_bg.jpg", path);
+        let mut bad = vec!["/etc/passwd", "../outside.png", "img/../../x.png", ""];
+        if cfg!(windows) {
+            bad.extend([r"\\attacker\share\x.png", r"\\?\C:\x.png", "C:/Users/me/x.png", "C:x.png"]);
+        }
+        for bad in bad {
+            let text = theme(&format!("'{bad}'"));
+            assert!(parse(&text, false, Some(Path::new("C:/themes"))).is_err(), "{bad} was accepted");
+        }
+        let ok = parse(&theme("img/bg.png"), false, Some(Path::new("C:/themes"))).unwrap();
+        assert_eq!(PathBuf::from(ok.background_image.unwrap().path), Path::new("C:/themes").join("img/bg.png"));
+    }
+
+    #[test]
+    fn failing_files_are_not_reparsed_until_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("bad.yaml");
+        std::fs::write(&f, "name: [unclosed").unwrap();
+        let first = load_dir(dir.path()).1;
+        // Same size and mtime, different content: the cached failure is reported.
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::fs::write(&f, DRACULA.get(..15).unwrap()).unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(load_dir(dir.path()).1, first);
+        std::fs::write(&f, DRACULA).unwrap();
+        let (themes, errors) = load_dir(dir.path());
+        assert!(errors.is_empty() && themes.len() == 1, "{errors:?}");
     }
 
     #[test]

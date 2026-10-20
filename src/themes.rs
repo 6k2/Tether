@@ -172,25 +172,57 @@ pub fn poll_user_themes(ctx: &egui::Context) {
 /// themes folder and reloads. Returns the imported theme's name.
 pub fn import_file(file: &Path) -> anyhow::Result<String> {
     let dir = user_dir().ok_or_else(|| anyhow::anyhow!("settings are not initialised"))?;
+    import_into(file, &dir)
+}
+
+/// [`import_file`] into `dir`. An existing theme file of the same name is kept (the
+/// import gets a numbered name); an image would be overwritten only by the same bytes.
+fn import_into(file: &Path, dir: &Path) -> anyhow::Result<String> {
     let parsed = crate::theme_import::load_file(file, file.parent()).map_err(|e| anyhow::anyhow!(e))?;
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir)?;
     let file_name = file.file_name().ok_or_else(|| anyhow::anyhow!("not a file"))?;
-    let dest = dir.join(file_name);
-    if dest != file {
-        std::fs::copy(file, &dest)?;
-    }
     if let Some(rel) = crate::theme_import::relative_image(file)? {
-        let (src, dst) = (file.parent().unwrap_or(Path::new(".")).join(&rel), dir.join(&rel));
-        if src.is_file() && src != dst {
+        let src_dir = file.parent().unwrap_or(Path::new(".")).canonicalize()?;
+        let (src, dst) = (src_dir.join(&rel), dir.join(&rel));
+        // `load_file` checked the path; check again after resolving links.
+        let src_real = src.canonicalize().ok().filter(|s| s.starts_with(&src_dir) && s.is_file());
+        if let Some(src) = src_real
+            && dst.canonicalize().ok() != Some(src.clone())
+        {
+            let bytes = std::fs::read(&src)?;
+            if std::fs::read(&dst).is_ok_and(|old| old != bytes) {
+                anyhow::bail!("the themes folder already has a different {}; rename the image first", rel.display());
+            }
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(&src, &dst)?;
+            std::fs::write(&dst, bytes)?;
         }
+    }
+    // The theme file last, so a refused image leaves nothing half-imported.
+    let mut dest = dir.join(file_name);
+    if dest != file {
+        let bytes = std::fs::read(file)?;
+        dest = free_name(&dest, &bytes);
+        std::fs::write(&dest, &bytes)?;
     }
     reload_user_themes();
     let name = all().iter().rev().find(|t| t.source == Source::User(dest.clone())).map_or(parsed.name, |t| t.name.clone());
     Ok(name)
+}
+
+/// `path`, or `name (2).ext`, `name (3).ext`… when a different file already has that name.
+fn free_name(path: &Path, bytes: &[u8]) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut candidate = path.to_path_buf();
+    for n in 2.. {
+        match std::fs::read(&candidate) {
+            Ok(existing) if existing != bytes => candidate = path.with_file_name(format!("{stem} ({n}){ext}")),
+            _ => break,
+        }
+    }
+    candidate
 }
 
 // ---- applying -----------------------------------------------------------------------
@@ -445,6 +477,30 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_never_overwrite_other_files() {
+        let (src, themes) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let theme = "name: Glow\naccent: '#ff0000'\nbackground: '#000000'\nforeground: '#ffffff'\nbackground_image: { path: bg.png }\n";
+        let file = src.path().join("glow.yaml");
+        std::fs::write(&file, theme).unwrap();
+        std::fs::write(src.path().join("bg.png"), b"new image").unwrap();
+        // A different theme already uses the name: it is kept, the import is renamed.
+        std::fs::write(themes.path().join("glow.yaml"), "name: Mine\n").unwrap();
+        // A different image of that name blocks the import instead of being replaced.
+        std::fs::write(themes.path().join("bg.png"), b"their image").unwrap();
+        assert!(import_into(&file, themes.path()).is_err());
+        assert_eq!(std::fs::read(themes.path().join("bg.png")).unwrap(), b"their image");
+        assert!(!themes.path().join("glow (2).yaml").exists(), "nothing half-imported");
+        std::fs::remove_file(themes.path().join("bg.png")).unwrap();
+        import_into(&file, themes.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(themes.path().join("glow.yaml")).unwrap(), "name: Mine\n");
+        assert_eq!(std::fs::read_to_string(themes.path().join("glow (2).yaml")).unwrap(), theme);
+        assert_eq!(std::fs::read(themes.path().join("bg.png")).unwrap(), b"new image");
+        // Importing the same file again reuses its copy.
+        import_into(&file, themes.path()).unwrap();
+        assert!(!themes.path().join("glow (3).yaml").exists());
+    }
 
     #[test]
     fn catalog_names_are_unique_and_default_is_first() {

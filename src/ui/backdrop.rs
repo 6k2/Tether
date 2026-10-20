@@ -12,6 +12,9 @@ use crate::themes::{self, Gradient};
 
 /// Longest side images are scaled down to (keeps GPU memory sane for 8K wallpapers).
 const MAX_SIDE: u32 = 2560;
+/// Larger images are refused rather than decoded.
+const MAX_DECODE_SIDE: u32 = 16_384;
+const MAX_DECODE_BYTES: u64 = 256 << 20;
 
 enum Slot {
     Loading(Arc<Mutex<Option<Result<ColorImage, String>>>>),
@@ -132,10 +135,16 @@ fn start_decode(ctx: &egui::Context, path: &str) -> Slot {
     if spawned.is_err() { Slot::Failed } else { Slot::Loading(pending) }
 }
 
-/// Decodes a PNG/JPEG file, downscaled to `MAX_SIDE`.
+/// Decodes a PNG/JPEG file, downscaled to `MAX_SIDE`. Explicit decoder limits: the
+/// file may come with a downloaded theme.
 pub fn decode(path: &str) -> Result<ColorImage, String> {
-    let img =
-        image::ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?.decode().map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_SIDE);
+    limits.max_image_height = Some(MAX_DECODE_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    let mut reader = image::ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| e.to_string())?;
     let img = if img.width() > MAX_SIDE || img.height() > MAX_SIDE { img.thumbnail(MAX_SIDE, MAX_SIDE) } else { img };
     let rgba = img.to_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
@@ -165,5 +174,12 @@ mod tests {
         let ok = dir.path().join("ok.png");
         image::RgbaImage::from_pixel(4, 2, image::Rgba([10, 20, 30, 255])).save(&ok).unwrap();
         assert_eq!(decode(&ok.display().to_string()).unwrap().size, [4, 2]);
+        // A header claiming a huge image is refused before allocating for it.
+        let huge = dir.path().join("huge.png");
+        let mut png = std::fs::read(&ok).unwrap();
+        png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        std::fs::write(&huge, png).unwrap();
+        assert!(decode(&huge.display().to_string()).is_err());
     }
 }

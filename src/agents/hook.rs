@@ -48,6 +48,28 @@ pub fn valid_session(tag: &str) -> bool {
     !tag.is_empty() && tag.len() <= 64 && tag.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Whether `TETHER_IPC` names one of our endpoints (a `tether-` named pipe on Windows,
+/// a unix socket elsewhere): the hook opens it for writing, so it must never be a path
+/// to a regular file someone planted in the environment.
+pub fn valid_endpoint(endpoint: &str) -> bool {
+    #[cfg(windows)]
+    {
+        endpoint
+            .strip_prefix(r"\\.\pipe\tether-")
+            .is_some_and(|rest| !rest.is_empty() && rest.len() <= 128 && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(endpoint).is_ok_and(|m| m.file_type().is_socket())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = endpoint;
+        false
+    }
+}
+
 fn text(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(str::to_string).filter(|s| !s.trim().is_empty())
 }
@@ -78,7 +100,7 @@ pub fn build_message(agent: &str, event: Option<&str>, payload: &Value, session:
 /// Entry point of `tether hook ...` (`args` are the words after `hook`).
 pub fn run(args: &[String]) {
     let (Ok(session), Ok(endpoint)) = (std::env::var("TETHER_SESSION"), std::env::var("TETHER_IPC")) else { return };
-    if !valid_session(&session) || endpoint.is_empty() {
+    if !valid_session(&session) || !valid_endpoint(&endpoint) {
         return;
     }
     let args = args.to_vec();

@@ -137,6 +137,8 @@ pub struct Tracker {
     pub hooked: bool,
     /// Last notification / prompt / message, for the agents panel.
     pub message: Option<String>,
+    /// `message` came from terminal output (OSC 9/777/99), not from the agent's hooks.
+    pub message_from_terminal: bool,
     last_input: Option<Instant>,
     burst_start: Option<Instant>,
     prev_output: Option<Instant>,
@@ -152,6 +154,7 @@ impl Tracker {
             since: now,
             hooked: false,
             message: None,
+            message_from_terminal: false,
             last_input: None,
             burst_start: None,
             prev_output: None,
@@ -191,12 +194,14 @@ impl Tracker {
                     AgentState::NeedsInput
                 };
                 self.message = Some(text);
+                self.message_from_terminal = true;
                 self.set(to, now)
             }
             Event::Hook { kind, message } => {
                 self.hooked = !matches!(kind, HookKind::SessionEnd);
                 if let Some(m) = message.filter(|m| !m.trim().is_empty()) {
                     self.message = Some(m);
+                    self.message_from_terminal = false;
                 }
                 match kind {
                     HookKind::SessionStart | HookKind::SessionEnd => self.set(AgentState::Idle, now),

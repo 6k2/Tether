@@ -3,7 +3,8 @@
 //!
 //! Merges are non-destructive and idempotent: unrelated keys and hooks stay as they are,
 //! running install twice changes nothing, and uninstall removes only entries whose command
-//! is ours. Before writing, the old file is copied to `<name>.tether-bak`.
+//! is ours (recognised by its exact form, see [`is_our_claude_command`]). Before writing,
+//! the old file is copied to `<name>.tether-bak` (a timestamped name when that exists).
 
 use std::path::{Path, PathBuf};
 
@@ -46,14 +47,31 @@ fn exe_arg(exe: &Path) -> String {
     exe.to_string_lossy().replace('\\', "/")
 }
 
+/// The exe path as it goes into a shell command line, refused when it holds characters
+/// a shell would interpret inside double quotes (or that end them).
+fn safe_exe_arg(exe: &Path) -> Result<String, String> {
+    let arg = exe_arg(exe);
+    if arg.contains(['"', '$', '`', '%']) {
+        return Err(format!("tether's path ({arg}) contains a character (\" $ ` %) that is unsafe in a hook command; move tether to a plain folder"));
+    }
+    Ok(arg)
+}
+
 pub fn claude_command(exe: &Path, event: &str) -> String {
     format!("\"{}\" hook claude {event}", exe_arg(exe))
 }
 
-/// A hook command we wrote (any tether path, any event).
+/// Whether `path`'s file is tether's executable (`tether`, `tether.exe`).
+fn is_tether_exe(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+    name == "tether" || name == "tether.exe"
+}
+
+/// A hook command we wrote: exactly `"<…/tether[.exe]>" hook claude <Event>`.
 pub fn is_our_claude_command(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    lower.contains("tether") && lower.contains("\" hook claude ")
+    let Some((path, rest)) = cmd.strip_prefix('"').and_then(|c| c.split_once('"')) else { return false };
+    let Some(event) = rest.strip_prefix(" hook claude ") else { return false };
+    is_tether_exe(path) && !event.is_empty() && event.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn hook_commands(group: &Value) -> impl Iterator<Item = &str> {
@@ -62,6 +80,7 @@ fn hook_commands(group: &Value) -> impl Iterator<Item = &str> {
 
 /// `settings` with our hooks added (or their tether path updated).
 pub fn merge_claude(settings: &Value, exe: &Path) -> Result<Value, String> {
+    safe_exe_arg(exe)?;
     let mut root = match settings {
         Value::Null => Map::new(),
         Value::Object(m) => m.clone(),
@@ -144,7 +163,7 @@ pub enum CodexMerge {
 fn codex_notify_is_ours(item: &toml_edit::Item) -> bool {
     let Some(arr) = item.as_array() else { return false };
     let words: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-    words.len() >= 3 && words[0].to_ascii_lowercase().contains("tether") && words[1] == "hook" && words[2] == "codex"
+    matches!(words.as_slice(), [exe, "hook", "codex"] if is_tether_exe(exe))
 }
 
 fn codex_notify(exe: &Path) -> toml_edit::Array {
@@ -156,6 +175,7 @@ fn codex_notify(exe: &Path) -> toml_edit::Array {
 }
 
 pub fn merge_codex(text: &str, exe: &Path) -> Result<CodexMerge, String> {
+    safe_exe_arg(exe)?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("config.toml does not parse: {e}"))?;
     let wanted = codex_notify(exe);
     match doc.get("notify") {
@@ -297,29 +317,57 @@ pub fn plan(target: Target, install: bool, exe: &Path) -> Result<Option<Plan>, S
     Ok(Some(Plan { target, install, path, original, after, diff }))
 }
 
-/// Writes `plan` after copying the current file to `<name>.tether-bak`. Refuses when
-/// the file changed since the plan was made. Returns the backup path, if one was made.
+/// Where the backup of `path` goes: `<name>.tether-bak`, or, when that already exists
+/// (the user's first backup must survive later installs), `<name>.tether-bak-<unix time>`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tether-bak");
+    let first = path.with_file_name(&name);
+    if !first.exists() {
+        return first;
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut n = 0u32;
+    loop {
+        let mut stamped = name.clone();
+        stamped.push(if n == 0 { format!("-{secs}") } else { format!("-{secs}-{n}") });
+        let candidate = path.with_file_name(stamped);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Writes `plan` after copying the current file to a backup (see [`backup_path`]).
+/// Refuses when the file changed since the plan was made. A symlinked config is written
+/// through to its target, and the file keeps its permissions. Returns the backup path,
+/// if one was made.
 pub fn apply(plan: &Plan) -> Result<Option<PathBuf>, String> {
     let now = read(&plan.path)?;
     if now != plan.original {
         return Err(format!("{} changed in the meantime; review the change again", plan.path.display()));
     }
+    // Replace the file a symlink points to, not the link (dotfile managers link these).
+    let is_link = std::fs::symlink_metadata(&plan.path).is_ok_and(|m| m.file_type().is_symlink());
+    let target = if is_link { std::fs::canonicalize(&plan.path).map_err(|e| format!("cannot follow {}: {e}", plan.path.display()))? } else { plan.path.clone() };
     let mut backup = None;
     if let Some(old) = &now {
-        let mut name = plan.path.file_name().unwrap_or_default().to_os_string();
-        name.push(".tether-bak");
-        let bak = plan.path.with_file_name(name);
+        let bak = backup_path(&target);
         std::fs::write(&bak, old).map_err(|e| format!("cannot write the backup {}: {e}", bak.display()))?;
         backup = Some(bak);
     }
-    if let Some(dir) = plan.path.parent() {
+    if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let tmp = plan.path.with_extension("tether-tmp");
+    let tmp = target.with_extension("tether-tmp");
     std::fs::write(&tmp, &plan.after).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &plan.path).map_err(|e| {
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("cannot replace {}: {e}", plan.path.display())
+        format!("cannot replace {}: {e}", target.display())
     })?;
     Ok(backup)
 }
@@ -437,6 +485,44 @@ mod tests {
         assert!(is_our_claude_command("\"/usr/bin/tether\" hook claude Notification"));
         assert!(!is_our_claude_command("tether-notify.sh"));
         assert!(!is_our_claude_command("\"C:/x/other.exe\" hook claude Stop"));
+        // Merely mentioning tether doesn't make a hook ours (uninstall would delete it).
+        assert!(!is_our_claude_command("\"C:/tether/backup.exe\" hook claude Stop"));
+        assert!(!is_our_claude_command("\"C:/x/tether.exe\" hook claude Stop && rm -rf ~"));
+        assert!(!is_our_claude_command("echo \"tether\" hook claude Stop"));
+        let theirs = toml_edit::value(toml_edit::Array::from_iter(["/opt/tether-tools/notify", "hook", "codex"]));
+        assert!(!codex_notify_is_ours(&theirs));
+        let ours = toml_edit::value(toml_edit::Array::from_iter(["C:/apps/tether.exe", "hook", "codex"]));
+        assert!(codex_notify_is_ours(&ours));
+    }
+
+    #[test]
+    fn unsafe_exe_paths_are_refused() {
+        for bad in [r#"C:/a"b/tether.exe"#, "/home/$USER/tether", "/opt/`x`/tether", "C:/%TEMP%/tether.exe"] {
+            assert!(merge_claude(&Value::Null, Path::new(bad)).is_err(), "{bad}");
+            assert!(merge_codex("", Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(merge_claude(&Value::Null, &exe()).is_ok());
+    }
+
+    #[test]
+    fn the_first_backup_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let plan = |original: &str, after: &str| Plan {
+            target: Target::Claude,
+            install: true,
+            path: path.clone(),
+            original: Some(original.into()),
+            after: after.into(),
+            diff: Vec::new(),
+        };
+        std::fs::write(&path, "first").unwrap();
+        let bak1 = apply(&plan("first", "second")).unwrap().unwrap();
+        let bak2 = apply(&plan("second", "third")).unwrap().unwrap();
+        assert_ne!(bak1, bak2);
+        assert_eq!(std::fs::read_to_string(&bak1).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&bak2).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third");
     }
 
     const CODEX: &str = "# my codex config\nmodel = \"gpt-5\"\n\n[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"docs\"]\n";

@@ -15,6 +15,13 @@ const MAX_CLIENT_BYTES: u64 = 64 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Messages kept while the UI is not draining (it drains every frame).
 const MAX_QUEUED: usize = 1024;
+/// Caps on what one message may carry into the UI and notifications.
+const MAX_MESSAGE_CHARS: usize = 300;
+const MAX_CWD_BYTES: usize = 1024;
+const MAX_WORD_BYTES: usize = 128;
+/// Longest wait between retries when the next pipe instance can't be created.
+#[cfg(windows)]
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 static ENDPOINT: OnceLock<String> = OnceLock::new();
 
@@ -67,12 +74,15 @@ pub fn start(rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Inbox {
     inbox
 }
 
+/// A fresh endpoint with a 128-bit random part: on Windows the unguessable pipe name is
+/// a second line of defence behind its owner-only DACL; on unix the socket sits in a
+/// private (0700) directory of that name.
 fn endpoint_name() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     if cfg!(windows) {
-        format!(r"\\.\pipe\tether-{}-{}", std::process::id(), &id[..12])
+        format!(r"\\.\pipe\tether-{}-{id}", std::process::id())
     } else {
-        std::env::temp_dir().join(format!("tether-{}-{}.sock", std::process::id(), &id[..12])).to_string_lossy().into_owned()
+        std::env::temp_dir().join(format!("tether-{}-{id}", std::process::id())).join("ipc.sock").to_string_lossy().into_owned()
     }
 }
 
@@ -90,36 +100,77 @@ async fn serve_client(stream: impl AsyncRead + Unpin, inbox: Inbox, ctx: egui::C
     let _ = tokio::time::timeout(CLIENT_TIMEOUT, read).await;
 }
 
-/// A valid message from one line, or `None`.
+/// A valid message from one line, or `None`. Free text is capped: it ends up in the
+/// agents panel and in desktop notifications.
 pub fn parse_line(line: &str) -> Option<IpcMessage> {
-    let msg: IpcMessage = serde_json::from_str(line.trim()).ok()?;
-    (msg.v == 1 && valid_session(&msg.session)).then_some(msg)
+    let mut msg: IpcMessage = serde_json::from_str(line.trim()).ok()?;
+    let short = |w: &str| w.len() <= MAX_WORD_BYTES;
+    if msg.v != 1 || !valid_session(&msg.session) || !short(&msg.agent) || !short(&msg.event) {
+        return None;
+    }
+    msg.message = msg.message.map(|m| super::snippet(&m, MAX_MESSAGE_CHARS));
+    msg.cwd = msg.cwd.filter(|c| c.len() <= MAX_CWD_BYTES);
+    for word in [&mut msg.notification_type, &mut msg.agent_session, &mut msg.tool] {
+        if word.as_deref().is_some_and(|w| !short(w)) {
+            *word = None;
+        }
+    }
+    Some(msg)
 }
 
 #[cfg(windows)]
 mod platform {
-    use tokio::net::windows::named_pipe::ServerOptions;
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
     use super::*;
 
+    /// Protected DACL with one entry: full access for the owner (this user) only.
+    const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)";
+
+    /// One pipe instance, accessible to its owner only. Remote clients are rejected
+    /// (tokio's default `reject_remote_clients`).
+    pub(super) fn create(name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+        let sddl: Vec<u16> = OWNER_ONLY.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: valid NUL-terminated input; on success `sd` is a LocalAlloc'd descriptor.
+        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut attrs = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: 0 };
+        // SAFETY: `attrs` and the descriptor it points to outlive the call.
+        let server = unsafe { ServerOptions::new().first_pipe_instance(first).create_with_security_attributes_raw(name, (&raw mut attrs).cast()) };
+        // SAFETY: freeing the descriptor allocated above, once.
+        unsafe { LocalFree(sd) };
+        server
+    }
+
+    /// The next instance; retries with backoff instead of giving up on the endpoint.
+    async fn next_instance(name: &str) -> NamedPipeServer {
+        let mut wait = Duration::from_millis(50);
+        loop {
+            match create(name, false) {
+                Ok(server) => return server,
+                Err(e) => {
+                    eprintln!("tether: hook pipe: {e}; retrying in {wait:?}");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
     pub fn listen(name: &str, inbox: Inbox, ctx: egui::Context) -> std::io::Result<()> {
-        // Remote clients are rejected by default; only this user's processes can write.
-        let mut server = ServerOptions::new().first_pipe_instance(true).create(name)?;
+        let mut server = create(name, true)?;
         let name = name.to_string();
         tokio::spawn(async move {
             loop {
-                if server.connect().await.is_ok() {
-                    let next = match ServerOptions::new().create(&name) {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                    let client = std::mem::replace(&mut server, next);
+                let connected = server.connect().await.is_ok();
+                let client = std::mem::replace(&mut server, next_instance(&name).await);
+                if connected {
                     tokio::spawn(serve_client(client, inbox.clone(), ctx.clone()));
-                } else {
-                    server = match ServerOptions::new().create(&name) {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
                 }
             }
         });
@@ -136,7 +187,11 @@ mod platform {
     use super::*;
 
     pub fn listen(name: &str, inbox: Inbox, ctx: egui::Context) -> std::io::Result<()> {
-        let _ = std::fs::remove_file(name);
+        use std::os::unix::fs::DirBuilderExt;
+        // Bind inside a fresh directory only we can enter: no window in which another
+        // user could connect before the socket's own mode is tightened.
+        let dir = std::path::Path::new(name).parent().ok_or_else(|| std::io::Error::other("socket path has no folder"))?;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
         let listener = UnixListener::bind(name)?;
         std::fs::set_permissions(name, std::fs::Permissions::from_mode(0o600))?;
         tokio::spawn(async move {
@@ -158,6 +213,31 @@ mod tests {
         assert!(parse_line(r#"{"v":2,"session":"ab12","agent":"claude","event":"Stop"}"#).is_none());
         assert!(parse_line(r#"{"v":1,"session":"a/b","agent":"claude","event":"Stop"}"#).is_none());
         assert!(parse_line("not json").is_none());
+    }
+
+    #[test]
+    fn free_text_is_capped() {
+        let long = "x".repeat(5000);
+        let line = format!(r#"{{"v":1,"session":"ab12","agent":"claude","event":"Stop","message":"{long}","cwd":"{long}","tool":"{long}"}}"#);
+        let msg = parse_line(&line).unwrap();
+        assert!(msg.message.unwrap().chars().count() <= MAX_MESSAGE_CHARS);
+        assert_eq!((msg.cwd, msg.tool), (None, None));
+        let huge_event = format!(r#"{{"v":1,"session":"ab12","agent":"claude","event":"{long}"}}"#);
+        assert!(parse_line(&huge_event).is_none());
+    }
+
+    #[test]
+    fn endpoints_are_unguessable_and_accepted_by_the_hook() {
+        let (a, b) = (endpoint_name(), endpoint_name());
+        assert_ne!(a, b);
+        assert!(a.len() > 40, "{a}");
+        #[cfg(windows)]
+        {
+            assert!(super::super::hook::valid_endpoint(&a));
+            assert!(!super::super::hook::valid_endpoint(r"C:\Users\me\important.txt"));
+            assert!(!super::super::hook::valid_endpoint(r"\\.\pipe\other-app"));
+            assert!(!super::super::hook::valid_endpoint(r"\\.\pipe\tether-..\x"));
+        }
     }
 
     /// The real round trip: `hook::send` from a thread into the running server.

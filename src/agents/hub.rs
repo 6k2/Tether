@@ -18,6 +18,8 @@ use crate::ssh::terminal::{LinkState, TerminalHandle};
 
 /// Two alerts for the same session closer than this are one.
 const ALERT_GAP: Duration = Duration::from_secs(2);
+/// Longest terminal notification text kept.
+const NOTICE_CHARS: usize = 300;
 /// Frame rate of the "working" pulse on badges.
 const PULSE_FRAME: Duration = Duration::from_millis(100);
 /// A hook-reported agent counts as gone only once a process sample this much newer
@@ -64,6 +66,8 @@ pub struct Alert {
     pub state: AgentState,
     pub project: String,
     pub message: Option<String>,
+    /// `message` is text a program printed (OSC notification), not from agent hooks.
+    pub from_terminal: bool,
     /// The tab was on screen when it happened.
     pub visible: bool,
 }
@@ -264,7 +268,8 @@ impl AgentHub {
             if seen.notices > session.notices
                 && let Some(text) = seen.notice
             {
-                transitions.extend(session.tracker.apply(Event::Notify(text), now));
+                // Program output: keep it short (it reaches the panel and notifications).
+                transitions.extend(session.tracker.apply(Event::Notify(super::snippet(&text, NOTICE_CHARS)), now));
             }
             session.bells = seen.bells;
             session.notices = seen.notices;
@@ -441,7 +446,15 @@ fn push_alert(alerts: &mut Vec<Alert>, uid: u64, session: &mut Session, to: Agen
         return;
     }
     session.last_alert = Some(now);
-    alerts.push(Alert { uid, kind, state: to, project: session.project(), message: session.tracker.message.clone(), visible: session.visible });
+    alerts.push(Alert {
+        uid,
+        kind,
+        state: to,
+        project: session.project(),
+        message: session.tracker.message.clone(),
+        from_terminal: session.tracker.message_from_terminal,
+        visible: session.visible,
+    });
 }
 
 #[cfg(test)]

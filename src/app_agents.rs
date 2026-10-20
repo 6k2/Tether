@@ -64,6 +64,8 @@ impl TetherApp {
         }
         let title = format!("{} · {}", a.kind.name(), a.state.label());
         let body = match &a.message {
+            // Text a program printed could pose as anything: say where it came from.
+            Some(m) if a.from_terminal => format!("{}\nTerminal: {}", a.project, crate::agents::snippet(m, 160)),
             Some(m) => format!("{}\n{}", a.project, crate::agents::snippet(m, 160)),
             None => a.project.clone(),
         };

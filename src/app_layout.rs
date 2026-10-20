@@ -67,7 +67,8 @@ impl TetherApp {
                     if let (Some(tab), Some(path)) = (self.duplicate_of(uid, ctx), self.dock.find_tab_from(|t| t.uid == uid)) {
                         let new_uid = tab.uid;
                         if let Ok(leaf) = self.dock.leaf_mut(path.node_path()) {
-                            leaf.append_tab(tab);
+                            let idx = (path.tab.0 + 1).min(leaf.tabs.len());
+                            leaf.insert_tab(TabIndex(idx), tab);
                         }
                         self.show_tab(new_uid);
                     }

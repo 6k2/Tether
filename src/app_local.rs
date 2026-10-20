@@ -42,38 +42,45 @@ impl TetherApp {
         Tab::new_local(spec.clone(), self.spawn_local(spec, cwd, ctx))
     }
 
-    /// Opens `spec` (or the default shell). When a terminal is already focused, opens the
-    /// new terminal **below** the current terminal in the **same working directory**.
+    /// Opens `spec` (or the active local shell / default shell) as a full-pane session
+    /// inserted right below the currently active session in the tab order, inheriting the
+    /// active terminal's working directory (`cwd`).
     pub(super) fn open_local(&mut self, spec: Option<&'static ShellSpec>, ctx: &egui::Context) {
-        if let Some((_, active)) = self.dock.find_active_focused()
-            && active.is_terminal()
-        {
-            if let Some((active_spec, active_cwd)) = origin(active) {
-                let chosen = spec.cloned().unwrap_or(active_spec);
-                let tab = self.local_tab(&chosen, active_cwd, ctx);
-                self.split_focused(tab, egui_dock::Split::Below);
-                return;
-            }
-            if spec.is_none() {
-                self.duplicate_focused(egui_dock::Split::Below, crate::workspace::TabKind::Terminal, ctx);
-                return;
-            }
-            if let Some(chosen) = spec {
-                let tab = self.local_tab(chosen, None, ctx);
-                self.split_focused(tab, egui_dock::Split::Below);
-                return;
-            }
+        let active_origin = self.dock.find_active_focused().and_then(|(_, active)| origin(active));
+        if let Some((active_spec, active_cwd)) = active_origin {
+            let chosen = spec.cloned().unwrap_or(active_spec);
+            let tab = self.local_tab(&chosen, active_cwd, ctx);
+            self.insert_after_active(tab);
+            return;
         }
         let Some(spec) = spec.or_else(pty::shells::default_shell) else {
             self.toasts.error("No local shell was found on this machine");
             return;
         };
         let tab = self.local_tab(spec, None, ctx);
+        self.insert_after_active(tab);
+    }
+
+    /// Inserts `tab` into the focused pane immediately after the currently active tab
+    /// (so in the Sessions list it sits right below the current session even when more
+    /// sessions follow) and switches the full pane to it.
+    pub(super) fn insert_after_active(&mut self, tab: Tab) {
+        let new_uid = tab.uid;
+        if let Some(leaf_path) = self.dock.focused_leaf()
+            && let Ok(leaf) = self.dock.leaf_mut(leaf_path)
+        {
+            let idx = (leaf.active.0 + 1).min(leaf.tabs.len());
+            leaf.insert_tab(egui_dock::TabIndex(idx), tab);
+            self.show_tab(new_uid);
+            return;
+        }
         self.dock.push_to_focused_leaf(tab);
+        self.show_tab(new_uid);
     }
 
     /// Opens shells picked from panes' "+" menus in those panes, inheriting the active
-    /// local terminal's working directory when available.
+    /// local terminal's working directory when available and placing the new tab right
+    /// after the active one.
     pub(super) fn open_local_in(&mut self, picks: Vec<(egui_dock::NodePath, &'static ShellSpec)>, ctx: &egui::Context) {
         for (path, spec) in picks {
             let inherited_cwd = self
@@ -84,12 +91,14 @@ impl TetherApp {
                 .and_then(origin)
                 .and_then(|(_, cwd)| cwd);
             let tab = self.local_tab(spec, inherited_cwd, ctx);
+            let new_uid = tab.uid;
             match self.dock.leaf_mut(path) {
                 Ok(leaf) => {
-                    leaf.append_tab(tab);
-                    self.dock.set_focused_node_and_surface(path);
+                    let idx = (leaf.active.0 + 1).min(leaf.tabs.len());
+                    leaf.insert_tab(egui_dock::TabIndex(idx), tab);
+                    self.show_tab(new_uid);
                 }
-                Err(_) => self.dock.push_to_focused_leaf(tab),
+                Err(_) => self.insert_after_active(tab),
             }
         }
     }

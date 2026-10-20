@@ -807,14 +807,13 @@ fn split_shell_words(cmd: &str) -> Option<Vec<String>> {
                     if dc == '"' {
                         break;
                     }
-                    if dc == '\\' {
-                        if let Some(&next) = chars.peek()
+                    if dc == '\\'
+                        && let Some(&next) = chars.peek()
                             && matches!(next, '"' | '\\' | '$' | '`')
                         {
                             cur.push(chars.next().unwrap());
                             continue;
                         }
-                    }
                     if matches!(dc, '$' | '`') {
                         return None;
                     }

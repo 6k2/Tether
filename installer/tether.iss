@@ -65,10 +65,13 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: 
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
+; Launch through explorer.exe, which hands off to the running shell and exits. Setup runs with
+; Redirection Guard enforced and a direct child inherits it, so Tether and every terminal it opens
+; would refuse to follow junctions (pnpm's node_modules, etc.).
 ; Interactive install: the usual "Launch Tether" checkbox on the last page.
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+Filename: "{win}\explorer.exe"; Parameters: """{app}\{#AppExe}"""; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ; Silent update from inside the app: start it again.
-Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
+Filename: "{win}\explorer.exe"; Parameters: """{app}\{#AppExe}"""; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
 
 [Code]
 function ShouldRelaunch(): Boolean;

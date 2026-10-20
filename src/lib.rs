@@ -10,6 +10,7 @@ pub mod keystore;
 pub mod known_hosts;
 pub mod profile;
 pub mod remote_edit;
+pub mod repaint;
 pub mod settings;
 pub mod sftp_history;
 pub mod ssh;

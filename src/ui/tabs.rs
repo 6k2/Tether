@@ -67,9 +67,9 @@ impl Tab {
 
     fn status_color(&self) -> egui::Color32 {
         match &self.body {
-            TabBody::Terminal(t) => match t.handle.shared.lock().map(|s| s.state.clone()) {
-                Ok(LinkState::Connected) => theme::accent(),
-                Ok(LinkState::Connecting) => theme::warn(),
+            TabBody::Terminal(t) => match t.link_state() {
+                LinkState::Connected => theme::accent(),
+                LinkState::Connecting => theme::warn(),
                 _ => theme::danger(),
             },
             TabBody::Sftp(s) if s.is_ready() => theme::blue(),
@@ -144,8 +144,8 @@ impl egui_dock::TabViewer for Viewer {
             TabBody::Sftp(_) => "📁",
             TabBody::Editor(_) => "📝",
         };
-        let remote_title = match &tab.body {
-            TabBody::Terminal(t) => t.handle.shared.lock().ok().and_then(|s| s.parser.callbacks().title.clone()),
+        let remote_title = match &mut tab.body {
+            TabBody::Terminal(t) => t.remote_title(),
             TabBody::Sftp(_) => None,
             TabBody::Editor(e) => Some(if e.is_dirty() { format!("{} •", e.file_name()) } else { e.file_name().to_string() }),
         };

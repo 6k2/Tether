@@ -26,6 +26,7 @@ pub mod sftp_view;
 pub mod sidebar;
 pub mod suggest;
 pub mod tabs;
+pub mod term_grid;
 pub mod terminal_view;
 pub mod theme_preview;
 pub mod toast;

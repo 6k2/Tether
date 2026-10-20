@@ -1,13 +1,17 @@
 //! Renders a vt100 screen with egui's painter and turns input into bytes.
 //!
 //! Every visual knob (font size, line height, padding, cursor, bell, scrollbar)
-//! is read from `settings::get().terminal` each frame, so the Settings screen
+//! is read from `settings::snapshot().terminal` each frame, so the Settings screen
 //! updates open terminals live.
+//!
+//! The cell grid itself is cached row by row in [`GridCache`]; the terminal mutex is
+//! held only while rows are hashed and new ones are prepared, never while painting.
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, Event, EventFilter, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, text::LayoutJob};
+use eframe::egui::{self, Align2, CornerRadius, Event, EventFilter, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use super::keys;
 use super::loading::{self, ConnectInfo};
+use super::term_grid::{FrameKey, GridCache};
 use crate::keybindings::{self, Action};
 use crate::profile::Profile;
 use crate::settings::{self, CursorStyle, TerminalSettings};
@@ -16,6 +20,8 @@ use crate::ssh::terminal::{LinkState, TerminalHandle};
 use crate::theme;
 
 const BLINK_PERIOD: f64 = 1.1;
+/// Share of the blink period the cursor is shown.
+const BLINK_ON: f64 = 0.6;
 const BELL_FLASH_SECS: f64 = 0.45;
 const SCROLLBAR_LINGER_SECS: f64 = 1.2;
 const SCROLLBAR_WIDTH: f32 = 4.0;
@@ -62,6 +68,29 @@ pub struct TerminalView {
     prompt_col: Option<(u16, u16)>,
     /// Characters typed since the last submitted/cancelled line (fallback before echo).
     typed_line: String,
+    /// Boxed to keep `TabBody` small.
+    cache: Box<ViewCache>,
+}
+
+/// Painted rows and the last header info seen.
+struct ViewCache {
+    grid: GridCache,
+    /// Last OSC title and link state seen, for the tab header (read without blocking).
+    title: Option<String>,
+    link: LinkState,
+}
+
+/// What a frame needs from the shared terminal state, copied out under the lock.
+struct FrameInfo {
+    state: LinkState,
+    stage: Stage,
+    bells: u64,
+    history: usize,
+    app_cursor: bool,
+    bracketed: bool,
+    alt_screen: bool,
+    /// Cursor position and the glyph under it, unless the app hid the cursor.
+    cursor: Option<((u16, u16), Option<String>)>,
 }
 
 #[derive(Default)]
@@ -90,13 +119,32 @@ impl TerminalView {
             last_stage: Stage::Connecting,
             prompt_col: None,
             typed_line: String::new(),
+            cache: Box::new(ViewCache { grid: GridCache::default(), title: None, link: LinkState::Connecting }),
         }
+    }
+
+    /// Remote (OSC) window title for the tab header. Never waits on the output reader:
+    /// when it holds the lock, the last known title is returned.
+    pub fn remote_title(&mut self) -> Option<String> {
+        if let Ok(s) = self.handle.shared.try_lock() {
+            self.cache.link.clone_from(&s.state);
+            if s.parser.callbacks().title != self.cache.title {
+                self.cache.title.clone_from(&s.parser.callbacks().title);
+            }
+        }
+        self.cache.title.clone()
+    }
+
+    /// Link state as of the latest frame or [`Self::remote_title`] call.
+    pub fn link_state(&self) -> &LinkState {
+        &self.cache.link
     }
 
     pub fn ui(&mut self, ui: &mut Ui, profile: &Profile) -> ViewOutput {
         let accent = theme::hue_color(profile.hue);
         let mut out = ViewOutput::default();
-        let cfg = settings::get().terminal;
+        let settings = settings::snapshot();
+        let cfg = &settings.terminal;
         let rect = ui.available_rect_before_wrap();
         let id = ui.id().with("terminal");
         let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -123,23 +171,15 @@ impl TerminalView {
         self.apply_resize(rows, cols);
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::term_bg());
+        let palette = theme::palette();
+        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), palette.term_bg);
+        self.handle.repaint.mark_painted(ui.ctx());
 
-        let shared_arc = self.handle.shared.clone();
-        let Ok(mut shared) = shared_arc.lock() else { return out };
-        let state = shared.state.clone();
-        let stage = shared.stage;
-        let bells = shared.parser.callbacks().bell_count;
-        let screen = shared.parser.screen_mut();
-        // Probe the history length: vt100 caps the offset at what it has stored.
-        screen.set_scrollback(usize::MAX);
-        let history = screen.scrollback();
-        screen.set_scrollback(self.scroll);
-        self.scroll = screen.scrollback();
-        let screen = shared.parser.screen();
-        let app_cursor = screen.application_cursor();
-        let bracketed = screen.bracketed_paste();
-        let alt_screen = screen.alternate_screen();
+        let Some(frame) = self.sync_grid((rows, cols), &font, &palette) else { return out };
+        // Glyph layout for new rows happens with the lock released.
+        self.cache.grid.layout(ui.ctx());
+        let FrameInfo { state, stage, bells, history, app_cursor, bracketed, alt_screen, cursor } = frame;
+        self.cache.link.clone_from(&state);
 
         let to_cell = |p: Pos2| Cell {
             row: (((p.y - inner.top()) / m.cell_h).floor().max(0.0) as u16).min(rows - 1),
@@ -149,15 +189,13 @@ impl TerminalView {
         self.handle_mouse(ui, &response, to_cell, m.cell_h, (alt_screen, app_cursor), &mut out);
 
         let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
-        for row in 0..rows {
-            let y = inner.top() + row as f32 * m.cell_h;
-            paint_row(&painter, screen, row, cols, inner.left(), y, m, &font, sel);
-        }
+        self.cache.grid.paint(&painter, inner.min, m, |row| selection_cols(sel, row, cols));
 
-        if self.scroll == 0 && !screen.hide_cursor() {
-            self.paint_live_cursor(ui, &painter, screen, (inner, m, &font), &cfg, (id, focused));
+        if self.scroll == 0
+            && let Some((pos, glyph)) = &cursor
+        {
+            self.paint_live_cursor(ui, &painter, (*pos, glyph.as_deref()), (inner, m, &font), cfg, (id, focused));
         }
-        drop(shared);
 
         if response.drag_stopped()
             && cfg.copy_on_select
@@ -200,16 +238,49 @@ impl TerminalView {
         out
     }
 
+    /// Locks the terminal just long enough to clamp the scroll offset, refresh the row
+    /// cache and copy out what the rest of the frame needs. `None` if the lock is poisoned.
+    fn sync_grid(&mut self, size: (u16, u16), font: &FontId, palette: &theme::Palette) -> Option<FrameInfo> {
+        let shared_arc = self.handle.shared.clone();
+        let mut shared = shared_arc.lock().ok()?;
+        let generation = shared.generation;
+        let screen = shared.parser.screen_mut();
+        // Probe the history length (O(1)): vt100 caps the offset at what it has stored.
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        screen.set_scrollback(self.scroll);
+        self.scroll = screen.scrollback();
+        let screen = shared.parser.screen();
+        self.cache.grid.sync(FrameKey::new(generation, self.scroll, size, font), screen, palette, font);
+        let cursor = (!screen.hide_cursor()).then(|| {
+            let (cr, cc) = screen.cursor_position();
+            let glyph = screen.cell(cr, cc).filter(|c| c.has_contents()).map(|c| c.contents().to_string());
+            ((cr, cc), glyph)
+        });
+        if shared.parser.callbacks().title != self.cache.title {
+            self.cache.title.clone_from(&shared.parser.callbacks().title);
+        }
+        Some(FrameInfo {
+            state: shared.state.clone(),
+            stage: shared.stage,
+            bells: shared.parser.callbacks().bell_count,
+            history,
+            app_cursor: screen.application_cursor(),
+            bracketed: screen.bracketed_paste(),
+            alt_screen: screen.alternate_screen(),
+            cursor,
+        })
+    }
+
     fn paint_live_cursor(
         &self,
         ui: &Ui,
         painter: &egui::Painter,
-        screen: &vt100::Screen,
+        ((cr, cc), glyph): ((u16, u16), Option<&str>),
         (inner, m, font): (Rect, Metrics, &FontId),
         cfg: &TerminalSettings,
         (id, focused): (egui::Id, bool),
     ) {
-        let (cr, cc) = screen.cursor_position();
         let target = Pos2::new(inner.left() + cc as f32 * m.cell_w, inner.top() + cr as f32 * m.cell_h);
         let ctx = ui.ctx();
         let glide = theme::anim_time(0.06);
@@ -218,13 +289,15 @@ impl TerminalView {
         let cell = Rect::from_min_size(Pos2::new(x, y), Vec2::new(m.cell_w, m.cell_h));
         let t = ctx.input(|i| i.time);
         let blinking = focused && cfg.cursor_blink;
-        let visible = !blinking || ((t - self.last_activity) % BLINK_PERIOD) < BLINK_PERIOD * 0.6;
+        let phase = (t - self.last_activity).rem_euclid(BLINK_PERIOD);
+        let visible = !blinking || phase < BLINK_PERIOD * BLINK_ON;
         if visible {
-            let glyph = screen.cell(cr, cc).filter(|c| c.has_contents()).map(|c| c.contents().to_string());
-            paint_cursor(painter, cell, m.text_dy, cfg.cursor_style, focused, glyph.as_deref(), font);
+            paint_cursor(painter, cell, m.text_dy, cfg.cursor_style, focused, glyph, font);
         }
         if blinking {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            // Wake exactly at the next on/off flip instead of polling.
+            let next = if phase < BLINK_PERIOD * BLINK_ON { BLINK_PERIOD * BLINK_ON - phase } else { BLINK_PERIOD - phase };
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(next.max(0.01)));
         }
     }
 
@@ -396,7 +469,7 @@ impl TerminalView {
         }
         let (wheel, zoom, ctrl, now) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.ctrl, i.time));
         if ctrl && zoom != 1.0 {
-            let current = settings::get().terminal.font_size();
+            let current = settings::snapshot().terminal.font_size();
             self.set_font_size(current * zoom, false);
             self.font_dirty_at = Some(now);
             return;
@@ -480,7 +553,7 @@ impl TerminalView {
                             continue;
                         }
                     }
-                    let font = settings::get().terminal.font_size();
+                    let font = settings::snapshot().terminal.font_size();
                     let is = |a: Action| !keybindings::is_recording() && keybindings::binding(a).is_some_and(|b| b.matches(key, modifiers));
                     if is(Action::FontBigger) {
                         self.set_font_size(font + 1.0, true);
@@ -734,92 +807,15 @@ pub fn paint_cursor(painter: &egui::Painter, cell: Rect, text_dy: f32, style: Cu
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct Style {
-    fg: Color32,
-    bg: Option<Color32>,
-    italic: bool,
-    underline: bool,
-}
-
-fn cell_style(cell: &vt100::Cell) -> Style {
-    let mut fg = match cell.fgcolor() {
-        vt100::Color::Default => theme::term_fg(),
-        vt100::Color::Idx(i) if cell.bold() && i < 8 => theme::indexed(i + 8),
-        vt100::Color::Idx(i) => theme::indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
-    };
-    let mut bg = match cell.bgcolor() {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(i) => Some(theme::indexed(i)),
-        vt100::Color::Rgb(r, g, b) => Some(Color32::from_rgb(r, g, b)),
-    };
-    if cell.inverse() {
-        let new_bg = fg;
-        fg = bg.unwrap_or(theme::term_bg());
-        bg = Some(new_bg);
-    }
-    if cell.dim() {
-        fg = fg.gamma_multiply(0.6);
-    }
-    Style { fg, bg, italic: cell.italic(), underline: cell.underline() }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_row(painter: &egui::Painter, screen: &vt100::Screen, row: u16, cols: u16, left: f32, y: f32, m: Metrics, font: &FontId, sel: Option<(Cell, Cell)>) {
-    let Metrics { cell_w, cell_h, text_dy } = m;
-    let mut job = LayoutJob::default();
-    let mut run = String::new();
-    let mut run_style: Option<Style> = None;
-    let flush = |job: &mut LayoutJob, run: &mut String, style: Option<Style>| {
-        if let Some(s) = style.filter(|_| !run.is_empty()) {
-            let mut fmt = egui::TextFormat::simple(font.clone(), s.fg);
-            fmt.italics = s.italic;
-            if s.underline {
-                fmt.underline = Stroke::new(1.0, s.fg);
-            }
-            job.append(run, 0.0, fmt);
-            run.clear();
-        }
-    };
-
-    for col in 0..cols {
-        let Some(cell) = screen.cell(row, col) else { break };
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let style = cell_style(cell);
-        let x = left + col as f32 * cell_w;
-        let width = if cell.is_wide() { 2.0 } else { 1.0 } * cell_w;
-        if let Some(bg) = style.bg {
-            painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h)), 0.0, bg);
-        }
-        if in_selection(sel, row, col) {
-            painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell_h)), 0.0, theme::term_selection());
-        }
-        if run_style != Some(style) {
-            flush(&mut job, &mut run, run_style);
-            run_style = Some(style);
-        }
-        let text = cell.contents();
-        run.push_str(if text.is_empty() { " " } else { text });
-    }
-    flush(&mut job, &mut run, run_style);
-    if !job.sections.is_empty() {
-        job.wrap.max_width = f32::INFINITY;
-        let galley = painter.layout_job(job);
-        painter.galley(Pos2::new(left, y + text_dy), galley, theme::term_fg());
-    }
-}
-
-fn in_selection(sel: Option<(Cell, Cell)>, row: u16, col: u16) -> bool {
-    let Some((a, b)) = sel else { return false };
+/// Selected `[start, end)` columns of `row` for an ordered selection, if any.
+fn selection_cols(sel: Option<(Cell, Cell)>, row: u16, cols: u16) -> Option<(u16, u16)> {
+    let (a, b) = sel?;
     if a == b || row < a.row || row > b.row {
-        return false;
+        return None;
     }
-    let after_start = row > a.row || col >= a.col;
-    let before_end = row < b.row || col < b.col;
-    after_start && before_end
+    let start = if row == a.row { a.col } else { 0 };
+    let end = if row == b.row { b.col } else { cols };
+    (start < end).then_some((start, end))
 }
 
 /// Connecting / failed / closed overlays. Returns true when "Reconnect" is clicked.
@@ -873,35 +869,24 @@ fn state_overlay(ui: &mut Ui, rect: Rect, state: &LinkState) -> bool {
 }
 
 #[cfg(test)]
+#[path = "terminal_bench.rs"]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn selection_spans_rows() {
         let sel = Some((Cell { row: 1, col: 5 }, Cell { row: 3, col: 2 }));
-        assert!(!in_selection(sel, 1, 4));
-        assert!(in_selection(sel, 1, 5));
-        assert!(in_selection(sel, 2, 0));
-        assert!(in_selection(sel, 3, 1));
-        assert!(!in_selection(sel, 3, 2));
-        assert!(!in_selection(sel, 4, 0));
-        assert!(!in_selection(None, 1, 1));
-    }
-
-    #[test]
-    fn inverse_swaps_colors() {
-        let mut p = vt100::Parser::new(2, 10, 0);
-        p.process(b"\x1b[7mX");
-        let s = cell_style(p.screen().cell(0, 0).unwrap());
-        assert_eq!(s.fg, theme::term_bg());
-        assert_eq!(s.bg, Some(theme::term_fg()));
-    }
-
-    #[test]
-    fn bold_brightens_low_ansi() {
-        let mut p = vt100::Parser::new(2, 10, 0);
-        p.process(b"\x1b[1;31mX");
-        assert_eq!(cell_style(p.screen().cell(0, 0).unwrap()).fg, theme::ansi(9));
+        assert_eq!(selection_cols(sel, 0, 80), None);
+        assert_eq!(selection_cols(sel, 1, 80), Some((5, 80)));
+        assert_eq!(selection_cols(sel, 2, 80), Some((0, 80)));
+        assert_eq!(selection_cols(sel, 3, 80), Some((0, 2)));
+        assert_eq!(selection_cols(sel, 4, 80), None);
+        assert_eq!(selection_cols(None, 1, 80), None);
+        let empty = Some((Cell { row: 1, col: 5 }, Cell { row: 1, col: 5 }));
+        assert_eq!(selection_cols(empty, 1, 80), None);
     }
 
     #[test]

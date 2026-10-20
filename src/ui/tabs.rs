@@ -11,6 +11,7 @@ use super::sftp_view::SftpView;
 use super::terminal_view::TerminalView;
 use crate::commands::{self, AppCommand, EditorDoc};
 use crate::profile::Profile;
+use crate::pty::{self, ShellSpec};
 use crate::ssh::terminal::LinkState;
 use crate::theme;
 use crate::workspace::{TabKind, TabSpec};
@@ -31,17 +32,32 @@ pub enum TabBody {
 
 pub struct Tab {
     pub uid: u64,
+    /// The host; for a local shell, a stand-in (`pty::local_profile`) with a nil id.
     pub profile: Profile,
     pub body: TabBody,
     pub born: Option<f64>,
+    /// Set for local shells: SSH-only features (SFTP links, cwd probes, `nano` hand-off)
+    /// skip these tabs, and reconnecting respawns the shell.
+    pub local: Option<ShellSpec>,
 }
 
 impl Tab {
     pub fn new(profile: Profile, body: TabBody) -> Self {
-        Self { uid: next_uid(), profile, body, born: None }
+        Self { uid: next_uid(), profile, body, born: None, local: None }
+    }
+
+    pub fn new_local(spec: ShellSpec, view: TerminalView) -> Self {
+        Self { local: Some(spec.clone()), ..Self::new(pty::local_profile(&spec), TabBody::Terminal(view)) }
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
     }
 
     pub fn spec(&self) -> TabSpec {
+        if let Some(shell) = &self.local {
+            return TabSpec { profile_id: uuid::Uuid::nil(), kind: TabKind::Local { shell_id: shell.id.clone() } };
+        }
         let kind = match self.body {
             TabBody::Terminal(_) => TabKind::Terminal,
             // Editors are skipped by workspaces (see `is_persistable`); reporting them as
@@ -129,6 +145,8 @@ pub struct Viewer {
     pub reconnect: Vec<u64>,
     pub open_files: Vec<(u64, Vec<String>)>,
     pub focused_uid: Option<u64>,
+    /// Shells picked from a pane's "+" menu, opened in that pane.
+    pub new_local: Vec<(egui_dock::NodePath, &'static ShellSpec)>,
 }
 
 impl egui_dock::TabViewer for Viewer {
@@ -139,15 +157,20 @@ impl egui_dock::TabViewer for Viewer {
     }
 
     fn title(&mut self, tab: &mut Tab) -> WidgetText {
-        let icon = match tab.body {
-            TabBody::Terminal(_) => "⌨",
-            TabBody::Sftp(_) => "📁",
-            TabBody::Editor(_) => "📝",
+        let icon = match (&tab.body, &tab.local) {
+            (TabBody::Terminal(_), Some(shell)) => shell.icon_kind.glyph(),
+            (TabBody::Terminal(_), None) => "⌨",
+            (TabBody::Sftp(_), _) => "📁",
+            (TabBody::Editor(_), _) => "📝",
         };
-        let remote_title = match &tab.body {
-            TabBody::Terminal(t) => t.handle.shared.lock().ok().and_then(|s| s.parser.callbacks().title.clone()),
-            TabBody::Sftp(_) => None,
-            TabBody::Editor(e) => Some(if e.is_dirty() { format!("{} •", e.file_name()) } else { e.file_name().to_string() }),
+        let remote_title = match (&tab.body, &tab.local) {
+            (TabBody::Terminal(t), Some(shell)) => t.handle.shared.lock().ok().map(|s| {
+                let ev = s.parser.callbacks();
+                pty::tab_title(shell, ev.title.as_deref(), ev.cwd.as_deref())
+            }),
+            (TabBody::Terminal(t), None) => t.handle.shared.lock().ok().and_then(|s| s.parser.callbacks().title.clone()),
+            (TabBody::Sftp(_), _) => None,
+            (TabBody::Editor(e), _) => Some(if e.is_dirty() { format!("{} •", e.file_name()) } else { e.file_name().to_string() }),
         };
         let name = remote_title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| tab.profile.display_name().to_string());
         let name: String = name.chars().take(32).collect();
@@ -223,6 +246,21 @@ impl egui_dock::TabViewer for Viewer {
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
         if let TabBody::Editor(e) = &tab.body {
             response.clone().on_hover_text(format!("{}:{}", tab.profile.display_name(), e.remote_path()));
+        }
+    }
+
+    /// The pane's "+" button: every detected local shell.
+    fn add_popup(&mut self, ui: &mut Ui, path: egui_dock::NodePath) {
+        ui.set_min_width(200.0);
+        let shells = pty::shells::available();
+        if shells.is_empty() {
+            ui.label(RichText::new("No local shells found").color(theme::text_dim()));
+        }
+        for shell in shells {
+            if ui.button(format!("{}  New {}", shell.icon_kind.glyph(), shell.name)).clicked() {
+                self.new_local.push((path, shell));
+                ui.close();
+            }
         }
     }
 

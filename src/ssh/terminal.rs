@@ -89,6 +89,8 @@ pub struct TermShared {
     pub stage: Stage,
     /// When the shell channel was opened (matches the remote shell's start time).
     pub opened_at: Option<std::time::Instant>,
+    /// OS process id of a local shell (`pty::local`); `None` for SSH sessions.
+    pub pid: Option<u32>,
 }
 
 pub enum TermCmd {
@@ -100,8 +102,9 @@ pub enum TermCmd {
 #[derive(Clone)]
 pub struct TerminalHandle {
     pub shared: Arc<Mutex<TermShared>>,
-    /// Random id exported to the remote shell as `LC_TETHER_ID` so we can find its
-    /// process (and working directory) later. Hex only: safe to embed in commands.
+    /// Random id exported to the remote shell as `LC_TETHER_ID` (local shells get it as
+    /// `TETHER_SESSION`) so we can find its process (and working directory) later.
+    /// Hex only: safe to embed in commands.
     pub tag: String,
     tx: mpsc::UnboundedSender<TermCmd>,
 }
@@ -114,6 +117,7 @@ impl TerminalHandle {
             generation: 0,
             stage: Stage::Connecting,
             opened_at: None,
+            pid: None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let tag = uuid::Uuid::new_v4().simple().to_string();

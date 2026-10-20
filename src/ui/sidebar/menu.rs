@@ -8,6 +8,7 @@ use super::{OpenKind, Sidebar, SidebarAction, SidebarData, count_hosts};
 use crate::folders::Folder;
 use crate::keybindings::{self, Action};
 use crate::profile::Profile;
+use crate::pty::ShellSpec;
 use crate::theme;
 
 pub(super) const MENU_W: f32 = 236.0;
@@ -91,8 +92,24 @@ impl Sidebar {
     }
 
     /// The header's "New" dropdown.
-    pub(super) fn new_menu(&mut self, ui: &mut Ui, actions: &mut Vec<SidebarAction>) {
+    pub(super) fn new_menu(&mut self, ui: &mut Ui, shells: &[ShellSpec], actions: &mut Vec<SidebarAction>) {
         begin(ui);
+        // The default shell carries the shortcut; the rest follow in detection order.
+        let default = crate::pty::shells::pick_default(shells, &crate::settings::get().terminal.default_shell).map(|s| s.id.clone());
+        for shell in shells {
+            let label = format!("New {}", shell.name);
+            let resp = if Some(&shell.id) == default.as_ref() {
+                bound(ui, shell.icon_kind.glyph(), &label, Action::NewLocalTerminal)
+            } else {
+                item(ui, shell.icon_kind.glyph(), &label)
+            };
+            if resp.clicked() {
+                actions.push(SidebarAction::NewLocal(shell.id.clone()));
+            }
+        }
+        if !shells.is_empty() {
+            ui.separator();
+        }
         if bound(ui, "+", "New host", Action::NewHost).clicked() {
             actions.push(SidebarAction::New(None));
         }

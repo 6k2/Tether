@@ -128,6 +128,10 @@ impl TetherApp {
             }
             SidebarAction::OpenKeys => self.key_manager = Some(KeyManager::new(&self.keys)),
             SidebarAction::Import => self.import = Some(ImportDialog::new(&self.store)),
+            SidebarAction::NewLocal(id) => match crate::pty::shells::find(&id) {
+                Some(shell) => self.open_local(Some(shell), ctx),
+                None => self.toasts.error(format!("Shell “{id}” is no longer available")),
+            },
         }
     }
 

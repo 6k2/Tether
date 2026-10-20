@@ -15,6 +15,7 @@ use super::suggest;
 use crate::folders::{Folder, FolderStore};
 use crate::keybindings::{self, Action};
 use crate::profile::{Profile, ProfileStore};
+use crate::pty::ShellSpec;
 use crate::theme;
 use menu::host_menu;
 pub use paint::logo;
@@ -59,6 +60,8 @@ pub enum SidebarAction {
     SetArchiveOpen(bool),
     OpenKeys,
     Import,
+    /// Open a local shell (`pty::shells` id) in the focused pane.
+    NewLocal(String),
 }
 
 /// What is being dragged around the tree.
@@ -76,6 +79,8 @@ pub struct SidebarData<'a> {
     /// Whether any tab is open (there is a layout to save).
     pub has_tabs: bool,
     pub is_live: &'a dyn Fn(Uuid) -> bool,
+    /// Local shells offered by the "New" dropdown.
+    pub shells: &'a [ShellSpec],
 }
 
 pub struct Sidebar {
@@ -129,7 +134,7 @@ impl Sidebar {
     pub fn ui(&mut self, ui: &mut Ui, data: &SidebarData) -> Vec<SidebarAction> {
         let mut actions = Vec::new();
         ui.add_space(6.0);
-        self.title_row(ui, &mut actions);
+        self.title_row(ui, data.shells, &mut actions);
         ui.add_space(8.0);
         self.quick_connect(ui, data.store, &mut actions);
         ui.add_space(4.0);
@@ -176,7 +181,7 @@ impl Sidebar {
         self.workspaces.start_save();
     }
 
-    fn title_row(&mut self, ui: &mut Ui, actions: &mut Vec<SidebarAction>) {
+    fn title_row(&mut self, ui: &mut Ui, shells: &[ShellSpec], actions: &mut Vec<SidebarAction>) {
         ui.horizontal(|ui| {
             logo(ui, 18.0);
             ui.label(egui::RichText::new("tether").size(17.0).strong());
@@ -188,7 +193,7 @@ impl Sidebar {
                 if main.on_hover_text(keybindings::hint("New host", Action::NewHost)).clicked() {
                     actions.push(SidebarAction::New(None));
                 }
-                egui::Popup::menu(&caret).show(|ui| self.new_menu(ui, actions));
+                egui::Popup::menu(&caret).show(|ui| self.new_menu(ui, shells, actions));
             });
         });
     }

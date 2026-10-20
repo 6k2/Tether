@@ -17,14 +17,20 @@ use crate::profile::write_json_atomic;
 
 pub const LAST_SESSION: &str = "Last session";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialized as `"Terminal"`, `"Sftp"` or `{"Local":{"shell_id":"pwsh"}}`, so layouts
+/// saved before local terminals existed still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabKind {
     Terminal,
     Sftp,
+    /// A local shell (`pty::shells`); dropped on restore if that shell is gone.
+    Local { shell_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabSpec {
+    /// The host; nil for local shells.
+    #[serde(default)]
     pub profile_id: Uuid,
     pub kind: TabKind,
 }
@@ -251,8 +257,22 @@ mod tests {
     fn layout_lists_every_tab_in_order() {
         let (_, dock) = sample();
         let layout = capture(&dock, |t| Some(t.clone())).unwrap();
-        let kinds: Vec<TabKind> = layout.tabs().iter().map(|t| t.kind).collect();
+        let kinds: Vec<TabKind> = layout.tabs().iter().map(|t| t.kind.clone()).collect();
         assert_eq!(kinds, vec![TabKind::Terminal, TabKind::Terminal, TabKind::Terminal, TabKind::Sftp]);
+    }
+
+    #[test]
+    fn tab_kinds_stay_compatible_with_old_layouts() {
+        let id = Uuid::new_v4();
+        let old = format!(r#"{{"Leaf":[{{"profile_id":"{id}","kind":"Terminal"}},{{"profile_id":"{id}","kind":"Sftp"}}]}}"#);
+        let layout: Layout<TabSpec> = serde_json::from_str(&old).unwrap();
+        assert_eq!(layout, Layout::Leaf(vec![spec(id, TabKind::Terminal), spec(id, TabKind::Sftp)]));
+        let local = Layout::Leaf(vec![spec(Uuid::nil(), TabKind::Local { shell_id: "wsl:Ubuntu".into() })]);
+        let text = serde_json::to_string(&local).unwrap();
+        assert!(text.contains(r#"{"Local":{"shell_id":"wsl:Ubuntu"}}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Layout<TabSpec>>(&text).unwrap(), local);
+        let no_profile: TabSpec = serde_json::from_str(r#"{"kind":{"Local":{"shell_id":"cmd"}}}"#).unwrap();
+        assert!(no_profile.profile_id.is_nil());
     }
 
     #[test]

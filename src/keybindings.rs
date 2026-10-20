@@ -15,6 +15,7 @@ pub enum Action {
     NewFolder,
     QuickConnect,
     SearchHosts,
+    NewLocalTerminal,
     SplitRight,
     SplitDown,
     OpenSftp,
@@ -53,7 +54,7 @@ impl Group {
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::ToggleSidebar,
         Action::OpenSettings,
         Action::KeyManager,
@@ -61,6 +62,7 @@ impl Action {
         Action::NewFolder,
         Action::QuickConnect,
         Action::SearchHosts,
+        Action::NewLocalTerminal,
         Action::SplitRight,
         Action::SplitDown,
         Action::OpenSftp,
@@ -86,6 +88,7 @@ impl Action {
             Action::NewFolder => "New folder",
             Action::QuickConnect => "Quick connect",
             Action::SearchHosts => "Search hosts",
+            Action::NewLocalTerminal => "New local terminal (default shell)",
             Action::SplitRight => "New terminal, split right",
             Action::SplitDown => "New terminal, split down",
             Action::OpenSftp => "SFTP pane for the focused host",
@@ -112,9 +115,14 @@ impl Action {
             | Action::NewFolder
             | Action::QuickConnect
             | Action::SearchHosts => Group::General,
-            Action::SplitRight | Action::SplitDown | Action::OpenSftp | Action::ToggleBroadcast | Action::CloseTab | Action::NextTab | Action::PrevTab => {
-                Group::Sessions
-            }
+            Action::NewLocalTerminal
+            | Action::SplitRight
+            | Action::SplitDown
+            | Action::OpenSftp
+            | Action::ToggleBroadcast
+            | Action::CloseTab
+            | Action::NextTab
+            | Action::PrevTab => Group::Sessions,
             Action::FontBigger | Action::FontSmaller | Action::FontReset => Group::Terminal,
             Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => Group::Sftp,
         }
@@ -132,6 +140,7 @@ impl Action {
             Action::NewFolder => None,
             Action::QuickConnect => cs(Key::L),
             Action::SearchHosts => cs(Key::P),
+            Action::NewLocalTerminal => cs(Key::T),
             Action::SplitRight => cs(Key::D),
             Action::SplitDown => cs(Key::E),
             Action::OpenSftp => cs(Key::F),

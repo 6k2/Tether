@@ -66,6 +66,8 @@ pub struct TerminalSettings {
     pub visual_bell: bool,
     /// Thin overlay scrollbar that fades in while scrolling through history.
     pub scrollbar: bool,
+    /// Shell id (`pty::shells`) opened by "New terminal"; empty = the first one found.
+    pub default_shell: String,
 }
 
 impl TerminalSettings {
@@ -111,6 +113,7 @@ impl Default for TerminalSettings {
             copy_on_select: false,
             visual_bell: true,
             scrollbar: true,
+            default_shell: String::new(),
         }
     }
 }

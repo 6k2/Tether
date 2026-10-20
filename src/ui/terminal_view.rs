@@ -62,6 +62,8 @@ pub struct TerminalView {
     prompt_col: Option<(u16, u16)>,
     /// Characters typed since the last submitted/cancelled line (fallback before echo).
     typed_line: String,
+    /// Hand `nano <file>` to the built-in SFTP editor (off for local shells).
+    pub intercept_nano: bool,
 }
 
 #[derive(Default)]
@@ -90,6 +92,7 @@ impl TerminalView {
             last_stage: Stage::Connecting,
             prompt_col: None,
             typed_line: String::new(),
+            intercept_nano: true,
         }
     }
 
@@ -473,7 +476,7 @@ impl TerminalView {
                         self.prompt_col = None;
                         self.typed_line.clear();
                     } else if key == egui::Key::Enter && !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command {
-                        if let Some(files) = self.take_nano_command() {
+                        if let Some(files) = self.take_nano_command().filter(|_| self.intercept_nano) {
                             // Cancel the typed command line in the remote shell and open the file(s) in Tether's editor.
                             out.input.push(0x03);
                             out.open_files.extend(files);

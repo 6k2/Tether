@@ -220,6 +220,18 @@ fn terminal(ui: &mut Ui, s: &mut Settings, st: &mut SectionState, now: f64) {
             }
         });
     });
+    ui.add_space(CARD_GAP);
+    w::card(ui, Some("Local shell"), |ui| {
+        w::row(ui, "Default shell", "Used by “New local terminal” and the welcome screen", |ui| {
+            let shells = crate::pty::shells::available();
+            let current = crate::pty::shells::pick_default(shells, &t.default_shell).map_or("None found", |s| s.name.as_str());
+            egui::ComboBox::from_id_salt("default_shell").selected_text(current).show_ui(ui, |ui| {
+                for shell in shells {
+                    ui.selectable_value(&mut t.default_shell, shell.id.clone(), &shell.name);
+                }
+            });
+        });
+    });
 }
 
 /// Coloured text runs for the preview: (ANSI index or `None` for the default fg, text).

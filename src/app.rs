@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 #[path = "app_actions.rs"]
 mod actions;
+#[path = "app_local.rs"]
+mod local;
 
 use crate::folders::FolderStore;
 use crate::keybindings::{self, Action};
@@ -88,6 +90,7 @@ impl TetherApp {
         crate::settings::init(dir.join("settings.json"));
         crate::themes::apply_saved(&cc.egui_ctx);
         crate::updater::check_on_startup(&cc.egui_ctx);
+        crate::pty::shells::warm_up();
         let toasts = Toasts::default();
         let mut store = ProfileStore::load(dir.join("profiles.json")).unwrap_or_else(|e| {
             toasts.error(format!("Could not read profiles: {e:#}"));
@@ -227,6 +230,10 @@ impl TetherApp {
     }
 
     fn reconnect(&mut self, uid: u64, secret_override: Option<String>, ctx: &egui::Context) {
+        if self.all_tabs().any(|t| t.uid == uid && t.is_local()) {
+            self.respawn_local(uid, ctx);
+            return;
+        }
         let Some((profile, is_terminal)) = self.all_tabs().find(|t| t.uid == uid).map(|t| (t.profile.clone(), matches!(t.body, TabBody::Terminal(_)))) else {
             return;
         };
@@ -251,11 +258,19 @@ impl TetherApp {
 
     fn duplicate_focused(&mut self, split: Split, kind: TabKind, ctx: &egui::Context) {
         let Some((_, tab)) = self.dock.find_active_focused() else { return };
+        if let Some((spec, cwd)) = local::origin(tab) {
+            // A local shell has no files pane; splits run the same shell again.
+            if kind == TabKind::Terminal {
+                let tab = self.local_tab(&spec, cwd, ctx);
+                self.split_focused(tab, split);
+            }
+            return;
+        }
         let profile = tab.profile.clone();
         let secret = secret::get(profile.secret_id());
         let tab = match kind {
-            TabKind::Terminal => self.terminal_tab(&profile, secret, ctx),
             TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
+            TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
         };
         self.split_focused(tab, split);
     }
@@ -330,10 +345,14 @@ impl TetherApp {
                 let tabs = self.workspaces.get(&name)?.tabs();
                 let mut hosts: Vec<String> = Vec::new();
                 for spec in &tabs {
-                    if let Some(p) = self.store.get(spec.profile_id)
-                        && !hosts.iter().any(|h| h == p.display_name())
+                    let name = match &spec.kind {
+                        TabKind::Local { shell_id } => crate::pty::shells::find(shell_id).map(|s| s.name.clone()),
+                        _ => self.store.get(spec.profile_id).map(|p| p.display_name().to_string()),
+                    };
+                    if let Some(name) = name
+                        && !hosts.contains(&name)
                     {
-                        hosts.push(p.display_name().to_string());
+                        hosts.push(name);
                     }
                 }
                 Some(WorkspaceInfo { name, tabs: tabs.len(), hosts })
@@ -344,11 +363,14 @@ impl TetherApp {
     fn restore_workspace(&mut self, name: &str, ctx: &egui::Context) {
         let Some(layout) = self.workspaces.get(name).cloned() else { return };
         let restored = workspace::rebuild(&layout, &mut |spec| {
+            if let TabKind::Local { shell_id } = &spec.kind {
+                return crate::pty::shells::find(shell_id).map(|shell| self.local_tab(shell, None, ctx));
+            }
             let profile = self.store.get(spec.profile_id)?.clone();
             let secret = secret::get(profile.secret_id());
             Some(match spec.kind {
-                TabKind::Terminal => self.terminal_tab(&profile, secret, ctx),
                 TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
+                TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
             })
         });
         for (_, tab) in self.dock.iter_all_tabs() {
@@ -375,7 +397,8 @@ impl TetherApp {
             }
             self.last_layout = layout;
         }
-        let in_use: HashSet<Uuid> = self.last_layout.iter().map(|(id, _)| *id).collect();
+        // Local shells (nil id) hold no pooled connection.
+        let in_use: HashSet<Uuid> = self.last_layout.iter().map(|(id, _)| *id).filter(|id| !id.is_nil()).collect();
         if let Ok(mut shared) = self.in_use.lock() {
             shared.clone_from(&in_use);
         }
@@ -413,6 +436,9 @@ impl TetherApp {
         if pressed(Action::SearchHosts) {
             self.sidebar_open = true;
             self.sidebar.focus_search();
+        }
+        if pressed(Action::NewLocalTerminal) {
+            self.open_local(None, ctx);
         }
         if pressed(Action::ToggleBroadcast) {
             self.broadcast = !self.broadcast;
@@ -495,7 +521,8 @@ impl TetherApp {
         let pool = self.pool.clone();
         let is_live = move |id| pool.has_live(id);
         let has_tabs = self.layout_specs().is_some();
-        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live };
+        let shells = crate::pty::shells::available();
+        let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live, shells };
         let sidebar = &mut self.sidebar;
         let actions = egui::Panel::left("sidebar")
             .resizable(true)
@@ -525,10 +552,13 @@ impl TetherApp {
                 .style(style)
                 // Floating windows may leave the app: `Detacher` turns them into native windows.
                 .window_bounds(crate::ui::detach_geom::floating_bounds(ui.ctx().content_rect()))
-                .show_add_buttons(false)
+                // Each pane's "+" lists the local shells (`Viewer::add_popup`).
+                .show_add_buttons(true)
+                .show_add_popup(true)
                 .show_leaf_collapse_buttons(false)
                 .show_leaf_close_all_buttons(false)
                 .show_inside(ui, &mut viewer);
+            self.open_local_in(std::mem::take(&mut viewer.new_local), ui.ctx());
             if viewer.focused_uid.is_some() {
                 self.focused_terminal = viewer.focused_uid;
             }
@@ -556,8 +586,9 @@ impl TetherApp {
 
     /// Opens files requested from a terminal (`nano <file>`) in the built-in editor.
     fn open_terminal_files(&mut self, uid: u64, files: Vec<String>, ctx: &egui::Context) {
+        // Local shells edit files with their own tools: only remote ones go through SFTP.
         let Some((profile, handle)) = self.all_tabs().find_map(|t| match &t.body {
-            TabBody::Terminal(term) if t.uid == uid => Some((t.profile.clone(), term.handle.clone())),
+            TabBody::Terminal(term) if t.uid == uid && !t.is_local() => Some((t.profile.clone(), term.handle.clone())),
             _ => None,
         }) else {
             return;
@@ -635,8 +666,25 @@ impl TetherApp {
             ui.add_space(ui.available_height() * 0.22);
             crate::ui::sidebar::logo(ui, 56.0);
             ui.label(RichText::new("tether").size(28.0).strong());
-            ui.label(RichText::new("SSH terminals and pipelined SFTP, side by side.").color(theme::text_dim()));
+            ui.label(RichText::new("Local and SSH terminals, pipelined SFTP, side by side.").color(theme::text_dim()));
             ui.add_space(22.0);
+            let mut shell = None;
+            if let Some(default) = crate::pty::shells::default_shell() {
+                let text = RichText::new(format!("{}  New {}", default.icon_kind.glyph(), default.name)).size(13.0);
+                let hint = keybindings::hint("Local terminal", Action::NewLocalTerminal);
+                if ui.add(egui::Button::new(text).min_size(egui::vec2(320.0, 34.0)).fill(theme::accent_soft())).on_hover_text(hint).clicked() {
+                    shell = Some(default);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(320.0);
+                    for s in crate::pty::shells::available().iter().filter(|s| s.id != default.id) {
+                        if ui.add(egui::Button::new(RichText::new(&s.name).size(11.5)).frame(false)).clicked() {
+                            shell = Some(s);
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
             let mut recent: Vec<&Profile> = self.store.profiles.iter().filter(|p| p.last_used > 0 && !p.archived).collect();
             recent.sort_by_key(|p| std::cmp::Reverse(p.last_used));
             let mut open = None;
@@ -656,6 +704,9 @@ impl TetherApp {
             ui.label(RichText::new("Drag tabs to split · drop files onto a remote pane to upload").size(11.5).color(theme::text_faint()));
             if let Some(p) = open {
                 self.request_open(p, OpenKind::Terminal, ui.ctx());
+            }
+            if let Some(s) = shell {
+                self.open_local(Some(s), ui.ctx());
             }
         });
     }
@@ -803,7 +854,9 @@ fn link_terminals(docks: &mut [&mut DockState<Tab>], focused: Option<u64>) {
     for (d, dock) in docks.iter().enumerate() {
         for (path, leaf) in dock.iter_leaves() {
             for (i, tab) in leaf.tabs.iter().enumerate() {
-                if let TabBody::Terminal(t) = &tab.body {
+                if let TabBody::Terminal(t) = &tab.body
+                    && !tab.is_local()
+                {
                     terms.push(TermRef { uid: tab.uid, dock: d, leaf: path, visible: i == leaf.active.0, profile: tab.profile.id, handle: t.handle.clone() });
                 }
             }

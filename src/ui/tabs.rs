@@ -28,7 +28,7 @@ pub fn next_uid() -> u64 {
 }
 
 pub enum TabBody {
-    Terminal(TerminalView),
+    Terminal(Box<TerminalView>),
     Sftp(Box<SftpView>),
     /// A remote file open in the built-in editor. Not saved in workspaces.
     Editor(Box<EditorView>),
@@ -76,7 +76,7 @@ impl Tab {
     }
 
     pub fn new_local(spec: ShellSpec, view: TerminalView) -> Self {
-        Self { local: Some(spec.clone()), ..Self::new(pty::local_profile(&spec), TabBody::Terminal(view)) }
+        Self { local: Some(spec.clone()), ..Self::new(pty::local_profile(&spec), TabBody::Terminal(Box::new(view))) }
     }
 
     pub fn is_local(&self) -> bool {
@@ -92,13 +92,7 @@ impl Tab {
         {
             return Some(cwd);
         }
-        let osc_cwd = t
-            .handle
-            .shared
-            .try_lock()
-            .ok()
-            .and_then(|s| s.parser.callbacks().cwd.clone())
-            .or_else(|| t.remote_cwd().map(str::to_string));
+        let osc_cwd = t.handle.shared.try_lock().ok().and_then(|s| s.parser.callbacks().cwd.clone()).or_else(|| t.remote_cwd().map(str::to_string));
         if osc_cwd.is_some() {
             return osc_cwd;
         }
@@ -113,11 +107,7 @@ impl Tab {
     pub fn spec(&self) -> TabSpec {
         let cwd = self.current_cwd();
         if let Some(shell) = &self.local {
-            return TabSpec {
-                title: self.custom_title.clone(),
-                cwd,
-                ..TabSpec::new(uuid::Uuid::nil(), TabKind::Local { shell_id: shell.id.clone() })
-            };
+            return TabSpec { title: self.custom_title.clone(), cwd, ..TabSpec::new(uuid::Uuid::nil(), TabKind::Local { shell_id: shell.id.clone() }) };
         }
         let kind = match self.body {
             TabBody::Terminal(_) => TabKind::Terminal,
@@ -182,7 +172,9 @@ impl Tab {
                 // The agent's own folder (from its hooks) names the project best.
                 let agent_cwd = agent.and_then(|_| crate::agents::hub::agent_cwd(self.uid));
                 let title_cwd = agent_cwd.as_deref().or(cwd);
-                return crate::agents::title::tab_title(self.custom_title.as_deref(), agent, title.as_deref(), title_cwd, |raw| pty::tab_title(shell, raw, cwd));
+                return crate::agents::title::tab_title(self.custom_title.as_deref(), agent, title.as_deref(), title_cwd, |raw| {
+                    pty::tab_title(shell, raw, cwd)
+                });
             }
             (TabBody::Terminal(t), None) => t.remote_title(),
             (TabBody::Sftp(_), _) => None,
@@ -442,7 +434,8 @@ impl Viewer {
 fn agent_title(name: &str, kind: AgentKind, state: Option<AgentState>, uid: u64) -> AgentTitle {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
-    let format = |size: f32, color: egui::Color32| TextFormat { font_id: egui::FontId::proportional(size), color, valign: egui::Align::Center, ..Default::default() };
+    let format =
+        |size: f32, color: egui::Color32| TextFormat { font_id: egui::FontId::proportional(size), color, valign: egui::Align::Center, ..Default::default() };
     job.append(name, ICON_SLOT, format(12.5, egui::Color32::PLACEHOLDER));
     let mut pill = None;
     if let Some(state) = state
@@ -476,11 +469,7 @@ impl egui_dock::TabViewer for Viewer {
         }
         let icon = tab.icon();
         agent_badge::append_title_mark(&mut job, tab.uid, tab.status_color(), self.time);
-        let label = if tab.linked_sftp.is_some() {
-            format!("{icon}  {name}  · 📁")
-        } else {
-            format!("{icon}  {name}")
-        };
+        let label = if tab.linked_sftp.is_some() { format!("{icon}  {name}  · 📁") } else { format!("{icon}  {name}") };
         RichText::new(label).size(12.5).append_to(&mut job, &egui::Style::default(), egui::FontSelection::Default, egui::Align::Center);
         if tab.is_local() {
             usage_chip::append_to_title(&mut job, tab.uid, HOVERED_TAB.load(Ordering::Relaxed) == tab.uid);
@@ -506,9 +495,7 @@ impl egui_dock::TabViewer for Viewer {
         match &mut tab.body {
             TabBody::Terminal(view) => {
                 if is_local {
-                    if let Some(cwd) = crate::agents::hub::agent_cwd(tab_uid)
-                        .or_else(|| crate::procmon::usage_for(tab_uid).and_then(|u| u.cwd.clone()))
-                    {
+                    if let Some(cwd) = crate::agents::hub::agent_cwd(tab_uid).or_else(|| crate::procmon::usage_for(tab_uid).and_then(|u| u.cwd.clone())) {
                         view.fallback_cwd = Some(cwd);
                     }
                 } else {
@@ -553,11 +540,7 @@ impl egui_dock::TabViewer for Viewer {
                     {
                         linked.split_fraction = ((pos.x - avail.left()) / avail.width().max(1.0)).clamp(0.2, 0.8);
                     }
-                    let sep_col = if sep_resp.hovered() || sep_resp.dragged() {
-                        theme::accent()
-                    } else {
-                        theme::border().gamma_multiply(0.55)
-                    };
+                    let sep_col = if sep_resp.hovered() || sep_resp.dragged() { theme::accent() } else { theme::border().gamma_multiply(0.55) };
                     ui.painter().vline(sep_rect.center().x, sep_rect.y_range(), egui::Stroke::new(1.5, sep_col));
 
                     // 3. Linked SFTP on the right (with draggable header to separate/minimize/close)
@@ -569,15 +552,7 @@ impl egui_dock::TabViewer for Viewer {
                     let mut detach_linked = None;
                     let mut minimize_linked = false;
 
-                    paint_linked_sftp_header(
-                        ui,
-                        tab_uid,
-                        &profile,
-                        header_rect,
-                        &mut close_linked,
-                        &mut detach_linked,
-                        &mut minimize_linked,
-                    );
+                    paint_linked_sftp_header(ui, tab_uid, &profile, header_rect, &mut close_linked, &mut detach_linked, &mut minimize_linked);
 
                     let mut sftp_ui = ui.new_child(egui::UiBuilder::new().max_rect(sftp_body_rect).id_salt(("linked_sftp", tab_uid)));
                     sftp_ui.set_clip_rect(sftp_body_rect.intersect(ui.clip_rect()));
@@ -741,9 +716,7 @@ fn paint_linked_sftp_header(
     let buttons_w = 72.0;
     let drag_rect = egui::Rect::from_min_max(rect.min, egui::pos2((rect.right() - buttons_w).max(rect.left() + 20.0), rect.bottom()));
     let drag_id = ui.id().with(("linked_sftp_hdr_drag", tab_uid));
-    let drag_resp = ui
-        .interact(drag_rect, drag_id, egui::Sense::click_and_drag())
-        .on_hover_text("Linked SFTP · Drag to separate into an independent window");
+    let drag_resp = ui.interact(drag_rect, drag_id, egui::Sense::click_and_drag()).on_hover_text("Linked SFTP · Drag to separate into an independent window");
     if drag_resp.hovered() || drag_resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
@@ -758,11 +731,7 @@ fn paint_linked_sftp_header(
     let label = format!("📁  SFTP · {}", profile.display_name());
     let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.5), theme::text());
     ui.painter().circle_filled(egui::pos2(rect.left() + 10.0, rect.center().y), 3.0, tint);
-    ui.painter().galley(
-        egui::pos2(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5),
-        galley,
-        theme::text(),
-    );
+    ui.painter().galley(egui::pos2(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5), galley, theme::text());
 
     // Header buttons: Minimize (`—`), Separate/Pop-out (`🗗`), Close (`✕`)
     let btn_size = egui::vec2(20.0, 18.0);

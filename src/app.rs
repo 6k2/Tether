@@ -19,10 +19,10 @@ mod chrome;
 mod layout_ui;
 #[path = "app_local.rs"]
 mod local;
-#[path = "app_views.rs"]
-mod views_ui;
 #[path = "app_palette.rs"]
 mod palette_ui;
+#[path = "app_views.rs"]
+mod views_ui;
 
 use crate::folders::FolderStore;
 use crate::keybindings::{self, Action};
@@ -37,14 +37,14 @@ use crate::ui::detach::Detacher;
 use crate::ui::editor::ProfileEditor;
 use crate::ui::import_view::{ImportDialog, ImportOutcome};
 use crate::ui::key_manager::KeyManager;
+use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 use crate::ui::sftp_view::SftpView;
-use crate::ui::palette::Palette;
 use crate::ui::sidebar::{OpenKind, Sidebar, WorkspaceInfo};
 use crate::ui::tabs::{Tab, TabBody, Viewer};
-use crate::ui::vertical_tabs::VerticalTabs;
 use crate::ui::terminal_view::TerminalView;
 use crate::ui::toast::Toasts;
+use crate::ui::vertical_tabs::VerticalTabs;
 use crate::workspace::{self, LAST_SESSION, TabKind, Workspaces};
 
 /// Password / passphrase asked before connecting (nothing stored, no live connection).
@@ -212,10 +212,7 @@ impl TetherApp {
             }
             OpenKind::Sftp => {
                 let can_attach = self.dock.find_active_focused().is_some_and(|(_, active)| {
-                    !active.is_local()
-                        && active.profile.id == profile.id
-                        && matches!(active.body, TabBody::Terminal(_))
-                        && active.linked_sftp.is_none()
+                    !active.is_local() && active.profile.id == profile.id && matches!(active.body, TabBody::Terminal(_)) && active.linked_sftp.is_none()
                 });
                 if can_attach {
                     let view = self.spawn_sftp(&profile, secret, ctx);
@@ -279,7 +276,7 @@ impl TetherApp {
     }
 
     fn terminal_tab(&self, profile: &Profile, secret: Option<String>, ctx: &egui::Context) -> Tab {
-        Tab::new(profile.clone(), TabBody::Terminal(self.spawn_terminal(profile, secret, ctx)))
+        Tab::new(profile.clone(), TabBody::Terminal(Box::new(self.spawn_terminal(profile, secret, ctx))))
     }
 
     fn sftp_tab(&self, profile: &Profile, secret: Option<String>, ctx: &egui::Context) -> Tab {
@@ -331,20 +328,14 @@ impl TetherApp {
         }
         let secret = secret_override.or_else(|| secret::get(profile.secret_id()));
         let new_view = is_terminal.then(|| self.spawn_terminal(&profile, secret.clone(), ctx));
-        let Some(tab) = self
-            .dock
-            .iter_all_tabs_mut()
-            .map(|(_, t)| t)
-            .chain(self.detached.tabs_mut())
-            .chain(self.mini_dock.tabs_mut())
-            .find(|t| t.uid == uid)
+        let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).chain(self.mini_dock.tabs_mut()).find(|t| t.uid == uid)
         else {
             return;
         };
         tab.profile = profile;
         match (&mut tab.body, new_view) {
             (TabBody::Terminal(view), Some(v)) => {
-                *view = v;
+                **view = v;
                 if let Some(linked) = &mut tab.linked_sftp {
                     linked.view.profile = tab.profile.clone();
                     linked.view.connect(self.pool.clone(), secret, self.toasts.clone());
@@ -657,11 +648,7 @@ impl TetherApp {
     /// away to another terminal hides the right-hand SFTP automatically.
     fn absorb_same_server_sftp_splits(&mut self) {
         let mut pairs: Vec<(u64, u64)> = Vec::new();
-        let leaves: Vec<_> = self
-            .dock
-            .iter_leaves()
-            .filter(|(p, l)| p.surface.is_main() && !l.tabs.is_empty())
-            .collect();
+        let leaves: Vec<_> = self.dock.iter_leaves().filter(|(p, l)| p.surface.is_main() && !l.tabs.is_empty()).collect();
         if leaves.len() < 2 {
             return;
         }
@@ -829,7 +816,7 @@ impl TetherApp {
             let r = ui.add(egui::TextEdit::singleline(&mut prompt.secret).password(true).desired_width(f32::INFINITY));
             r.request_focus();
             submit |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ui.checkbox(&mut prompt.remember, "Remember in Windows Credential Manager");
+            ui.checkbox(&mut prompt.remember, format!("Remember in {}", crate::platform::credential_store()));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 submit |= ui.add(egui::Button::new("Connect").fill(theme::accent_soft())).clicked();
@@ -1010,4 +997,3 @@ fn is_no_such_file(err: &anyhow::Error) -> bool {
         )
     })
 }
-

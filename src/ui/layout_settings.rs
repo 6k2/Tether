@@ -5,7 +5,7 @@
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use super::activity::{forget_sizes, paint_view_icon};
+use super::activity::forget_sizes;
 use super::settings_widgets::{self as w, Icon, SliderSpec, paint_icon};
 use crate::keybindings::{self, Action};
 use crate::layout::{BarOrientation, Container, ContainerState, LayoutSettings, Side, TabPosition, View};
@@ -92,27 +92,21 @@ pub fn show(ui: &mut Ui, s: &mut Settings, gap: f32) {
 /// Icon, name and a location picker for one view.
 fn view_row(ui: &mut Ui, l: &mut LayoutSettings, v: View) {
     let place = l.views.container_of(v).map_or(Place::Hidden, Place::In);
-    ui.horizontal(|ui| {
-        ui.set_min_height(40.0);
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-        paint_view_icon(ui.painter(), r.shrink(3.0), v, theme::text_dim());
-        ui.label(egui::RichText::new(v.title()).size(13.5).color(theme::text()));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut pick = place;
-            let options = [
-                (Place::In(Container::Primary), "Primary"),
-                (Place::In(Container::Secondary), "Secondary"),
-                (Place::In(Container::Panel), "Panel"),
-                (Place::Hidden, "Hidden"),
-            ];
-            w::segmented(ui, &mut pick, &options);
-            if pick != place {
-                match pick {
-                    Place::Hidden => l.views.hide(v),
-                    Place::In(c) => l.views.move_view(v, c, None),
-                }
+    w::row(ui, v.title(), "", |ui| {
+        let mut pick = place;
+        let options = [
+            (Place::In(Container::Primary), "Primary"),
+            (Place::In(Container::Secondary), "Secondary"),
+            (Place::In(Container::Panel), "Panel"),
+            (Place::Hidden, "Hidden"),
+        ];
+        w::segmented(ui, &mut pick, &options);
+        if pick != place {
+            match pick {
+                Place::Hidden => l.views.hide(v),
+                Place::In(c) => l.views.move_view(v, c, None),
             }
-        });
+        }
     });
 }
 

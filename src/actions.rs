@@ -40,7 +40,11 @@ pub enum Command {
     /// The "Import hosts" dialog (Bitvise, SSH config).
     ImportHosts,
     /// Start an AI agent CLI in a new default shell.
-    LaunchAgent { kind: crate::agents::AgentKind, command: &'static str, pick_folder: bool },
+    LaunchAgent {
+        kind: crate::agents::AgentKind,
+        command: &'static str,
+        pick_folder: bool,
+    },
     /// Anything else: runs on the UI thread when chosen.
     Run(Arc<dyn Fn(&egui::Context) + Send + Sync>),
 }
@@ -241,7 +245,8 @@ pub fn fuzzy_match(needle: &str, hay: &str) -> Option<(i32, Vec<usize>)> {
     let lower_str: String = lower.iter().collect();
     let substring_at = lower_str.find(&needle_str).map(|byte| lower_str[..byte].chars().count());
 
-    let word_start = |i: usize| i == 0 || matches!(h[i - 1], ' ' | '-' | '_' | '/' | '\\' | '.' | ':' | '·' | '(') || (h[i - 1].is_lowercase() && h[i].is_uppercase());
+    let word_start =
+        |i: usize| i == 0 || matches!(h[i - 1], ' ' | '-' | '_' | '/' | '\\' | '.' | ':' | '·' | '(') || (h[i - 1].is_lowercase() && h[i].is_uppercase());
 
     // Greedy forward pass, preferring word starts: for each needle char take the next
     // word-start occurrence if one comes before the next plain occurrence's run ends.
@@ -358,7 +363,7 @@ mod tests {
     fn action_entries_carry_their_shortcut() {
         let e = Entry::action("Pane", Action::SplitRight);
         assert_eq!(e.title, Action::SplitRight.title());
-        assert_eq!(e.keys.as_deref(), Some("Ctrl+Shift+D"));
+        assert_eq!(e.keys, Some(Action::SplitRight.default_binding().unwrap().label()));
         assert!(Entry::action("Pane", Action::MoveSidebar).keys.is_none());
         let mut r = Registry::default();
         r.add(Entry::action("Pane", Action::ZoomPane));

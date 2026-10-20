@@ -5,3 +5,4 @@
 /installer/Output
 .claude/
 /target-agents
+/dist

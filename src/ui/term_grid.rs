@@ -18,11 +18,26 @@ use eframe::egui::{self, Color32, FontId, Galley, Pos2, Rect, Stroke, Vec2, text
 use super::terminal_view::Metrics;
 use crate::theme::{self, Palette};
 
+/// What laid-out galleys depend on in the context: the loaded fonts and the scale they
+/// were rasterised at (UI scale setting, moving to a monitor with another DPI).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderKey {
+    pub fonts: u64,
+    pub pixels_per_point: f32,
+}
+
+impl RenderKey {
+    pub fn of(ctx: &egui::Context) -> Self {
+        Self { fonts: crate::fonts::version(ctx), pixels_per_point: ctx.pixels_per_point() }
+    }
+}
+
 /// Everything a cached row's pixels depend on besides its cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StyleKey {
     palette: u64,
     font_size: f32,
+    render: RenderKey,
 }
 
 /// Inputs of a whole frame; when unchanged the previous frame's rows are reused as is.
@@ -33,15 +48,16 @@ pub struct FrameKey {
     pub size: (u16, u16),
     palette: u64,
     font_size: f32,
+    render: RenderKey,
 }
 
 impl FrameKey {
-    pub fn new(generation: u64, scroll: usize, size: (u16, u16), font: &FontId) -> Self {
-        Self { generation, scroll, size, palette: theme::palette_version(), font_size: font.size }
+    pub fn new(generation: u64, scroll: usize, size: (u16, u16), font: &FontId, render: RenderKey) -> Self {
+        Self { generation, scroll, size, palette: theme::palette_version(), font_size: font.size, render }
     }
 
     fn style(&self) -> StyleKey {
-        StyleKey { palette: self.palette, font_size: self.font_size }
+        StyleKey { palette: self.palette, font_size: self.font_size, render: self.render }
     }
 }
 
@@ -362,25 +378,35 @@ mod tests {
         let font = FontId::monospace(12.0);
         let pal = Palette::TETHER_NIGHT;
         let mut cache = GridCache::default();
+        let r = RenderKey { fonts: 0, pixels_per_point: 1.0 };
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            cache.sync(FrameKey::new(1, 0, (3, 10), &font), p.screen(), &pal, &font);
+            cache.sync(FrameKey::new(1, 0, (3, 10), &font, r), p.screen(), &pal, &font);
             assert_eq!(cache.pending.len(), 3);
             cache.layout(ui.ctx());
             assert!(cache.rows.iter().all(|(_, r)| r.galley.is_some()));
             let first = cache.rows[1].1.clone();
             // Same key: nothing to do.
-            cache.sync(FrameKey::new(1, 0, (3, 10), &font), p.screen(), &pal, &font);
+            cache.sync(FrameKey::new(1, 0, (3, 10), &font, r), p.screen(), &pal, &font);
             assert!(cache.pending.is_empty());
             // Scroll one line: "two" moves up and is reused, only the new last row is built.
             p.process(b"\r\nfour");
-            cache.sync(FrameKey::new(2, 0, (3, 10), &font), p.screen(), &pal, &font);
+            cache.sync(FrameKey::new(2, 0, (3, 10), &font, r), p.screen(), &pal, &font);
             assert_eq!(cache.pending.len(), 1);
             cache.layout(ui.ctx());
             assert!(Arc::ptr_eq(&cache.rows[0].1, &first));
             // A palette change rebuilds everything.
-            let mut key = FrameKey::new(2, 0, (3, 10), &font);
+            let mut key = FrameKey::new(2, 0, (3, 10), &font, r);
             key.palette += 1;
             cache.sync(key, p.screen(), &pal, &font);
+            assert_eq!(cache.pending.len(), 3);
+            cache.layout(ui.ctx());
+            // So do new fonts and a new scale: old galleys would be garbled or blurry.
+            let fonts = RenderKey { fonts: 1, ..r };
+            cache.sync(FrameKey::new(2, 0, (3, 10), &font, fonts), p.screen(), &pal, &font);
+            assert_eq!(cache.pending.len(), 3);
+            cache.layout(ui.ctx());
+            let scaled = RenderKey { pixels_per_point: 1.5, ..fonts };
+            cache.sync(FrameKey::new(2, 0, (3, 10), &font, scaled), p.screen(), &pal, &font);
             assert_eq!(cache.pending.len(), 3);
         });
         out.textures_delta.clear();

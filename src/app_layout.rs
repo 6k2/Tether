@@ -176,7 +176,7 @@ impl TetherApp {
         let pool = self.pool.clone();
         let is_live = move |id| pool.has_live(id);
         let has_tabs = self.layout_specs().is_some();
-        let shells = crate::pty::shells::available();
+        let shells = crate::pty::shells::detected().unwrap_or_default();
         let data = SidebarData { store: &self.store, folders: &self.folders, workspaces: &workspaces, has_tabs, is_live: &is_live, shells };
         let sessions = self.agents.sessions();
         let mut host = Host {
@@ -187,7 +187,7 @@ impl TetherApp {
             opts: list_options(l),
             actions: Vec::new(),
             tab_actions: Vec::new(),
-            agents: &sessions,
+            agents: sessions,
             agent_action: None,
         };
         let mut visible = l.sidebar_visible;

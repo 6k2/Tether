@@ -382,7 +382,10 @@ impl egui_dock::TabViewer for Viewer {
     /// The pane's "+" button: every detected local shell.
     fn add_popup(&mut self, ui: &mut Ui, path: egui_dock::NodePath) {
         ui.set_min_width(200.0);
-        let shells = pty::shells::available();
+        let Some(shells) = pty::shells::detected() else {
+            ui.label(RichText::new(pty::shells::DETECTING).color(theme::text_dim()));
+            return;
+        };
         if shells.is_empty() {
             ui.label(RichText::new("No local shells found").color(theme::text_dim()));
         }

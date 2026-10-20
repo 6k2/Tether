@@ -17,11 +17,11 @@ use crate::ui::agents_panel::{LaunchPick, PanelAction};
 use crate::ui::tabs::{Tab, TabBody};
 
 /// Local terminals of `dock`, with whether each is the visible tab of its pane.
-fn local_terms(dock: &DockState<Tab>, out: &mut Vec<TermInfo>) {
+fn local_terms<'a>(dock: &'a DockState<Tab>, out: &mut Vec<TermInfo<'a>>) {
     for (_, leaf) in dock.iter_leaves() {
         for (i, tab) in leaf.tabs.iter().enumerate() {
             if let (TabBody::Terminal(view), true) = (&tab.body, tab.is_local()) {
-                out.push(TermInfo { uid: tab.uid, handle: view.handle.clone(), visible: i == leaf.active.0, label: tab.profile.display_name().to_string() });
+                out.push(TermInfo { uid: tab.uid, handle: &view.handle, visible: i == leaf.active.0, label: tab.profile.display_name() });
             }
         }
     }

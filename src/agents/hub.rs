@@ -4,6 +4,7 @@
 //! every session's [`Tracker`]. Tabs read the result through [`badge_for`].
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,17 +24,17 @@ const PULSE_FRAME: Duration = Duration::from_millis(100);
 /// than the hook no longer shows it.
 const HOOK_GRACE: Duration = Duration::from_secs(3);
 
-/// A local terminal, as the app sees it this frame.
-pub struct TermInfo {
+/// A local terminal, as the app sees it this frame (borrowed: built every frame).
+pub struct TermInfo<'a> {
     pub uid: u64,
-    pub handle: TerminalHandle,
+    pub handle: &'a TerminalHandle,
     /// The tab is the active one of its pane.
     pub visible: bool,
     /// The tab's title, for the panel.
-    pub label: String,
+    pub label: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Badge {
     pub kind: AgentKind,
     pub state: AgentState,
@@ -51,7 +52,7 @@ pub struct SessionInfo {
     pub project: String,
     pub cwd: Option<String>,
     pub hooked: bool,
-    pub usage: Option<Usage>,
+    pub usage: Option<Arc<Usage>>,
     pub visible: bool,
 }
 
@@ -88,6 +89,9 @@ struct Session {
     visible: bool,
     ended: bool,
     last_alert: Option<Instant>,
+    /// The terminal's raw title and OSC 7 folder as last read (copied only on change).
+    seen_title: String,
+    seen_cwd: Option<String>,
 }
 
 impl Session {
@@ -106,6 +110,8 @@ impl Session {
             visible: false,
             ended: false,
             last_alert: None,
+            seen_title: String::new(),
+            seen_cwd: None,
         }
     }
 
@@ -119,31 +125,41 @@ impl Session {
     }
 }
 
-/// What a terminal shows, read under one short lock.
+/// What a terminal shows, read under one short lock. Strings are copied only when
+/// they changed since `prev` (this runs every frame for every local terminal).
 struct Seen {
-    title: String,
-    cwd: Option<String>,
+    /// New title / folder, `None` when unchanged.
+    title: Option<String>,
+    cwd: Option<Option<String>>,
     bells: u64,
     notices: u64,
+    /// The latest notification, only when there are new ones.
     notice: Option<String>,
     last_output: Option<Instant>,
     pid: Option<u32>,
-    link: LinkState,
+    live: bool,
+    /// The shell ended (closed or failed), with its exit code if it reported one.
+    ended: Option<Option<u32>>,
 }
 
-fn read(handle: &TerminalHandle) -> Option<Seen> {
+fn read(handle: &TerminalHandle, prev: Option<&Session>) -> Option<Seen> {
     // Never wait on a busy reader: this terminal is simply read next frame.
     let s = handle.shared.try_lock().ok()?;
     let ev = s.parser.callbacks();
+    let title = ev.title.as_deref().unwrap_or_default();
+    let changed_title = prev.is_none_or(|p| p.seen_title != title).then(|| title.to_string());
+    let changed_cwd = prev.is_none_or(|p| p.seen_cwd != ev.cwd).then(|| ev.cwd.clone());
+    let new_notices = prev.is_none_or(|p| ev.notice_count > p.notices);
     Some(Seen {
-        title: ev.title.clone().unwrap_or_default(),
-        cwd: ev.cwd.clone(),
+        title: changed_title,
+        cwd: changed_cwd,
         bells: ev.bell_count,
         notices: ev.notice_count,
-        notice: ev.notice.clone(),
+        notice: if new_notices { ev.notice.clone() } else { None },
         last_output: s.last_output,
         pid: s.pid,
-        link: s.state.clone(),
+        live: s.state.is_live(),
+        ended: matches!(s.state, LinkState::Closed(_) | LinkState::Failed(_)).then(|| exit_code(&s.state)),
     })
 }
 
@@ -159,12 +175,24 @@ pub struct AgentHub {
     sessions: HashMap<u64, Session>,
     inbox: ipc::Inbox,
     monitor: Arc<Monitor>,
+    /// [`Self::sessions`], rebuilt only when what it shows changed.
+    listed: Vec<SessionInfo>,
+    listed_key: u64,
+    /// What [`badge_for`] last published.
+    badges_key: u64,
 }
 
 impl AgentHub {
     /// Starts the hook pipe and the resource monitor.
     pub fn new(rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Self {
-        Self { sessions: HashMap::new(), inbox: ipc::start(rt, ctx), monitor: Arc::new(Monitor::start(ctx)) }
+        Self {
+            sessions: HashMap::new(),
+            inbox: ipc::start(rt, ctx),
+            monitor: Arc::new(Monitor::start(ctx)),
+            listed: Vec::new(),
+            listed_key: 0,
+            badges_key: 0,
+        }
     }
 
     pub fn monitor(&self) -> &Monitor {
@@ -179,7 +207,7 @@ impl AgentHub {
     }
 
     /// Runs once per frame. Returns the sessions that just started needing attention.
-    pub fn frame(&mut self, ctx: &egui::Context, terms: Vec<TermInfo>, now: Instant) -> Vec<Alert> {
+    pub fn frame(&mut self, ctx: &egui::Context, terms: Vec<TermInfo<'_>>, now: Instant) -> Vec<Alert> {
         let mut alerts = Vec::new();
         self.drain_inbox(now, &mut alerts);
         let snap = procmon::latest();
@@ -187,14 +215,15 @@ impl AgentHub {
         let mut live = HashSet::new();
         for t in terms {
             live.insert(t.uid);
-            let Some(seen) = read(&t.handle) else {
+            let prev = self.sessions.get(&t.uid).filter(|s| s.tag == t.handle.tag);
+            let Some(seen) = read(t.handle, prev) else {
                 // Busy this frame: keep watching what we knew.
                 if let Some(pid) = self.sessions.get(&t.uid).and_then(|s| s.pid) {
                     watch.insert(t.uid, pid);
                 }
                 continue;
             };
-            let pid = seen.pid.filter(|_| seen.link.is_live());
+            let pid = seen.pid.filter(|_| seen.live);
             if let Some(pid) = pid {
                 watch.insert(t.uid, pid);
             }
@@ -205,12 +234,21 @@ impl AgentHub {
                 *session = fresh();
             }
             session.pid = pid;
+            if let Some(title) = seen.title {
+                session.seen_title = title;
+            }
+            if let Some(cwd) = seen.cwd {
+                session.seen_cwd = cwd;
+            }
             // The agent's own title ("✳ Fix the login bug") names the task best.
-            let title = crate::ui::agent_badge::clean_title(&seen.title).trim();
-            session.label = if title.is_empty() || title.eq_ignore_ascii_case("claude code") { t.label } else { title.to_string() };
+            let title = crate::ui::agent_badge::clean_title(&session.seen_title).trim();
+            let label = if title.is_empty() || title.eq_ignore_ascii_case("claude code") { t.label } else { title };
+            if session.label != label {
+                session.label = label.to_string();
+            }
             session.visible = t.visible;
-            if seen.cwd.is_some() && session.hook_kind.is_none() {
-                session.cwd.clone_from(&seen.cwd);
+            if session.seen_cwd.is_some() && session.hook_kind.is_none() && session.cwd != session.seen_cwd {
+                session.cwd.clone_from(&session.seen_cwd);
             }
             let sample = snap.as_ref().and_then(|s| s.per_tab.get(&t.uid).map(|u| (u.agent, s.at.unwrap_or(now))));
             update_kind(session, sample);
@@ -224,17 +262,19 @@ impl AgentHub {
                 transitions.extend(session.tracker.apply(Event::Bell, now));
             }
             if seen.notices > session.notices
-                && let Some(text) = seen.notice.clone()
+                && let Some(text) = seen.notice
             {
                 transitions.extend(session.tracker.apply(Event::Notify(text), now));
             }
             session.bells = seen.bells;
             session.notices = seen.notices;
-            if matches!(seen.link, LinkState::Closed(_) | LinkState::Failed(_)) && !session.ended {
+            if let Some(code) = seen.ended
+                && !session.ended
+            {
                 session.ended = true;
-                transitions.extend(session.tracker.apply(Event::Exited(exit_code(&seen.link)), now));
+                transitions.extend(session.tracker.apply(Event::Exited(code), now));
             }
-            let obs = Observation { title_busy: title_activity(Some(kind), &seen.title), last_output: seen.last_output };
+            let obs = Observation { title_busy: title_activity(Some(kind), &session.seen_title), last_output: seen.last_output };
             transitions.extend(session.tracker.observe(obs, now));
             for (_, to) in transitions {
                 push_alert(&mut alerts, t.uid, session, to, now);
@@ -243,7 +283,11 @@ impl AgentHub {
         self.sessions.retain(|uid, _| live.contains(uid));
         self.monitor.set_watch(watch);
         self.schedule(ctx, now);
-        self.publish_badges();
+        if self.publish_badges() {
+            // One more pass, so a badge that just started working is painted and pulses.
+            ctx.request_repaint();
+        }
+        self.refresh_list(snap.as_deref());
         alerts
     }
 
@@ -258,7 +302,10 @@ impl AgentHub {
 
     fn schedule(&self, ctx: &egui::Context, now: Instant) {
         let recheck = self.sessions.values().filter(|s| s.kind.is_some()).filter_map(|s| s.tracker.recheck_in(now)).min();
-        let pulsing = crate::settings::snapshot().agents.badges
+        // Animate only while a working badge is actually being painted (last pass).
+        let painted = crate::ui::agent_badge::take_pulse_painted();
+        let pulsing = painted
+            && crate::settings::snapshot().agents.badges
             && crate::theme::anim_time(1.0) > 0.0
             && self.sessions.values().any(|s| s.kind.is_some() && s.tracker.state == AgentState::Working);
         let next = match (recheck, pulsing) {
@@ -272,16 +319,39 @@ impl AgentHub {
         }
     }
 
-    fn publish_badges(&self) {
-        let map = self.sessions.iter().filter_map(|(uid, s)| s.kind.map(|kind| (*uid, Badge { kind, state: s.tracker.state }))).collect();
+    /// Publishes the tab badges when they changed; true if they did.
+    fn publish_badges(&mut self) -> bool {
+        let badges = || self.sessions.iter().filter_map(|(uid, s)| s.kind.map(|kind| (*uid, Badge { kind, state: s.tracker.state })));
+        // Order-independent: the map's iteration order is not stable.
+        let key = badges().fold(1u64, |acc, b| acc.wrapping_add(hash_of(&b)));
+        if key == self.badges_key {
+            return false;
+        }
+        let map = badges().collect();
         if let Ok(mut b) = BADGES.lock() {
             *b = Some(map);
         }
+        self.badges_key = key;
+        true
     }
 
-    /// Every agent session, most urgent first.
-    pub fn sessions(&self) -> Vec<SessionInfo> {
-        let snap = procmon::latest();
+    /// Rebuilds the [`Self::sessions`] list if anything it shows changed.
+    fn refresh_list(&mut self, snap: Option<&procmon::Snapshot>) {
+        let mut h = DefaultHasher::new();
+        snap.map(|s| s.seq).hash(&mut h);
+        let mut parts: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.kind.is_some())
+            .map(|(uid, s)| hash_of(&(uid, s.kind, s.tracker.state, s.tracker.since, &s.tracker.message, &s.cwd, &s.label, s.tracker.hooked, s.visible)))
+            .collect();
+        parts.sort_unstable();
+        parts.hash(&mut h);
+        let key = h.finish();
+        if key == self.listed_key {
+            return;
+        }
+        self.listed_key = key;
         let mut out: Vec<SessionInfo> = self
             .sessions
             .iter()
@@ -295,18 +365,23 @@ impl AgentHub {
                     project: s.project(),
                     cwd: s.cwd.clone(),
                     hooked: s.tracker.hooked,
-                    usage: snap.as_ref().and_then(|p| p.per_tab.get(uid).cloned()),
+                    usage: snap.and_then(|p| p.per_tab.get(uid).cloned()),
                     visible: s.visible,
                 })
             })
             .collect();
         out.sort_by_key(|s| (s.state.urgency(), s.since, s.uid));
-        out
+        self.listed = out;
+    }
+
+    /// Every agent session, most urgent first (as of the last [`Self::frame`]).
+    pub fn sessions(&self) -> &[SessionInfo] {
+        &self.listed
     }
 
     /// The next session needing attention after `current` (wrapping), most urgent first.
     pub fn next_attention(&self, current: Option<u64>) -> Option<u64> {
-        let list: Vec<u64> = self.sessions().into_iter().filter(|s| s.state.needs_attention()).map(|s| s.uid).collect();
+        let list: Vec<u64> = self.sessions().iter().filter(|s| s.state.needs_attention()).map(|s| s.uid).collect();
         let at = current.and_then(|c| list.iter().position(|u| *u == c));
         match at {
             Some(i) => list.get((i + 1) % list.len()).copied(),
@@ -317,6 +392,12 @@ impl AgentHub {
     pub fn attention_count(&self) -> usize {
         self.sessions.values().filter(|s| s.kind.is_some() && s.tracker.state.needs_attention()).count()
     }
+}
+
+fn hash_of(value: &impl Hash) -> u64 {
+    let mut h = DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish()
 }
 
 /// Picks the session's agent: what runs in its process tree, else what its hooks said
@@ -422,6 +503,22 @@ mod tests {
         // ...until a sample well after the hook shows no agent.
         update_kind(&mut s, Some((None, t0 + Duration::from_secs(10))));
         assert_eq!(s.kind, None);
+    }
+
+    #[test]
+    fn reads_copy_strings_only_when_they_change() {
+        let (term, _rx) = TerminalHandle::new(24, 80);
+        if let Ok(mut s) = term.shared.lock() {
+            s.parser.process(b"\x1b]0;build\x07\x1b]9;done\x07");
+        }
+        let first = read(&term, None).unwrap();
+        assert_eq!(first.title.as_deref(), Some("build"));
+        assert_eq!(first.notice.as_deref(), Some("done"));
+        let mut s = Session::new(term.tag.clone(), 0, first.notices, Instant::now());
+        s.seen_title = "build".into();
+        let again = read(&term, Some(&s)).unwrap();
+        assert!(again.title.is_none() && again.cwd.is_none() && again.notice.is_none(), "nothing new: nothing copied");
+        assert_eq!(again.ended, None);
     }
 
     #[test]

@@ -66,13 +66,19 @@ fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 fn shells(ui: &mut Ui, out: &mut Option<WelcomeAction>) {
-    let Some(default) = crate::pty::shells::default_shell() else { return };
+    let Some(shells) = crate::pty::shells::detected() else {
+        card(ui, "Start", |ui| {
+            ui.label(RichText::new(crate::pty::shells::DETECTING).color(theme::text_dim()));
+        });
+        return;
+    };
+    let Some(default) = crate::pty::shells::pick_default(shells, &crate::settings::get().terminal.default_shell) else { return };
     card(ui, "Start", |ui| {
         let text = format!("{}  New {}", default.icon_kind.glyph(), default.name);
         if wide_button(ui, &text, keybindings::label(Action::NewLocalTerminal), true).on_hover_text(keybindings::hint("Local terminal", Action::NewLocalTerminal)).clicked() {
             *out = Some(WelcomeAction::Shell(default));
         }
-        let others: Vec<&'static ShellSpec> = crate::pty::shells::available().iter().filter(|s| s.id != default.id).collect();
+        let others: Vec<&'static ShellSpec> = shells.iter().filter(|s| s.id != default.id).collect();
         if !others.is_empty() {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -188,7 +194,7 @@ fn cheat_sheet(ui: &mut Ui, out: &mut Option<WelcomeAction>) {
     });
 }
 
-/// "Ctrl+Alt+←→↑↓" when the four focus bindings share their modifiers.
+/// "Alt+Shift+←→↑↓" when the four focus bindings share their modifiers.
 fn focus_keys() -> Option<String> {
     let all = [Action::FocusPaneLeft, Action::FocusPaneRight, Action::FocusPaneUp, Action::FocusPaneDown].map(keybindings::binding);
     let first = all[0].clone()?;

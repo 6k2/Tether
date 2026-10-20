@@ -202,7 +202,12 @@ pub struct TerminalHandle {
     /// Coalesces UI wake-ups from the output reader (see [`RepaintThrottle`]).
     pub repaint: Arc<RepaintThrottle>,
     tx: mpsc::UnboundedSender<TermCmd>,
+    /// Run by [`Self::close`] on the closing thread, so a backend stuck on a blocking
+    /// write still dies (local shells kill their process tree here).
+    on_close: Arc<Mutex<Option<CloseHook>>>,
 }
+
+type CloseHook = Box<dyn FnOnce() + Send>;
 
 impl TerminalHandle {
     pub fn new(rows: u16, cols: u16) -> (Self, mpsc::UnboundedReceiver<TermCmd>) {
@@ -217,7 +222,8 @@ impl TerminalHandle {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let tag = uuid::Uuid::new_v4().simple().to_string();
-        (Self { shared: Arc::new(Mutex::new(shared)), tag, repaint: Arc::new(RepaintThrottle::new()), tx }, rx)
+        let handle = Self { shared: Arc::new(Mutex::new(shared)), tag, repaint: Arc::new(RepaintThrottle::new()), tx, on_close: Arc::default() };
+        (handle, rx)
     }
 
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
@@ -230,6 +236,17 @@ impl TerminalHandle {
 
     pub fn close(&self) {
         let _ = self.tx.send(TermCmd::Close);
+        let hook = self.on_close.lock().ok().and_then(|mut h| h.take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Backend side: `hook` runs once, on the thread that calls [`Self::close`].
+    pub fn on_close(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut h) = self.on_close.lock() {
+            *h = Some(Box::new(hook));
+        }
     }
 
     pub fn set_state(&self, state: LinkState) {
@@ -357,6 +374,20 @@ mod tests {
         let mut p = parser();
         p.process(&stream[..stream.len() - 26]);
         assert_eq!(p.callbacks().notice.as_deref(), Some("Claude Code: Needs your permission; to use Bash"));
+    }
+
+    #[test]
+    fn close_runs_the_hook_once_on_the_closing_thread() {
+        let (term, mut rx) = TerminalHandle::new(24, 80);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = runs.clone();
+        term.on_close(move || {
+            r.fetch_add(1, Ordering::Relaxed);
+        });
+        term.close();
+        term.clone().close();
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(matches!(rx.try_recv(), Ok(TermCmd::Close)));
     }
 
     #[test]

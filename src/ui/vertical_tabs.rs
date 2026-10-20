@@ -378,7 +378,10 @@ fn options_menu(ui: &mut Ui, opts: ListOptions, position: TabPosition, actions: 
 
 fn shells_menu(ui: &mut Ui, actions: &mut Vec<TabAction>) {
     ui.set_min_width(200.0);
-    let shells = crate::pty::shells::available();
+    let Some(shells) = crate::pty::shells::detected() else {
+        ui.label(egui::RichText::new(crate::pty::shells::DETECTING).color(theme::text_dim()));
+        return;
+    };
     if shells.is_empty() {
         ui.label(egui::RichText::new("No local shells found").color(theme::text_dim()));
     }

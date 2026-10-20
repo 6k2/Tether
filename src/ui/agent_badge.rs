@@ -1,6 +1,8 @@
 //! The status mark of an agent session: in tab titles (a glyph in the title's text) and
 //! in the agents panel (painted). Pulses while the agent works.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eframe::egui::{self, Color32};
 
 use crate::agents::{AgentState, Badge, hub};
@@ -29,8 +31,18 @@ pub fn glyph(state: AgentState) -> &'static str {
     }
 }
 
+/// A working badge was painted since the last [`take_pulse_painted`].
+static PULSE_PAINTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a working (pulsing) badge was painted since the last call: the hub keeps
+/// animating only while one is on screen.
+pub fn take_pulse_painted() -> bool {
+    PULSE_PAINTED.swap(false, Ordering::Relaxed)
+}
+
 /// 0.45..=1.0 brightness of the working pulse at `time` (1.0 when animations are off).
 pub fn pulse(time: f64) -> f32 {
+    PULSE_PAINTED.store(true, Ordering::Relaxed);
     if theme::anim_time(1.0) <= 0.0 {
         return 1.0;
     }

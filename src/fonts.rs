@@ -28,6 +28,16 @@ enum Scan {
 static SCAN: Mutex<Scan> = Mutex::new(Scan::Idle);
 /// Path currently loaded into egui (`None` = bundled font).
 static APPLIED: Mutex<Option<Option<String>>> = Mutex::new(None);
+/// How many times [`apply`] replaced the fonts, and the pass it did it in (`set_fonts`
+/// takes effect from the next pass).
+static GENERATION: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Changes whenever the fonts in use change; caches of laid-out text key on it.
+pub fn version(ctx: &egui::Context) -> u64 {
+    let (generation, pass) = *GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    // Still the old fonts during the pass that asked for new ones.
+    if generation > 0 && ctx.cumulative_pass_nr() <= pass { generation - 1 } else { generation }
+}
 
 /// The installed monospace fonts, or `None` while the background scan runs (it
 /// starts on the first call and repaints `ctx` when done).
@@ -144,6 +154,8 @@ pub fn apply(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(definitions(choice.as_ref()));
+    let mut generation = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    *generation = (generation.0 + 1, ctx.cumulative_pass_nr());
 }
 
 #[cfg(test)]

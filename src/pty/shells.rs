@@ -1,11 +1,16 @@
 //! Local shells tether can start: PowerShell 7, Windows PowerShell, cmd, Git Bash and
 //! WSL distros on Windows; `$SHELL` plus bash/zsh/fish elsewhere.
 //!
-//! Detection runs once (WSL needs a `wsl.exe` round trip) and is cached; `warm_up`
-//! starts it in the background at launch so menus never wait on it.
+//! Detection runs once (WSL needs a `wsl.exe` round trip, capped at [`WSL_TIMEOUT`]) and
+//! is cached; `warm_up` starts it in the background at launch. UI code reads
+//! [`detected`], which never blocks (`None` while detection is still running).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// How long `wsl.exe -l -q` may take before it is killed and WSL is skipped.
+pub const WSL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Picks the glyph and accent of a shell in menus and tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,19 +64,36 @@ impl ShellSpec {
 static DETECTED: OnceLock<Vec<ShellSpec>> = OnceLock::new();
 
 /// Shells found on this machine, in menu order (the first one is the default default).
+/// Blocks until detection is done: UI paint code uses [`detected`] instead.
 pub fn available() -> &'static [ShellSpec] {
     DETECTED.get_or_init(detect)
 }
 
-/// Starts detection on a background thread so the first menu doesn't block on `wsl.exe`.
-pub fn warm_up() {
+/// The detected shells, or `None` while detection is still running. Never blocks.
+pub fn detected() -> Option<&'static [ShellSpec]> {
+    DETECTED.get().map(Vec::as_slice)
+}
+
+/// What menus show while [`detected`] is still `None`.
+pub const DETECTING: &str = "Detecting shells…";
+
+/// Starts detection on a background thread so the first menu doesn't block on `wsl.exe`;
+/// `on_ready` runs once it is done (to repaint menus showing [`DETECTING`]).
+pub fn warm_up(on_ready: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new().name("tether-shells".into()).spawn(|| {
         available();
+        on_ready();
     });
 }
 
+/// Blocks until detection is done (see [`find_detected`]).
 pub fn find(id: &str) -> Option<&'static ShellSpec> {
     available().iter().find(|s| s.id == id)
+}
+
+/// Like [`find`], but `None` while detection is still running.
+pub fn find_detected(id: &str) -> Option<&'static ShellSpec> {
+    detected()?.iter().find(|s| s.id == id)
 }
 
 /// The shell from `settings.terminal.default_shell`, else the first one detected.
@@ -147,7 +169,8 @@ fn detect() -> Vec<ShellSpec> {
             .collect();
         newest_pwsh(&dirs)
     };
-    if let Some(pwsh) = on_path("pwsh.exe").or_else(installed_pwsh) {
+    // An installed copy under Program Files beats whatever `pwsh.exe` comes first on PATH.
+    if let Some(pwsh) = installed_pwsh().or_else(|| on_path("pwsh.exe")) {
         out.push(ShellSpec::new("pwsh", "PowerShell", pwsh, &["-NoLogo"], ShellIcon::PowerShell));
     }
     let system_root = env_dir("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
@@ -186,10 +209,39 @@ fn git_install_dir() -> Option<PathBuf> {
 fn wsl_distros(wsl: &std::path::Path) -> Vec<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    match std::process::Command::new(wsl).args(["-l", "-q"]).creation_flags(CREATE_NO_WINDOW).output() {
-        Ok(out) if out.status.success() => parse_wsl_list(&out.stdout),
-        _ => Vec::new(),
-    }
+    let mut cmd = std::process::Command::new(wsl);
+    cmd.args(["-l", "-q"]).creation_flags(CREATE_NO_WINDOW);
+    stdout_within(cmd, WSL_TIMEOUT).map(|out| parse_wsl_list(&out)).unwrap_or_default()
+}
+
+/// Runs `cmd` and returns its stdout if it exits successfully within `timeout`;
+/// otherwise kills it and returns `None` (a hung `wsl.exe` must not hang detection).
+pub fn stdout_within(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Read on a side thread: a grandchild keeping the pipe open can't block us.
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(15)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = rx.recv_timeout(Duration::from_millis(200)).ok()?;
+    status.filter(|s| s.success()).map(|_| out)
 }
 
 #[cfg(not(windows))]
@@ -269,10 +321,25 @@ mod tests {
         assert!(pick_default(&[], "cmd").is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn slow_commands_are_killed_at_the_timeout() {
+        let mut slow = std::process::Command::new("cmd");
+        slow.args(["/C", "ping -n 6 127.0.0.1 >NUL"]);
+        let started = std::time::Instant::now();
+        assert_eq!(stdout_within(slow, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        let mut fast = std::process::Command::new("cmd");
+        fast.args(["/C", "echo hi"]);
+        let out = stdout_within(fast, Duration::from_secs(5)).map(|o| String::from_utf8_lossy(&o).trim().to_string());
+        assert_eq!(out.as_deref(), Some("hi"));
+    }
+
     #[test]
     fn detects_at_least_one_shell() {
         assert!(!available().is_empty());
         let first = &available()[0];
         assert!(find(&first.id).is_some());
+        assert!(detected().is_some_and(|d| !d.is_empty()));
     }
 }

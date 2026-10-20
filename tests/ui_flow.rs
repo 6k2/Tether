@@ -28,6 +28,9 @@ fn harness(config: &std::path::Path) -> Harness<'static, TetherApp> {
     std::fs::write(config.join("workspaces.json"), WORKSPACES).unwrap();
     // SAFETY: tests in this file run single-threaded (one #[test] touches the env at a time).
     unsafe { std::env::set_var("TETHER_CONFIG_DIR", config) };
+    // Shell detection runs in the background; finish it first so the welcome screen
+    // doesn't change layout between a query and its click.
+    tether::pty::shells::available();
     Harness::builder().with_size(egui::vec2(1360.0, 820.0)).with_max_steps(10_000).wgpu().build_eframe(|cc| TetherApp::new(cc).expect("app init"))
 }
 

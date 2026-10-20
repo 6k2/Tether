@@ -107,7 +107,10 @@ impl Sidebar {
                 actions.push(SidebarAction::NewLocal(shell.id.clone()));
             }
         }
-        if !shells.is_empty() {
+        if crate::pty::shells::detected().is_none() {
+            ui.label(egui::RichText::new(crate::pty::shells::DETECTING).color(crate::theme::text_dim()));
+        }
+        if !shells.is_empty() || crate::pty::shells::detected().is_none() {
             ui.separator();
         }
         if bound(ui, "+", "New host", Action::NewHost).clicked() {

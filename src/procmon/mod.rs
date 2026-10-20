@@ -27,8 +27,8 @@ pub const BACKGROUND_INTERVAL: Duration = Duration::from_secs(5);
 /// Results of one sample.
 #[derive(Debug, Default)]
 pub struct Snapshot {
-    /// Keyed by the watch key (tab uid).
-    pub per_tab: HashMap<u64, Usage>,
+    /// Keyed by the watch key (tab uid). Shared so readers don't copy the top lists.
+    pub per_tab: HashMap<u64, Arc<Usage>>,
     /// tether itself plus everything it started.
     pub total: Usage,
     pub seq: u64,
@@ -55,7 +55,7 @@ pub fn latest() -> Option<Arc<Snapshot>> {
 }
 
 /// Usage of one watched terminal, from the last sample.
-pub fn usage_for(key: u64) -> Option<Usage> {
+pub fn usage_for(key: u64) -> Option<Arc<Usage>> {
     latest().and_then(|s| s.per_tab.get(&key).cloned())
 }
 
@@ -191,15 +191,29 @@ impl Sampler {
 
     fn sample(&mut self, watch: &HashMap<u64, u32>, seq: u64) -> Snapshot {
         self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cpu().with_memory());
+        self.summarize(watch, seq)
+    }
+
+    /// Builds the snapshot from the refreshed process list: one table of the whole
+    /// system, names and agents filled in only for our own trees.
+    fn summarize(&mut self, watch: &HashMap<u64, u32>, seq: u64) -> Snapshot {
         let mut table = self.table();
+        let roots = watch.values().copied().chain(std::iter::once(self.self_pid));
+        let mut ours: Vec<u32> = roots.flat_map(|root| table.descendants(root)).collect();
+        ours.sort_unstable();
+        ours.dedup();
         // Command lines only for launchers in our trees we have not classified yet.
-        let unknown: Vec<Pid> = watch
-            .values()
-            .chain(std::iter::once(&self.self_pid))
-            .flat_map(|root| table.descendants(*root))
-            .filter(|pid| table.row(*pid).is_some_and(|r| needs_cmd(&r.name) && self.agents.get(pid).is_none_or(|(s, _)| *s != r.start)))
-            .map(Pid::from_u32)
-            .collect();
+        let mut unknown = Vec::new();
+        for &pid in &ours {
+            let Some(p) = self.sys.process(Pid::from_u32(pid)) else { continue };
+            let name = p.name().to_string_lossy().into_owned();
+            if needs_cmd(&name) && self.agents.get(&pid).is_none_or(|(s, _)| *s != p.start_time()) {
+                unknown.push(Pid::from_u32(pid));
+            }
+            if let Some(row) = table.row_mut(pid) {
+                row.name = name;
+            }
+        }
         if !unknown.is_empty() {
             self.sys.refresh_processes_specifics(ProcessesToUpdate::Some(&unknown), false, ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet));
             for pid in &unknown {
@@ -209,29 +223,36 @@ impl Sampler {
                     self.agents.insert(pid.as_u32(), (p.start_time(), AgentKind::detect(&name, &cmd)));
                 }
             }
-            table = self.table();
         }
-        let alive: std::collections::HashSet<u32> = self.sys.processes().keys().map(|p| p.as_u32()).collect();
-        self.agents.retain(|pid, _| alive.contains(pid));
-        let per_tab = watch.iter().filter_map(|(k, pid)| table.aggregate(*pid).map(|u| (*k, u))).collect();
+        for &pid in &ours {
+            if let Some(row) = table.row_mut(pid) {
+                row.agent = match self.agents.get(&pid) {
+                    Some((s, a)) if *s == row.start => *a,
+                    _ => AgentKind::detect(&row.name, &[]),
+                };
+            }
+        }
+        let sys = &self.sys;
+        self.agents.retain(|pid, _| sys.process(Pid::from_u32(*pid)).is_some());
+        let per_tab = watch.iter().filter_map(|(k, pid)| table.aggregate(*pid).map(|u| (*k, Arc::new(u)))).collect();
         let total = table.aggregate(self.self_pid).unwrap_or_default();
         Snapshot { per_tab, total, seq, at: Some(Instant::now()) }
     }
 
+    /// Every process, without names or agents (filled in for our trees by `summarize`).
     fn table(&self) -> Table {
         let rows = self
             .sys
             .processes()
             .values()
-            .map(|p| {
-                let pid = p.pid().as_u32();
-                let name = p.name().to_string_lossy().into_owned();
-                let start = p.start_time();
-                let agent = match self.agents.get(&pid) {
-                    Some((s, a)) if *s == start => *a,
-                    _ => AgentKind::detect(&name, &[]),
-                };
-                ProcRow { pid, parent: p.parent().map(|pp| pp.as_u32()), name, cpu: p.cpu_usage() / self.cpus, mem: p.memory(), start, agent }
+            .map(|p| ProcRow {
+                pid: p.pid().as_u32(),
+                parent: p.parent().map(|pp| pp.as_u32()),
+                name: String::new(),
+                cpu: p.cpu_usage() / self.cpus,
+                mem: p.memory(),
+                start: p.start_time(),
+                agent: None,
             })
             .collect();
         Table::new(rows)

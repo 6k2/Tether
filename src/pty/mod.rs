@@ -3,6 +3,7 @@
 
 pub mod local;
 pub mod shells;
+pub mod tree;
 
 pub use local::run_local_pty;
 pub use shells::{ShellIcon, ShellSpec};

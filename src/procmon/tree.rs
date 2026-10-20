@@ -75,6 +75,10 @@ impl Table {
         self.index.get(&pid).map(|&i| &self.rows[i])
     }
 
+    pub fn row_mut(&mut self, pid: u32) -> Option<&mut ProcRow> {
+        self.index.get(&pid).map(|&i| &mut self.rows[i])
+    }
+
     /// Pids in the tree under `root` (breadth first, root first).
     pub fn descendants(&self, root: u32) -> Vec<u32> {
         let Some(&start) = self.index.get(&root) else { return Vec::new() };

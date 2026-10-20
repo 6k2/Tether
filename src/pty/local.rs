@@ -13,6 +13,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
 use super::shells::ShellSpec;
+use super::tree::ProcessTree;
 use crate::ssh::terminal::{LinkState, TERM_NAME, TermCmd, TerminalHandle};
 
 const READ_BUF: usize = 64 * 1024;
@@ -58,6 +59,8 @@ pub fn run_local_pty(
         cmd.cwd(dir);
     }
     let mut child = pair.slave.spawn_command(cmd).with_context(|| format!("starting {}", spec.program.display()))?;
+    // Everything the shell starts (an agent, its workers) dies with the tab, not just the shell.
+    let tree = Arc::new(ProcessTree::adopt(&*child));
     // Our copy of the slave end would keep the pty open after the shell exits.
     drop(pair.slave);
     let reader = pair.master.try_clone_reader()?;
@@ -81,9 +84,18 @@ pub fn run_local_pty(
         }
     })?;
     let closed_by_user = Arc::new(AtomicBool::new(false));
+    // Killing from the closing side: the writer thread may be stuck in a blocking write
+    // to a shell that stopped reading, and would never see `Close`.
+    term.on_close({
+        let (killer, tree, closed_by_user) = (child.clone_killer(), tree.clone(), closed_by_user.clone());
+        move || {
+            closed_by_user.store(true, Ordering::Relaxed);
+            kill_all(&tree, killer);
+        }
+    });
     spawn_named("tether-pty-write", {
-        let (master, killer, closed_by_user) = (master.clone(), child.clone_killer(), closed_by_user.clone());
-        move || handle_commands(rx, writer, &master, killer, &closed_by_user)
+        let (master, killer, tree) = (master.clone(), child.clone_killer(), tree.clone());
+        move || handle_commands(rx, writer, &master, killer, &tree)
     })?;
 
     let status = child.wait();
@@ -103,6 +115,7 @@ pub fn run_local_pty(
 /// Feeds pty output into the screen model until EOF.
 fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle) {
     let mut buf = vec![0u8; READ_BUF];
+    let mut queries = QueryScanner::default();
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => return,
@@ -110,11 +123,12 @@ fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle) {
         };
         let chunk = &buf[..n];
         let mut cursor_report = None;
+        let asked = queries.feed(chunk);
         if let Ok(mut s) = term.shared.lock() {
             crate::ssh::terminal::feed(&mut s.parser, chunk);
             s.generation = s.generation.wrapping_add(1);
             s.last_output = Some(Instant::now());
-            if contains(chunk, CURSOR_QUERY) {
+            if asked {
                 let (row, col) = s.parser.screen().cursor_position();
                 cursor_report = Some(format!("\x1b[{};{}R", row + 1, col + 1));
             }
@@ -132,8 +146,8 @@ fn handle_commands(
     mut rx: mpsc::UnboundedReceiver<TermCmd>,
     mut writer: Box<dyn Write + Send>,
     master: &SharedMaster,
-    mut killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
-    closed_by_user: &AtomicBool,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    tree: &ProcessTree,
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -149,18 +163,46 @@ fn handle_commands(
                     let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                 }
             }
-            TermCmd::Close => {
-                closed_by_user.store(true, Ordering::Relaxed);
-                break;
-            }
+            // `TerminalHandle::close` already killed the tree from the closing thread.
+            TermCmd::Close => break,
         }
     }
     // Closed, or every handle dropped: nobody can see this shell any more.
+    kill_all(tree, killer);
+}
+
+fn kill_all(tree: &ProcessTree, mut killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) {
+    tree.kill();
     let _ = killer.kill();
 }
 
 /// Device status report "where is the cursor?" (DSR 6).
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Finds [`CURSOR_QUERY`] in a stream of chunks, including one split across two reads.
+#[derive(Default)]
+struct QueryScanner {
+    /// The last bytes of the previous chunk (fewer than the query's length).
+    tail: Vec<u8>,
+}
+
+impl QueryScanner {
+    /// Whether the query ends in `chunk`.
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        let keep = CURSOR_QUERY.len() - 1;
+        let head = &chunk[..chunk.len().min(keep)];
+        let mut seam = std::mem::take(&mut self.tail);
+        seam.extend_from_slice(head);
+        let found = contains(&seam, CURSOR_QUERY) || contains(chunk, CURSOR_QUERY);
+        // Keep what could start a query completed by the next chunk.
+        if chunk.len() >= keep {
+            self.tail.extend_from_slice(&chunk[chunk.len() - keep..]);
+        } else {
+            self.tail = seam[seam.len().saturating_sub(keep)..].to_vec();
+        }
+        found
+    }
+}
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
@@ -172,4 +214,26 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> Result<()> {
 
 fn home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_queries_split_across_reads_are_found() {
+        let stream = b"abc\x1b[6ndef";
+        for cut in 0..=stream.len() {
+            let mut q = QueryScanner::default();
+            let found = [q.feed(&stream[..cut]), q.feed(&stream[cut..])];
+            assert_eq!(found.iter().filter(|f| **f).count(), 1, "cut at {cut}: {found:?}");
+        }
+        let mut q = QueryScanner::default();
+        let hits = stream.iter().filter(|b| q.feed(std::slice::from_ref(*b))).count();
+        assert_eq!(hits, 1, "byte by byte");
+        let mut q = QueryScanner::default();
+        assert!(!q.feed(b"\x1b[6"));
+        assert!(!q.feed(b"x"));
+        assert!(!q.feed(b"n"), "an interrupted query is not a query");
+    }
 }

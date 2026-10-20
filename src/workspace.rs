@@ -19,12 +19,33 @@ pub const LAST_SESSION: &str = "Last session";
 
 /// Serialized as `"Terminal"`, `"Sftp"` or `{"Local":{"shell_id":"pwsh"}}`, so layouts
 /// saved before local terminals existed still load.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TabKind {
     Terminal,
     Sftp,
     /// A local shell (`pty::shells`); dropped on restore if that shell is gone.
     Local { shell_id: String },
+    /// A kind this version doesn't know (saved by a newer tether): skipped on restore
+    /// instead of failing the whole workspace file. Never saved.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for TabKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum Known {
+            Terminal,
+            Sftp,
+            Local { shell_id: String },
+        }
+        let value = serde_json::Value::deserialize(d)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(Known::Terminal) => TabKind::Terminal,
+            Ok(Known::Sftp) => TabKind::Sftp,
+            Ok(Known::Local { shell_id }) => TabKind::Local { shell_id },
+            Err(_) => TabKind::Unknown,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +303,14 @@ mod tests {
         assert_eq!(serde_json::from_str::<Layout<TabSpec>>(&text).unwrap(), local);
         let no_profile: TabSpec = serde_json::from_str(r#"{"kind":{"Local":{"shell_id":"cmd"}}}"#).unwrap();
         assert!(no_profile.profile_id.is_nil());
+    }
+
+    #[test]
+    fn tabs_of_unknown_kinds_do_not_break_the_file() {
+        let text = r#"{"Leaf":[{"kind":"Terminal"},{"kind":{"Notebook":{"path":"x"}}},{"kind":"Browser"}]}"#;
+        let layout: Layout<TabSpec> = serde_json::from_str(text).unwrap();
+        let kinds: Vec<TabKind> = layout.tabs().iter().map(|t| t.kind.clone()).collect();
+        assert_eq!(kinds, vec![TabKind::Terminal, TabKind::Unknown, TabKind::Unknown]);
     }
 
     #[test]

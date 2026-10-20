@@ -178,7 +178,9 @@ impl Action {
         let cs = |k| Some(Binding::new(k, true, true, false));
         let c = |k| Some(Binding::new(k, true, false, false));
         let a = |k| Some(Binding::new(k, false, false, true));
-        let ca = |k| Some(Binding::new(k, true, false, true));
+        // Alt+Shift, not Ctrl+Alt: Windows reports AltGr as Ctrl+Alt, and Ctrl+Alt+arrows
+        // rotate the screen on some Intel graphics drivers.
+        let sa = |k| Some(Binding::new(k, false, true, true));
         match self {
             Action::ToggleSidebar => cs(Key::B),
             Action::OpenSettings => c(Key::Comma),
@@ -206,10 +208,10 @@ impl Action {
             Action::SftpUp => a(Key::ArrowUp),
             Action::SftpRefresh => Some(Binding::new(Key::F5, false, false, false)),
             Action::CommandPalette => cs(Key::P),
-            Action::FocusPaneLeft => ca(Key::ArrowLeft),
-            Action::FocusPaneRight => ca(Key::ArrowRight),
-            Action::FocusPaneUp => ca(Key::ArrowUp),
-            Action::FocusPaneDown => ca(Key::ArrowDown),
+            Action::FocusPaneLeft => sa(Key::ArrowLeft),
+            Action::FocusPaneRight => sa(Key::ArrowRight),
+            Action::FocusPaneUp => sa(Key::ArrowUp),
+            Action::FocusPaneDown => sa(Key::ArrowDown),
             Action::ZoomPane => cs(Key::Enter),
             Action::CycleTabPosition | Action::MoveSidebar | Action::RenameTab => None,
         }
@@ -358,9 +360,45 @@ pub fn conflicts(action: Action, binding: &Binding) -> Vec<Action> {
     Action::ALL.into_iter().filter(|a| *a != action && self::binding(*a).as_ref() == Some(binding)).collect()
 }
 
+/// `settings.keybindings`, read leniently: an entry for an action this version doesn't
+/// know (written by a newer tether) or with an unreadable binding is skipped, instead of
+/// failing the whole settings file (which would reset everything to defaults).
+pub fn deserialize_overrides<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<Action, Option<Binding>>, D::Error> {
+    let raw: std::collections::BTreeMap<String, serde_json::Value> = Deserialize::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(action, binding)| {
+            let action: Action = serde_json::from_value(serde_json::Value::String(action)).ok()?;
+            Some((action, serde_json::from_value(binding).ok()?))
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_actions_in_saved_overrides_are_skipped() {
+        #[derive(Deserialize)]
+        struct S {
+            #[serde(deserialize_with = "deserialize_overrides")]
+            keys: std::collections::BTreeMap<Action, Option<Binding>>,
+        }
+        let text = r#"{"keys":{"CloseTab":null,"TeleportTab":{"key":"Q","ctrl":true},"NextTab":{"key":"Tab","ctrl":true},"PrevTab":42}}"#;
+        let s: S = serde_json::from_str(text).unwrap();
+        assert_eq!(s.keys.len(), 2);
+        assert_eq!(s.keys[&Action::CloseTab], None);
+        assert_eq!(s.keys[&Action::NextTab], Some(Binding::new(Key::Tab, true, false, false)));
+    }
+
+    #[test]
+    fn pane_focus_defaults_avoid_ctrl_alt() {
+        for a in [Action::FocusPaneLeft, Action::FocusPaneRight, Action::FocusPaneUp, Action::FocusPaneDown] {
+            let b = a.default_binding().unwrap();
+            assert!(!(b.ctrl && b.alt), "{a:?} uses Ctrl+Alt (AltGr on Windows)");
+        }
+    }
 
     #[test]
     fn every_action_has_metadata_and_unique_defaults() {

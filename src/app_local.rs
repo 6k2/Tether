@@ -15,6 +15,8 @@ impl TetherApp {
     /// Starts `spec` on its own thread (the pty read/write loops block).
     pub(super) fn spawn_local(&self, spec: &ShellSpec, cwd: Option<PathBuf>, ctx: &egui::Context) -> TerminalView {
         let (handle, rx) = TerminalHandle::new(24, 80);
+        // Wakes the UI even if this tab is never drawn (restored workspace, background tab).
+        handle.repaint.attach(ctx);
         let (spec_owned, h, ctx) = (spec.clone(), handle.clone(), ctx.clone());
         let started = std::thread::Builder::new().name("tether-pty".into()).spawn(move || {
             let repaint = {

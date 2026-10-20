@@ -31,8 +31,11 @@ impl TetherApp {
             let title = tab.display_title();
             r.add(Entry::new("Tab", title, Command::FocusTab(tab.uid)).detail(tab.subtitle()));
         }
-        for shell in crate::pty::shells::available() {
-            let keys = (crate::pty::shells::default_shell().is_some_and(|d| d.id == shell.id)).then(|| crate::keybindings::label(Action::NewLocalTerminal));
+        // Not waiting on detection: until it is done the palette just lists no shells.
+        let shells = crate::pty::shells::detected().unwrap_or_default();
+        let default = crate::pty::shells::pick_default(shells, &settings::get().terminal.default_shell).map(|s| s.id.as_str());
+        for shell in shells {
+            let keys = (default == Some(shell.id.as_str())).then(|| crate::keybindings::label(Action::NewLocalTerminal));
             r.add(Entry::new("Shell", format!("New {}", shell.name), Command::NewShell(shell.id.clone())).keys(keys));
         }
         let mut hosts: Vec<_> = self.store.profiles.iter().filter(|p| !p.archived).collect();

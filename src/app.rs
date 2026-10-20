@@ -113,7 +113,8 @@ impl TetherApp {
         crate::settings::init(dir.join("settings.json"));
         crate::themes::apply_saved(&cc.egui_ctx);
         crate::updater::check_on_startup(&cc.egui_ctx);
-        crate::pty::shells::warm_up();
+        let ctx = cc.egui_ctx.clone();
+        crate::pty::shells::warm_up(move || ctx.request_repaint());
         crate::agents::launch::warm_up();
         let toasts = Toasts::default();
         let mut store = ProfileStore::load(dir.join("profiles.json")).unwrap_or_else(|e| {
@@ -222,6 +223,8 @@ impl TetherApp {
 
     fn spawn_terminal(&self, profile: &Profile, secret: Option<String>, ctx: &egui::Context) -> TerminalView {
         let (handle, rx) = TerminalHandle::new(24, 80);
+        // Wakes the UI even if this tab is never drawn (restored workspace, background tab).
+        handle.repaint.attach(ctx);
         let (pool, profile, h, ctx, toasts) = (self.pool.clone(), profile.clone(), handle.clone(), ctx.clone(), self.toasts.clone());
         self.rt.spawn(async move {
             let repaint = {
@@ -303,6 +306,7 @@ impl TetherApp {
         let tab = match kind {
             TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
             TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
+            TabKind::Unknown => return,
         };
         self.split_focused(tab, split);
     }
@@ -374,11 +378,13 @@ impl TetherApp {
             .names()
             .into_iter()
             .filter_map(|name| {
-                let tabs = self.workspaces.get(&name)?.tabs();
+                let mut tabs = self.workspaces.get(&name)?.tabs();
+                tabs.retain(|t| t.kind != TabKind::Unknown);
                 let mut hosts: Vec<String> = Vec::new();
                 for spec in &tabs {
                     let name = match &spec.kind {
-                        TabKind::Local { shell_id } => crate::pty::shells::find(shell_id).map(|s| s.name.clone()),
+                        // Per frame: never wait on shell detection (the id stands in meanwhile).
+                        TabKind::Local { shell_id } => Some(crate::pty::shells::find_detected(shell_id).map_or_else(|| shell_id.clone(), |s| s.name.clone())),
                         _ => self.store.get(spec.profile_id).map(|p| p.display_name().to_string()),
                     };
                     if let Some(name) = name
@@ -403,6 +409,7 @@ impl TetherApp {
                 match spec.kind {
                     TabKind::Sftp => self.sftp_tab(&profile, secret, ctx),
                     TabKind::Terminal | TabKind::Local { .. } => self.terminal_tab(&profile, secret, ctx),
+                    TabKind::Unknown => return None,
                 }
             };
             tab.rename(spec.title.clone());
@@ -736,6 +743,15 @@ impl eframe::App for TetherApp {
         self.toasts.show(&ctx);
         if self.broadcast {
             broadcast_frame(&ctx);
+        }
+    }
+
+    /// Ends every shell (and what it started) instead of leaving them orphaned.
+    fn on_exit(&mut self) {
+        for tab in self.all_tabs() {
+            if let TabBody::Terminal(t) = &tab.body {
+                t.handle.close();
+            }
         }
     }
 }

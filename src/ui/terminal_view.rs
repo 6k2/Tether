@@ -11,7 +11,7 @@ use eframe::egui::{self, Align2, CornerRadius, Event, EventFilter, FontFamily, F
 
 use super::keys;
 use super::loading::{self, ConnectInfo};
-use super::term_grid::{FrameKey, GridCache};
+use super::term_grid::{FrameKey, GridCache, RenderKey};
 use crate::keybindings::{self, Action};
 use crate::profile::Profile;
 use crate::settings::{self, CursorStyle, TerminalSettings};
@@ -201,7 +201,7 @@ impl TerminalView {
         self.handle.repaint.mark_painted(ui.ctx());
         super::backdrop::paint(&painter, rect);
 
-        let Some(frame) = self.sync_grid((rows, cols), &font, &palette) else { return out };
+        let Some(frame) = self.sync_grid((rows, cols), &font, &palette, RenderKey::of(ui.ctx())) else { return out };
         // Glyph layout for new rows happens with the lock released.
         self.cache.grid.layout(ui.ctx());
         let FrameInfo { state, stage, bells, history, app_cursor, bracketed, alt_screen, cursor } = frame;
@@ -272,7 +272,7 @@ impl TerminalView {
 
     /// Locks the terminal just long enough to clamp the scroll offset, refresh the row
     /// cache and copy out what the rest of the frame needs. `None` if the lock is poisoned.
-    fn sync_grid(&mut self, size: (u16, u16), font: &FontId, palette: &theme::Palette) -> Option<FrameInfo> {
+    fn sync_grid(&mut self, size: (u16, u16), font: &FontId, palette: &theme::Palette, render: RenderKey) -> Option<FrameInfo> {
         let shared_arc = self.handle.shared.clone();
         let mut shared = shared_arc.lock().ok()?;
         let generation = shared.generation;
@@ -283,7 +283,7 @@ impl TerminalView {
         screen.set_scrollback(self.scroll);
         self.scroll = screen.scrollback();
         let screen = shared.parser.screen();
-        self.cache.grid.sync(FrameKey::new(generation, self.scroll, size, font), screen, palette, font);
+        self.cache.grid.sync(FrameKey::new(generation, self.scroll, size, font, render), screen, palette, font);
         let cursor = (!screen.hide_cursor()).then(|| {
             let (cr, cc) = screen.cursor_position();
             let glyph = screen.cell(cr, cc).filter(|c| c.has_contents()).map(|c| c.contents().to_string());

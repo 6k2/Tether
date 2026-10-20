@@ -164,6 +164,8 @@ fn terminal(ui: &mut Ui, s: &mut Settings, st: &mut SectionState, now: f64) {
             });
         });
     });
+    ui.add_space(CARD_GAP);
+    super::settings_shell::card(ui, &mut s.shell_integration);
 }
 
 /// Coloured text runs for the preview: (ANSI index or `None` for the default fg, text).

@@ -16,6 +16,7 @@ pub mod pty;
 pub mod remote_edit;
 pub mod repaint;
 pub mod settings;
+pub mod shell_integration;
 pub mod sftp_history;
 pub mod ssh;
 pub mod theme;

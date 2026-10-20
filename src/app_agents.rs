@@ -49,6 +49,7 @@ impl TetherApp {
         for dock in self.detached.docks_mut() {
             local_terms(dock, &mut terms);
         }
+        self.command_notices(ctx, &terms, window_focused);
         let alerts = self.agents.frame(ctx, terms, Instant::now());
         for alert in alerts {
             self.alert(ctx, alert, window_focused);
@@ -76,6 +77,30 @@ impl TetherApp {
             let hint = keybindings::label(Action::NextAttention);
             let jump = if hint.is_empty() { String::new() } else { format!("  ({hint} to jump)") };
             self.toasts.info(format!("{title}: {}{jump}", a.project));
+        }
+    }
+
+    /// Shell integration: a long command finished in a hidden tab or while tether was in
+    /// the background. Same channels as agent alerts (toast, or desktop + taskbar flash).
+    fn command_notices(&self, ctx: &egui::Context, terms: &[TermInfo], window_focused: bool) {
+        let settings = crate::settings::snapshot();
+        for t in terms {
+            // Busy terminals are looked at next frame (`take_finished` keeps the news).
+            let Some(done) = t.handle.shared.try_lock().ok().and_then(|mut s| s.parser.callbacks_mut().shell.take_finished()) else { continue };
+            if t.visible && window_focused {
+                continue;
+            }
+            let Some((title, body)) = crate::ui::blocks::long_command_notice(&done, &settings.shell_integration) else { continue };
+            if window_focused {
+                self.toasts.info(format!("{title} in {}: {body}", t.label));
+                continue;
+            }
+            if settings.agents.desktop_notifications {
+                notify::desktop(format!("{title} · {}", t.label), body);
+            }
+            if settings.agents.flash_taskbar {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+            }
         }
     }
 

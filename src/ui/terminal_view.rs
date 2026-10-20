@@ -84,6 +84,8 @@ struct ViewCache {
     /// Last OSC 7 working directory seen.
     cwd: Option<String>,
     link: LinkState,
+    /// Shell-integration blocks on screen (marks, selection, sticky header).
+    blocks: super::blocks::BlocksView,
 }
 
 /// What a frame needs from the shared terminal state, copied out under the lock.
@@ -127,7 +129,7 @@ impl TerminalView {
             typed_line: String::new(),
             intercept_nano: true,
             want_focus: false,
-            cache: Box::new(ViewCache { grid: GridCache::default(), title: None, cwd: None, link: LinkState::Connecting }),
+            cache: Box::new(ViewCache { grid: GridCache::default(), title: None, cwd: None, link: LinkState::Connecting, blocks: Default::default() }),
         }
     }
 
@@ -142,8 +144,15 @@ impl TerminalView {
             if s.parser.callbacks().cwd != self.cache.cwd {
                 self.cache.cwd.clone_from(&s.parser.callbacks().cwd);
             }
+            self.cache.blocks.note_branch(&s.parser.callbacks().shell);
         }
         self.cache.title.clone()
+    }
+
+    /// Working directory and git branch reported by shell integration (OSC 7 /
+    /// OSC 6973), as of the latest [`Self::remote_title`] call or frame. Never blocks.
+    pub fn shell_context(&self) -> Option<(&str, Option<&str>)> {
+        self.cache.cwd.as_deref().map(|cwd| (cwd, self.cache.blocks.branch()))
     }
 
     /// Working directory (OSC 7) as of the latest [`Self::remote_title`] call.
@@ -207,6 +216,12 @@ impl TerminalView {
 
         let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         self.cache.grid.paint(&painter, inner.min, m, |row| selection_cols(sel, row, cols));
+        if !alt_screen {
+            let geom = super::blocks::Geom { rect, inner, cell_h: m.cell_h, rows };
+            if let Some(req) = self.cache.blocks.paint(ui, geom, &settings.shell_integration, accent) {
+                self.block_request(req, ui.ctx(), &mut out);
+            }
+        }
 
         if self.scroll == 0
             && let Some((pos, glyph)) = &cursor
@@ -277,6 +292,7 @@ impl TerminalView {
         if shared.parser.callbacks().title != self.cache.title {
             self.cache.title.clone_from(&shared.parser.callbacks().title);
         }
+        self.cache.blocks.sync(&shared.parser.callbacks().shell, self.scroll, size.0);
         Some(FrameInfo {
             state: shared.state.clone(),
             stage: shared.stage,
@@ -550,6 +566,10 @@ impl TerminalView {
                 },
                 Event::Cut => out.input.push(0x18),
                 Event::Key { key, pressed: true, modifiers, .. } => {
+                    if let Some(up) = super::blocks::step_key(key, modifiers).filter(|_| self.cache.blocks.active()) {
+                        self.block_request(super::blocks::Request::Step(up), ui.ctx(), out);
+                        continue;
+                    }
                     if modifiers.shift && matches!(key, egui::Key::PageUp | egui::Key::PageDown) {
                         let page = self.size.0.max(2) as usize - 1;
                         self.scroll = if key == egui::Key::PageUp { self.scroll + page } else { self.scroll.saturating_sub(page) };
@@ -585,6 +605,21 @@ impl TerminalView {
                 _ => {}
             }
         }
+    }
+
+    /// Scrolls back `lines` rows (screenshot tests).
+    #[cfg(test)]
+    pub(crate) fn set_scroll(&mut self, lines: usize) {
+        self.scroll = lines;
+    }
+
+    /// A block mark, menu or Ctrl+Shift+Up/Down asked for something (see `ui::blocks`).
+    fn block_request(&mut self, req: super::blocks::Request, ctx: &egui::Context, out: &mut ViewOutput) {
+        let handle = self.handle.clone();
+        if let Some(bytes) = self.cache.blocks.apply(req, &handle, ctx, &mut self.scroll) {
+            out.input.extend(bytes);
+        }
+        ctx.request_repaint();
     }
 
     fn mark_prompt_start(&mut self) {

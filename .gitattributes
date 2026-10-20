@@ -1,0 +1,4 @@
+# Shell integration scripts run inside bash/zsh/fish: always LF.
+src/shell_integration/*.sh text eol=lf
+src/shell_integration/*.zsh text eol=lf
+src/shell_integration/*.fish text eol=lf

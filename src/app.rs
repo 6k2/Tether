@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 #[path = "app_actions.rs"]
 mod actions;
+#[path = "app_agents.rs"]
+mod agents;
 #[path = "app_local.rs"]
 mod local;
 
@@ -74,6 +76,9 @@ pub struct TetherApp {
     focused_terminal: Option<u64>,
     /// Tabs dragged out into their own native windows (see `ui::detach`).
     detached: Detacher,
+    /// AI agent sessions and the resource monitor (`app_agents.rs`).
+    agents: crate::agents::AgentHub,
+    agents_open: bool,
 }
 
 /// `TETHER_CONFIG_DIR` overrides the location (portable installs, tests).
@@ -91,6 +96,7 @@ impl TetherApp {
         crate::themes::apply_saved(&cc.egui_ctx);
         crate::updater::check_on_startup(&cc.egui_ctx);
         crate::pty::shells::warm_up();
+        crate::agents::launch::warm_up();
         let toasts = Toasts::default();
         let mut store = ProfileStore::load(dir.join("profiles.json")).unwrap_or_else(|e| {
             toasts.error(format!("Could not read profiles: {e:#}"));
@@ -109,6 +115,7 @@ impl TetherApp {
             KeyStore::default()
         });
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("tether-io").build()?;
+        let agents = crate::agents::AgentHub::new(rt.handle(), &cc.egui_ctx);
         Ok(Self {
             rt,
             pool: Pool::new(KnownHosts::load(dir.join("known_hosts.json"))),
@@ -132,6 +139,8 @@ impl TetherApp {
             in_use: Arc::default(),
             focused_terminal: None,
             detached: Detacher::default(),
+            agents,
+            agents_open: false,
         })
     }
 
@@ -315,7 +324,7 @@ impl TetherApp {
     /// Shows the native windows of detached tabs and applies their tab output like
     /// `workspace_area` does for the main dock.
     fn detached_windows(&mut self, ctx: &egui::Context) {
-        let mut viewer = Viewer::default();
+        let mut viewer = Viewer { time: ctx.input(|i| i.time), ..Viewer::default() };
         self.detached.frame(ctx, &mut self.dock, &mut viewer);
         if viewer.focused_uid.is_some() {
             self.focused_terminal = viewer.focused_uid;
@@ -461,6 +470,12 @@ impl TetherApp {
         if pressed(Action::PrevTab) {
             self.cycle_tab(false);
         }
+        if pressed(Action::NextAttention) {
+            self.focus_next_attention(ctx);
+        }
+        if pressed(Action::ToggleAgents) {
+            self.agents_open = !self.agents_open;
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -489,6 +504,7 @@ impl TetherApp {
                 }
                 let tabs = self.all_tabs().count();
                 ui.label(RichText::new(format!("{tabs} session{}", if tabs == 1 { "" } else { "s" })).size(11.5).color(theme::text_faint()));
+                self.agents_top_bar(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Gear, 24.0).on_hover_text(keybindings::hint("Settings", Action::OpenSettings)).clicked() {
                         self.settings_view.get_or_insert_with(SettingsView::new);
@@ -553,7 +569,7 @@ impl TetherApp {
                 style.tab.tab_body.bg_fill = theme::surface().gamma_multiply(crate::themes::window_opacity());
                 crate::ui::backdrop::paint_frame(ui, egui::vec2(6.0, 6.0));
             }
-            let mut viewer = Viewer::default();
+            let mut viewer = Viewer { time: ui.input(|i| i.time), ..Viewer::default() };
             crate::ui::tabs::apply_commands(&mut self.dock, self.rt.handle(), ui.ctx());
             DockArea::new(&mut self.dock)
                 .style(style)
@@ -566,6 +582,7 @@ impl TetherApp {
                 .show_leaf_close_all_buttons(false)
                 .show_inside(ui, &mut viewer);
             self.open_local_in(std::mem::take(&mut viewer.new_local), ui.ctx());
+            self.open_agents_in(std::mem::take(&mut viewer.new_agent), ui.ctx());
             if viewer.focused_uid.is_some() {
                 self.focused_terminal = viewer.focused_uid;
             }
@@ -581,6 +598,7 @@ impl TetherApp {
 
     fn route_input(&mut self, inputs: Vec<(u64, Vec<u8>)>) {
         for (uid, bytes) in inputs {
+            self.note_agent_input(uid);
             for tab in self.dock.iter_all_tabs().map(|(_, t)| t).chain(self.detached.tabs()) {
                 if let TabBody::Terminal(t) = &tab.body
                     && (tab.uid == uid || self.broadcast)
@@ -828,6 +846,8 @@ impl eframe::App for TetherApp {
         self.handle_shortcuts(&ctx);
         self.top_bar(ui);
         self.side_panel(ui);
+        self.agents_frame(&ctx);
+        self.agents_side_panel(ui);
         {
             let mut docks: Vec<&mut DockState<Tab>> = std::iter::once(&mut self.dock).chain(self.detached.docks_mut()).collect();
             link_terminals(&mut docks, self.focused_terminal);

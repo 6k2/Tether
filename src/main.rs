@@ -5,6 +5,12 @@ use std::sync::Arc;
 use tether::app;
 
 fn main() -> eframe::Result {
+    // `tether hook <agent> [event]`: run by agent hooks. Reports and exits; no window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("hook") {
+        tether::agents::hook::run(&args[2..]);
+        return Ok(());
+    }
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("tether")
         .with_inner_size([1360.0, 840.0])

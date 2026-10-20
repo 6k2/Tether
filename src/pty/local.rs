@@ -40,6 +40,11 @@ pub fn run_local_pty(
     cmd.env("TERM", TERM_NAME);
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TETHER_SESSION", &term.tag);
+    cmd.env("TERM_PROGRAM", "tether");
+    // Where `tether hook` reports agent status (see `agents::ipc`).
+    for (key, value) in crate::agents::ipc::session_env() {
+        cmd.env(key, value);
+    }
     if let Some(dir) = cwd.filter(|d| d.is_dir()).or_else(home_dir) {
         cmd.cwd(dir);
     }
@@ -97,6 +102,7 @@ fn pump_output(mut reader: Box<dyn Read + Send>, term: &TerminalHandle) {
         if let Ok(mut s) = term.shared.lock() {
             s.parser.process(chunk);
             s.generation = s.generation.wrapping_add(1);
+            s.last_output = Some(Instant::now());
             if contains(chunk, CURSOR_QUERY) {
                 let (row, col) = s.parser.screen().cursor_position();
                 cursor_report = Some(format!("\x1b[{};{}R", row + 1, col + 1));

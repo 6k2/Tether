@@ -201,6 +201,39 @@ impl Default for UpdateSettings {
     }
 }
 
+/// AI agent sessions (`agents`) and the per-terminal resource monitor (`procmon`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// CPU / memory chip on local terminal tabs and the app total in the top bar.
+    pub show_usage: bool,
+    /// Status badges on tabs of terminals running an agent.
+    pub badges: bool,
+    /// Native notification when a session needs you while tether is in the background.
+    pub desktop_notifications: bool,
+    /// Flash the taskbar button in the same case.
+    pub flash_taskbar: bool,
+    /// Also notify when a session finishes a turn (not only when it asks something).
+    pub notify_on_done: bool,
+    /// Sampling period of the resource monitor (slower while tether is in the background).
+    pub monitor_interval_ms: u64,
+}
+
+impl AgentSettings {
+    pub const INTERVAL_MIN_MS: u64 = 500;
+    pub const INTERVAL_MAX_MS: u64 = 10_000;
+
+    pub fn monitor_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.monitor_interval_ms.clamp(Self::INTERVAL_MIN_MS, Self::INTERVAL_MAX_MS))
+    }
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self { show_usage: true, badges: true, desktop_notifications: true, flash_taskbar: true, notify_on_done: true, monitor_interval_ms: 1500 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
@@ -229,6 +262,7 @@ pub struct Settings {
     pub sftp: SftpSettings,
     pub editor: EditorSettings,
     pub updates: UpdateSettings,
+    pub agents: AgentSettings,
     /// Lower-case extension (no dot) -> how double-click opens it. Missing = `default_open`.
     pub open_with: BTreeMap<String, OpenWith>,
     pub default_open: OpenWith,

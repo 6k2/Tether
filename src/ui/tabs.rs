@@ -147,6 +147,10 @@ pub struct Viewer {
     pub focused_uid: Option<u64>,
     /// Shells picked from a pane's "+" menu, opened in that pane.
     pub new_local: Vec<(egui_dock::NodePath, &'static ShellSpec)>,
+    /// Agents picked from a pane's "+" menu (`agents_panel::launch_menu`).
+    pub new_agent: Vec<(egui_dock::NodePath, super::agents_panel::LaunchPick)>,
+    /// Frame time, for animated tab badges.
+    pub time: f64,
 }
 
 impl egui_dock::TabViewer for Viewer {
@@ -173,15 +177,14 @@ impl egui_dock::TabViewer for Viewer {
             (TabBody::Editor(e), _) => Some(if e.is_dirty() { format!("{} •", e.file_name()) } else { e.file_name().to_string() }),
         };
         let name = remote_title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| tab.profile.display_name().to_string());
-        let name: String = name.chars().take(32).collect();
+        let name: String = super::agent_badge::clean_title(&name).chars().take(32).collect();
         let mut job = egui::text::LayoutJob::default();
-        RichText::new("• ").color(tab.status_color()).size(16.0).append_to(
-            &mut job,
-            &egui::Style::default(),
-            egui::FontSelection::Default,
-            egui::Align::Center,
-        );
+        let time = self.time;
+        super::agent_badge::append_title_mark(&mut job, tab.uid, tab.status_color(), time);
         RichText::new(format!("{icon}  {name}")).size(12.5).append_to(&mut job, &egui::Style::default(), egui::FontSelection::Default, egui::Align::Center);
+        if tab.is_local() {
+            super::usage_chip::append_to_title(&mut job, tab.uid);
+        }
         job.into()
     }
 
@@ -244,6 +247,9 @@ impl egui_dock::TabViewer for Viewer {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        if tab.is_local() {
+            super::usage_chip::tab_tooltip(tab.uid, response);
+        }
         if let TabBody::Editor(e) = &tab.body {
             response.clone().on_hover_text(format!("{}:{}", tab.profile.display_name(), e.remote_path()));
         }
@@ -261,6 +267,9 @@ impl egui_dock::TabViewer for Viewer {
                 self.new_local.push((path, shell));
                 ui.close();
             }
+        }
+        if let Some(pick) = super::agents_panel::launch_menu(ui) {
+            self.new_agent.push((path, pick));
         }
     }
 

@@ -22,6 +22,7 @@ pub struct SectionState {
     confirm_reset: bool,
     bell_demo_at: Option<f64>,
     keyboard: super::settings_keyboard::KeyboardState,
+    agents: super::settings_agents::AgentsState,
 }
 
 impl SectionState {
@@ -39,6 +40,7 @@ pub fn show(ui: &mut Ui, section: Section, s: &mut Settings, st: &mut SectionSta
         Section::Editor => editor(ui, s),
         Section::FileTypes => file_types(ui, s, st),
         Section::Keyboard => super::settings_keyboard::show(ui, s, &mut st.keyboard, CARD_GAP),
+        Section::Agents => super::settings_agents::show(ui, s, &mut st.agents, CARD_GAP),
         Section::About => about(ui, s, st),
     }
 }

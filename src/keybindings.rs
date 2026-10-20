@@ -23,6 +23,8 @@ pub enum Action {
     CloseTab,
     NextTab,
     PrevTab,
+    NextAttention,
+    ToggleAgents,
     FontBigger,
     FontSmaller,
     FontReset,
@@ -54,7 +56,7 @@ impl Group {
 }
 
 impl Action {
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 24] = [
         Action::ToggleSidebar,
         Action::OpenSettings,
         Action::KeyManager,
@@ -70,6 +72,8 @@ impl Action {
         Action::CloseTab,
         Action::NextTab,
         Action::PrevTab,
+        Action::NextAttention,
+        Action::ToggleAgents,
         Action::FontBigger,
         Action::FontSmaller,
         Action::FontReset,
@@ -96,6 +100,8 @@ impl Action {
             Action::CloseTab => "Close tab",
             Action::NextTab => "Next tab",
             Action::PrevTab => "Previous tab",
+            Action::NextAttention => "Next agent session needing attention",
+            Action::ToggleAgents => "Toggle the agents panel",
             Action::FontBigger => "Larger font",
             Action::FontSmaller => "Smaller font",
             Action::FontReset => "Reset font size",
@@ -122,7 +128,9 @@ impl Action {
             | Action::ToggleBroadcast
             | Action::CloseTab
             | Action::NextTab
-            | Action::PrevTab => Group::Sessions,
+            | Action::PrevTab
+            | Action::NextAttention
+            | Action::ToggleAgents => Group::Sessions,
             Action::FontBigger | Action::FontSmaller | Action::FontReset => Group::Terminal,
             Action::SftpBack | Action::SftpForward | Action::SftpUp | Action::SftpRefresh => Group::Sftp,
         }
@@ -148,6 +156,8 @@ impl Action {
             Action::CloseTab => cs(Key::W),
             Action::NextTab => c(Key::Tab),
             Action::PrevTab => cs(Key::Tab),
+            Action::NextAttention => cs(Key::A),
+            Action::ToggleAgents => cs(Key::J),
             Action::FontBigger => c(Key::Equals),
             Action::FontSmaller => cs(Key::Minus),
             Action::FontReset => c(Key::Num0),

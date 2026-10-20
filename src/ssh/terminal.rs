@@ -40,6 +40,10 @@ pub struct Events {
     pub bell_count: u64,
     /// Working directory reported by the shell via OSC 7 (`file://host/path`), if it does.
     pub cwd: Option<String>,
+    /// Desktop notifications the program asked for (OSC 9 / OSC 777 / OSC 99): how many,
+    /// and the latest text. `agents::hub` turns them into session states.
+    pub notice_count: u64,
+    pub notice: Option<String>,
 }
 
 impl vt100::Callbacks for Events {
@@ -52,10 +56,51 @@ impl vt100::Callbacks for Events {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        if let [b"7", uri, ..] = params {
-            self.cwd = osc7_path(uri);
+        match params {
+            [b"7", uri, ..] => self.cwd = osc7_path(uri),
+            // A title containing ';' is split into more params than vt100 matches.
+            [b"0" | b"2", rest @ ..] if !rest.is_empty() => self.title = Some(join_params(rest)),
+            _ => {
+                if let Some(text) = osc_notification(params) {
+                    self.notice_count += 1;
+                    self.notice = Some(text);
+                }
+            }
         }
     }
+}
+
+fn join_params(parts: &[&[u8]]) -> String {
+    String::from_utf8_lossy(&parts.join(&b';')).into_owned()
+}
+
+/// The text of a desktop-notification OSC: `9;<msg>` (iTerm2 / Windows Terminal; `9;4;..`
+/// is ConEmu's progress bar, not a message), `777;notify;<title>;<body>` (urxvt / Ghostty)
+/// and `99;<meta>;<payload>` (kitty). vt100's parser (vte) reassembles sequences split
+/// across reads, so this sees whole sequences only.
+pub fn osc_notification(params: &[&[u8]]) -> Option<String> {
+    let text = match params {
+        [b"9", first, rest @ ..] => {
+            if !first.is_empty() && first.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let mut all = vec![*first];
+            all.extend_from_slice(rest);
+            join_params(&all)
+        }
+        [b"777", b"notify", title, body @ ..] => {
+            let (title, body) = (String::from_utf8_lossy(title), join_params(body));
+            match (title.trim().is_empty(), body.trim().is_empty()) {
+                (_, true) => title.into_owned(),
+                (true, false) => body,
+                (false, false) => format!("{title}: {body}"),
+            }
+        }
+        [b"99", _meta, payload @ ..] => join_params(payload),
+        _ => return None,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// `file://host/some%20dir` -> `/some dir`.
@@ -93,6 +138,8 @@ pub struct TermShared {
     pub opened_at: Option<std::time::Instant>,
     /// OS process id of a local shell (`pty::local`); `None` for SSH sessions.
     pub pid: Option<u32>,
+    /// When the last output chunk arrived (local shells), for activity detection.
+    pub last_output: Option<std::time::Instant>,
 }
 
 pub enum TermCmd {
@@ -122,6 +169,7 @@ impl TerminalHandle {
             stage: Stage::Connecting,
             opened_at: None,
             pid: None,
+            last_output: None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let tag = uuid::Uuid::new_v4().simple().to_string();
@@ -235,4 +283,57 @@ pub async fn run_shell(
     term.set_state(LinkState::Closed(reason));
     repaint();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser() -> vt100::Parser<Events> {
+        vt100::Parser::new_with_callbacks(24, 80, 0, Events::default())
+    }
+
+    #[test]
+    fn notifications_are_extracted_even_when_split_across_chunks() {
+        let stream: &[u8] = b"hi\x1b]777;notify;Claude Code;Needs your permission; to use Bash\x07\x1b]9;Task done\x1b\\\x1b]9;4;3;50\x07";
+        // Every split point, including inside the ESC ] introducer and the ST terminator.
+        for cut in 0..=stream.len() {
+            let mut p = parser();
+            p.process(&stream[..cut]);
+            p.process(&stream[cut..]);
+            assert_eq!(p.callbacks().notice_count, 2, "cut at {cut}");
+            assert_eq!(p.callbacks().notice.as_deref(), Some("Task done"), "cut at {cut}");
+        }
+        // Byte by byte.
+        let mut p = parser();
+        for b in stream {
+            p.process(std::slice::from_ref(b));
+        }
+        assert_eq!(p.callbacks().notice_count, 2);
+        let mut p = parser();
+        p.process(&stream[..stream.len() - 26]);
+        assert_eq!(p.callbacks().notice.as_deref(), Some("Claude Code: Needs your permission; to use Bash"));
+    }
+
+    #[test]
+    fn osc_notification_forms() {
+        assert_eq!(osc_notification(&[b"9", b"hello"]).as_deref(), Some("hello"));
+        assert_eq!(osc_notification(&[b"9", b"4", b"1", b"20"]), None, "ConEmu progress");
+        assert_eq!(osc_notification(&[b"777", b"notify", b"", b"body"]).as_deref(), Some("body"));
+        assert_eq!(osc_notification(&[b"777", b"notify", b"Title"]).as_deref(), Some("Title"));
+        assert_eq!(osc_notification(&[b"99", b"i=1:d=0", b"Build finished"]).as_deref(), Some("Build finished"));
+        assert_eq!(osc_notification(&[b"8", b"", b"http://x"]), None);
+        assert_eq!(osc_notification(&[b"9", b"  "]), None);
+    }
+
+    #[test]
+    fn titles_with_semicolons_and_cwd() {
+        let mut p = parser();
+        p.process("\x1b]0;\u{2810} fix; then test\x07".as_bytes());
+        assert_eq!(p.callbacks().title.as_deref(), Some("\u{2810} fix; then test"));
+        p.process(b"\x1b]2;plain\x07\x1b]7;file://host/home/me%20x\x07");
+        assert_eq!(p.callbacks().title.as_deref(), Some("plain"));
+        assert_eq!(p.callbacks().cwd.as_deref(), Some("/home/me x"));
+        assert_eq!(p.callbacks().notice_count, 0);
+    }
 }

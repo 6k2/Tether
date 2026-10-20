@@ -1,5 +1,6 @@
 //! tether: SSH terminals (Termius-style split workspace) + pipelined SFTP (Bitvise-style).
 
+pub mod agents;
 pub mod app;
 pub mod commands;
 pub mod folders;
@@ -9,6 +10,7 @@ pub mod json_file;
 pub mod keybindings;
 pub mod keystore;
 pub mod known_hosts;
+pub mod procmon;
 pub mod profile;
 pub mod pty;
 pub mod remote_edit;

@@ -70,6 +70,8 @@ pub struct TerminalView {
     typed_line: String,
     /// Hand `nano <file>` to the built-in SFTP editor (off for local shells).
     pub intercept_nano: bool,
+    /// Take keyboard focus on the next frame (the agents panel jumping to this tab).
+    pub want_focus: bool,
     /// Boxed to keep `TabBody` small.
     cache: Box<ViewCache>,
 }
@@ -124,6 +126,7 @@ impl TerminalView {
             prompt_col: None,
             typed_line: String::new(),
             intercept_nano: true,
+            want_focus: false,
             cache: Box::new(ViewCache { grid: GridCache::default(), title: None, cwd: None, link: LinkState::Connecting }),
         }
     }
@@ -162,7 +165,7 @@ impl TerminalView {
         let id = ui.id().with("terminal");
         let response = ui.interact(rect, id, Sense::click_and_drag());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Terminal"));
-        if response.clicked() || response.drag_started() {
+        if response.clicked() || response.drag_started() || std::mem::take(&mut self.want_focus) {
             response.request_focus();
         }
         let focused = response.has_focus();

@@ -25,12 +25,13 @@ pub enum Section {
     Editor,
     FileTypes,
     Keyboard,
+    Agents,
     About,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] =
-        [Section::Appearance, Section::Terminal, Section::Sftp, Section::Editor, Section::FileTypes, Section::Keyboard, Section::About];
+    pub const ALL: [Section; 8] =
+        [Section::Appearance, Section::Terminal, Section::Sftp, Section::Editor, Section::FileTypes, Section::Keyboard, Section::Agents, Section::About];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -40,6 +41,7 @@ impl Section {
             Section::Editor => "Editor",
             Section::FileTypes => "File types",
             Section::Keyboard => "Keyboard",
+            Section::Agents => "AI agents",
             Section::About => "About",
         }
     }
@@ -52,6 +54,7 @@ impl Section {
             Section::Editor => "The built-in remote file editor",
             Section::FileTypes => "Choose what opens each kind of file",
             Section::Keyboard => "Click a shortcut, then press the new keys",
+            Section::Agents => "Claude Code, Codex and other agent sessions, CPU and memory",
             Section::About => "Version, shortcuts and maintenance",
         }
     }
@@ -64,6 +67,7 @@ impl Section {
             Section::Editor => Icon::Editor,
             Section::FileTypes => Icon::FileType,
             Section::Keyboard => Icon::Keyboard,
+            Section::Agents => Icon::Server,
             Section::About => Icon::Info,
         }
     }

@@ -1,3 +1,5 @@
+pub mod agent_badge;
+pub mod agents_panel;
 pub mod autocomplete;
 pub mod backdrop;
 pub mod code_editor;
@@ -16,6 +18,7 @@ pub mod loading;
 pub mod nav_history;
 pub mod path_complete;
 pub mod path_field;
+pub mod settings_agents;
 pub mod settings_keyboard;
 pub mod settings_sections;
 pub mod settings_view;
@@ -35,3 +38,4 @@ pub mod toast;
 pub mod transfers_view;
 pub mod type_select;
 pub mod update_banner;
+pub mod usage_chip;

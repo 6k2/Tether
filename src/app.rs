@@ -509,13 +509,20 @@ impl TetherApp {
     }
 
     fn workspace_area(&mut self, ui: &mut egui::Ui) {
-        let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 0, right: 6, top: 0, bottom: 6 });
+        // Translucent window: the panel must not stack its fill under the terminals.
+        let see_through = crate::themes::see_through() && self.dock.iter_all_tabs().next().is_some();
+        let fill = if see_through { egui::Color32::TRANSPARENT } else { theme::bg() };
+        let frame = egui::Frame::new().fill(fill).inner_margin(egui::Margin { left: 0, right: 6, top: 0, bottom: 6 });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.dock.iter_all_tabs().next().is_none() {
                 self.welcome(ui);
                 return;
             }
-            let style = theme::dock_style(ui.style());
+            let mut style = theme::dock_style(ui.style());
+            if see_through {
+                style.tab.tab_body.bg_fill = theme::surface().gamma_multiply(crate::themes::window_opacity());
+                crate::ui::backdrop::paint_frame(ui, egui::vec2(6.0, 6.0));
+            }
             let mut viewer = Viewer::default();
             crate::ui::tabs::apply_commands(&mut self.dock, self.rt.handle(), ui.ctx());
             DockArea::new(&mut self.dock)
@@ -679,8 +686,14 @@ impl TetherApp {
 }
 
 impl eframe::App for TetherApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Panels cover the window; transparent so window opacity can reach the desktop.
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        crate::themes::follow_system(&ctx);
         self.handle_shortcuts(&ctx);
         self.top_bar(ui);
         self.side_panel(ui);

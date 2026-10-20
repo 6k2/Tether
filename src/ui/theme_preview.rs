@@ -4,10 +4,12 @@
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 
 use crate::theme::Palette;
+use crate::themes::Gradient;
 
-/// Paints a fake tether window into `rect`: chrome, sidebar with hosts, a tab and
-/// a few coloured terminal lines with a cursor.
-pub fn paint(painter: &egui::Painter, rect: Rect, p: &Palette) {
+/// Paints a fake tether window into `rect`: chrome, sidebar with hosts, a tab,
+/// a few coloured terminal lines with a cursor and a strip of the 16 ANSI colours.
+/// `gradient` (a Warp-style theme background) replaces the flat terminal colour.
+pub fn paint(painter: &egui::Painter, rect: Rect, p: &Palette, gradient: Option<Gradient>) {
     let r = |v: f32| CornerRadius::same(v.round().clamp(0.0, 255.0) as u8);
     let s = rect.height() / 100.0; // scale unit
     painter.rect_filled(rect, r(8.0 * s.min(1.2)), p.bg);
@@ -46,7 +48,24 @@ pub fn paint(painter: &egui::Painter, rect: Rect, p: &Palette) {
     painter.rect_filled(ghost, r(1.2 * s), p.text_faint.gamma_multiply(0.7));
 
     let body = Rect::from_min_max(Pos2::new(main.left(), tab.bottom() + 3.0 * s), main.max);
-    painter.rect(body, r(4.0 * s), p.term_bg, Stroke::new(1.0, p.border.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+    painter.rect_filled(body, r(4.0 * s), p.term_bg);
+    if let Some(g) = gradient {
+        paint_gradient(painter, body.shrink(1.0), g);
+    }
+    painter.rect_stroke(body, r(4.0 * s), Stroke::new(1.0, p.border.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+    // ANSI strip along the bottom of the terminal: normal colours over bright ones.
+    let strip_h = (4.0 * s).max(3.0);
+    let strip = Rect::from_min_max(
+        Pos2::new(body.left() + 5.0 * s, body.bottom() - 5.0 * s - strip_h * 2.0),
+        Pos2::new(body.right() - 5.0 * s, body.bottom() - 5.0 * s),
+    );
+    let cell_w = strip.width() / 8.0;
+    for (i, c) in p.ansi.iter().enumerate() {
+        let (col, row) = ((i % 8) as f32, (i / 8) as f32);
+        let cell = Rect::from_min_size(Pos2::new(strip.left() + col * cell_w, strip.top() + row * strip_h), Vec2::new(cell_w, strip_h));
+        painter.rect_filled(cell, 0.0, *c);
+    }
+    let body = Rect::from_min_max(body.min, Pos2::new(body.right(), strip.top() - 1.0 * s));
 
     // Terminal lines as coloured runs: (colour, width fraction).
     let a = &p.ansi;
@@ -82,4 +101,17 @@ pub fn paint(painter: &egui::Painter, rect: Rect, p: &Palette) {
     let badge = Pos2::new(rect.right() - 9.0 * s, rect.top() + 7.0 * s);
     painter.circle_filled(badge, 3.2 * s, p.accent);
     painter.circle_filled(badge, 1.2 * s, p.on_accent);
+}
+
+/// Two-stop gradient as a vertex-coloured mesh.
+fn paint_gradient(painter: &egui::Painter, rect: Rect, g: Gradient) {
+    let mut mesh = egui::Mesh::default();
+    let (a, b) = (g.start, g.end);
+    let corners = if g.vertical { [a, a, b, b] } else { [a, b, b, a] };
+    for (pos, c) in [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()].into_iter().zip(corners) {
+        mesh.colored_vertex(pos, c);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
 }

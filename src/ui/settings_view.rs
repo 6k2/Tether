@@ -171,7 +171,8 @@ impl SettingsView {
     }
 
     fn finish(&mut self, ctx: &egui::Context) {
-        themes::finish(ctx);
+        // Also drops a hover preview from the theme gallery.
+        themes::apply(ctx, &settings::get().appearance.theme);
         crate::keybindings::set_recording(false);
         if self.pending_save {
             let _ = settings::save();
@@ -185,6 +186,7 @@ impl SettingsView {
         if draft != *before {
             let theme_changed = !draft.appearance.theme.eq_ignore_ascii_case(&before.appearance.theme);
             let anim_changed = draft.appearance.animations != before.appearance.animations;
+            let draft_appearance = draft.appearance.clone();
             if dragging {
                 settings::preview(|s| *s = draft);
                 self.pending_save = true;
@@ -192,10 +194,18 @@ impl SettingsView {
                 let _ = settings::update(|s| *s = draft);
                 self.pending_save = false;
             }
+            let (a, b) = (&draft_appearance, &before.appearance);
+            let backdrop_changed = a.window_opacity != b.window_opacity || a.background_images != b.background_images;
             if theme_changed {
                 themes::apply_animated(ctx, &settings::get().appearance.theme);
             } else if anim_changed {
                 theme::install(ctx);
+            }
+            if backdrop_changed {
+                themes::refresh(ctx);
+            }
+            if a.terminal_font != b.terminal_font {
+                crate::fonts::apply(ctx);
             }
         }
         if !dragging {
@@ -373,6 +383,16 @@ mod tests {
                 let file = format!("settings-{}-{:?}.png", name.replace(' ', "-").to_lowercase(), section).to_lowercase();
                 img.save(dir.join(file)).unwrap();
             }
+        }
+        // Gallery in a gradient theme and in a light one.
+        for name in ["Synthwave '84", "GitHub Light"] {
+            themes::apply(&h.ctx, name);
+            h.state_mut().section = Section::Appearance;
+            for _ in 0..30 {
+                h.step();
+            }
+            let file = format!("settings-gallery-{}.png", name.replace([' ', '\''], "-").to_lowercase());
+            h.render().expect("render").save(dir.join(file)).unwrap();
         }
         themes::apply(&h.ctx, themes::DEFAULT_THEME);
     }

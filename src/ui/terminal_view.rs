@@ -116,6 +116,7 @@ impl TerminalView {
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::term_bg());
+        super::backdrop::paint(&painter, rect);
 
         let shared_arc = self.handle.shared.clone();
         let Ok(mut shared) = shared_arc.lock() else { return out };

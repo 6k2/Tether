@@ -118,14 +118,11 @@ impl Tab {
         super::agent_badge::clean_title(&name).to_string()
     }
 
-    /// Second line in the vertical tab list: folder for local shells, address for
-    /// remote ones, the file path for editors.
+    /// Second line in the vertical tab list: folder for local shells (else the shell's
+    /// full name), address for remote ones, the file path for editors.
     pub fn subtitle(&self) -> String {
         match (&self.body, &self.local) {
-            (TabBody::Terminal(t), Some(shell)) => t.remote_cwd().map(short_path).unwrap_or_else(|| {
-                let program = shell.program.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-                format!("Local shell · {program}")
-            }),
+            (TabBody::Terminal(t), Some(shell)) => t.remote_cwd().map_or_else(|| shell.name.clone(), short_path),
             (TabBody::Terminal(_), None) => self.profile.address(),
             (TabBody::Sftp(_), _) => format!("SFTP · {}", self.profile.address()),
             (TabBody::Editor(e), _) => e.remote_path().to_string(),

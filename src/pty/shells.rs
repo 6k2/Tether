@@ -56,6 +56,21 @@ pub struct ShellSpec {
 }
 
 impl ShellSpec {
+    /// A compact name for tab titles: `PowerShell`, `pwsh 7`, `cmd`, `Git Bash`, `Ubuntu`,
+    /// `zsh` (menus keep the full [`Self::name`]).
+    pub fn short_name(&self) -> String {
+        match self.id.as_str() {
+            "powershell" => "PowerShell".into(),
+            "cmd" => "cmd".into(),
+            "pwsh" => {
+                // `…\PowerShell\7\pwsh.exe` -> "pwsh 7".
+                let version = self.program.parent().and_then(|d| d.file_name()).and_then(|v| v.to_str()).filter(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+                version.map_or_else(|| "pwsh".into(), |v| format!("pwsh {v}"))
+            }
+            id => id.strip_prefix("wsl:").map_or_else(|| self.name.clone(), str::to_string),
+        }
+    }
+
     fn new(id: impl Into<String>, name: impl Into<String>, program: impl Into<PathBuf>, args: &[&str], icon_kind: ShellIcon) -> Self {
         Self { id: id.into(), name: name.into(), program: program.into(), args: args.iter().map(|a| a.to_string()).collect(), icon_kind }
     }
@@ -310,6 +325,17 @@ mod tests {
         let dirs = vec![mk("7"), mk("7-preview"), mk("10"), dir.path().join("6")];
         assert_eq!(newest_pwsh(&dirs), Some(dir.path().join("10").join("pwsh.exe")));
         assert_eq!(newest_pwsh(&[]), None);
+    }
+
+    #[test]
+    fn short_names_for_tabs() {
+        let spec = |id: &str, name: &str, program: &str| ShellSpec::new(id, name, program, &[], ShellIcon::PowerShell);
+        assert_eq!(spec("powershell", "Windows PowerShell", "powershell.exe").short_name(), "PowerShell");
+        assert_eq!(spec("pwsh", "PowerShell", r"C:\Program Files\PowerShell\7\pwsh.exe").short_name(), "pwsh 7");
+        assert_eq!(spec("pwsh", "PowerShell", r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe").short_name(), "pwsh");
+        assert_eq!(spec("wsl:Ubuntu-22.04", "Ubuntu-22.04 (WSL)", "wsl.exe").short_name(), "Ubuntu-22.04");
+        assert_eq!(spec("cmd", "Command Prompt", "cmd.exe").short_name(), "cmd");
+        assert_eq!(spec("git-bash", "Git Bash", "bash.exe").short_name(), "Git Bash");
     }
 
     #[test]

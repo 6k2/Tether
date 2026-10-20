@@ -16,6 +16,10 @@ const ROW_H: f32 = 64.0;
 pub enum PanelAction {
     Focus(u64),
     Close,
+    /// Start an agent from the empty state.
+    Launch(LaunchPick),
+    /// Settings › AI agents (hook installer).
+    InstallHooks,
 }
 
 /// An agent picked from a "+" menu.
@@ -72,22 +76,13 @@ pub fn list_height(sessions: &[SessionInfo]) -> f32 {
     if sessions.is_empty() { EMPTY_H } else { sessions.len() as f32 * (ROW_H + 4.0) }
 }
 
-const EMPTY_H: f32 = 92.0;
+const EMPTY_H: f32 = 136.0;
 
 /// The sessions without a header (the sidebar's "Agents" section draws its own).
 pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option<PanelAction> {
     let mut action = None;
     if sessions.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new("No agent sessions").color(theme::text_dim()));
-        ui.label(
-            RichText::new(
-                "Run claude, codex, gemini, opencode or aider in a local terminal and it shows up here. Settings › AI agents installs hooks for exact states.",
-            )
-            .size(11.5)
-            .color(theme::text_faint()),
-        );
-        return action;
+        return empty_state(ui);
     }
     let time = ui.input(|i| i.time);
     egui::ScrollArea::vertical().id_salt("agents_list").auto_shrink([false, false]).show(ui, |ui| {
@@ -98,6 +93,53 @@ pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option
             ui.add_space(4.0);
         }
     });
+    action
+}
+
+/// A card instead of the list: what shows up here, and the two ways to get started.
+fn empty_state(ui: &mut egui::Ui) -> Option<PanelAction> {
+    use super::settings_widgets::{Icon, paint_icon};
+    let mut action = None;
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(theme::surface_2().gamma_multiply(0.7))
+        .stroke(egui::Stroke::new(1.0, theme::border().gamma_multiply(0.6)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (tile, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                ui.painter().rect_filled(tile, CornerRadius::same(8), theme::accent_soft());
+                paint_icon(ui.painter(), tile.shrink(7.0), Icon::Sparkle, theme::accent());
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new("No agent sessions").size(13.0).color(theme::text()));
+                    ui.label(RichText::new("Agents in local terminals show up here").size(11.0).color(theme::text_faint()));
+                });
+            });
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let width = ui.available_width();
+                let wide = |text: RichText, fill| egui::Button::new(text).fill(fill).corner_radius(CornerRadius::same(7)).min_size(Vec2::new(width, 26.0));
+                // Claude Code first when several agents are installed. Never waits on the PATH scan.
+                let found = launch::found().unwrap_or_default();
+                let first = found.iter().find(|l| l.kind == AgentKind::Claude).or_else(|| found.first());
+                if let Some(l) = first {
+                    let text = RichText::new(format!("{}  Launch {}", l.kind.glyph(), l.kind.name())).size(12.0).color(theme::text());
+                    let tip = format!("Run {} in a new default shell", l.command);
+                    if ui.add(wide(text, theme::accent_soft())).on_hover_text(tip).clicked() {
+                        action = Some(PanelAction::Launch(LaunchPick { kind: l.kind, command: l.command, pick_folder: false }));
+                    }
+                }
+                let hooks = RichText::new("Install hooks…").size(12.0).color(theme::text_dim());
+                let tip = "Settings › AI agents: exact states (working, waiting, done) from the agents' hooks";
+                if ui.add(wide(hooks, theme::surface_3())).on_hover_text(tip).clicked() {
+                    action = Some(PanelAction::InstallHooks);
+                }
+            });
+        });
     action
 }
 

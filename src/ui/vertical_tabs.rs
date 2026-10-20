@@ -3,7 +3,10 @@
 //! (hover ✕ or middle-click), reordered or moved between panes by dragging, and dropped
 //! onto the panes to split them. Used by the Sessions panel and the sidebar section.
 
-use eframe::egui::{self, Align2, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2};
+use std::sync::Arc;
+
+use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Galley, Id, Painter, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2};
 use egui_dock::{DockState, NodePath, Split};
 
 use super::tab_badges::TabBadges;
@@ -236,22 +239,17 @@ impl VerticalTabs {
         if renaming {
             self.rename_field(ui, row.uid, Rect::from_min_max(Pos2::new(text_x - 4.0, card.top() + 5.0), Pos2::new(card.right() - 6.0, card.bottom() - 5.0)), actions);
         } else {
-            let clip = Rect::from_min_max(Pos2::new(text_x, card.top()), Pos2::new(right.max(text_x + 10.0), card.bottom()));
-            let tp = p.with_clip_rect(clip.intersect(ui.clip_rect()));
+            let tp = p.with_clip_rect(card.intersect(ui.clip_rect()));
             let title_col = if row.visible { theme::text() } else { theme::text_dim().lerp_to_gamma(theme::text(), hover) };
-            if opts.compact {
-                tp.text(Pos2::new(text_x, card.center().y), Align2::LEFT_CENTER, &row.title, FontId::proportional(12.5), title_col.gamma_multiply(alpha));
-            } else {
-                tp.text(Pos2::new(text_x, card.center().y - 8.0), Align2::LEFT_CENTER, &row.title, FontId::proportional(13.0), title_col.gamma_multiply(alpha));
+            let title_w = (right - text_x).max(10.0);
+            let (size, y) = if opts.compact { (12.5, card.center().y) } else { (13.0, card.center().y - 8.0) };
+            let title = elide_end(&tp, &row.title, FontId::proportional(size), title_col.gamma_multiply(alpha), title_w);
+            tp.galley(Pos2::new(text_x, y - title.size().y / 2.0), title, Color32::PLACEHOLDER);
+            if !opts.compact {
                 // The subtitle runs under the chips too (they sit on the title line).
-                let sub_clip = Rect::from_min_max(Pos2::new(text_x, card.top()), Pos2::new(card.right() - 6.0 - close_w * hover, card.bottom()));
-                p.with_clip_rect(sub_clip.intersect(ui.clip_rect())).text(
-                    Pos2::new(text_x, card.center().y + 9.0),
-                    Align2::LEFT_CENTER,
-                    &row.subtitle,
-                    FontId::proportional(11.0),
-                    theme::text_faint().gamma_multiply(alpha),
-                );
+                let sub_w = (card.right() - 6.0 - close_w * hover - text_x).max(10.0);
+                let sub = elide_middle(&tp, &row.subtitle, FontId::proportional(11.0), theme::text_faint().gamma_multiply(alpha), sub_w);
+                tp.galley(Pos2::new(text_x, card.center().y + 9.0 - sub.size().y / 2.0), sub, Color32::PLACEHOLDER);
             }
         }
 
@@ -391,6 +389,42 @@ fn shells_menu(ui: &mut Ui, actions: &mut Vec<TabAction>) {
             ui.close();
         }
     }
+}
+
+/// `text` on one line, cut with "…" at the end to fit `max_w`.
+fn elide_end(p: &Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, color));
+    job.wrap = TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    p.layout_job(job)
+}
+
+/// `text` on one line, its middle replaced by "…" to fit `max_w` (paths keep their root
+/// and their last folders).
+fn elide_middle(p: &Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
+    let full = p.layout_no_wrap(text.to_owned(), font.clone(), color);
+    let chars: Vec<char> = text.chars().collect();
+    if full.size().x <= max_w || chars.len() < 3 {
+        return full;
+    }
+    // The longest cut that fits: binary search on how many characters are kept.
+    let cut = |keep: usize| {
+        let head = keep / 3;
+        let tail = keep - head;
+        let mut s: String = chars[..head].iter().collect();
+        s.push('…');
+        s.extend(&chars[chars.len() - tail..]);
+        s
+    };
+    let (mut lo, mut hi) = (0, chars.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if p.layout_no_wrap(cut(mid), font.clone(), color).size().x <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    p.layout_no_wrap(cut(lo), font, color)
 }
 
 fn row_h(opts: ListOptions) -> f32 {
@@ -590,6 +624,25 @@ mod tests {
 
     fn leaf() -> NodePath {
         NodePath { surface: SurfaceIndex::main(), node: NodeIndex::root() }
+    }
+
+    #[test]
+    fn long_titles_and_paths_are_elided_to_fit() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (p, font, c) = (ui.painter().clone(), FontId::proportional(13.0), Color32::WHITE);
+            let short = elide_end(&p, "pwsh 7", font.clone(), c, 200.0);
+            assert_eq!(short.text(), "pwsh 7");
+            let long = elide_end(&p, "Ubuntu-22.04 · a-very-long-project-folder-name", font.clone(), c, 90.0);
+            // The galley keeps the full text; the shown glyphs end in the ellipsis.
+            let last = long.rows.iter().flat_map(|r| r.glyphs.iter()).last().map(|g| g.chr);
+            assert!(long.size().x <= 90.5 && last == Some('…'), "{last:?} {}", long.size().x);
+            assert_eq!(long.rows.len(), 1);
+            let path = elide_middle(&p, "~/src/clients/acme/backend/services/billing", font.clone(), c, 140.0);
+            assert!(path.size().x <= 140.5, "{}", path.size().x);
+            assert!(path.text().starts_with("~/") && path.text().contains('…') && path.text().ends_with("billing"), "{}", path.text());
+        });
+        out.textures_delta.clear();
     }
 
     #[test]

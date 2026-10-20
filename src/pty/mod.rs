@@ -29,14 +29,14 @@ pub fn local_profile(spec: &ShellSpec) -> Profile {
 pub fn tab_title(spec: &ShellSpec, title: Option<&str>, cwd: Option<&str>) -> String {
     let folder = cwd.map(|c| c.trim_end_matches(['/', '\\'])).filter(|c| !c.is_empty()).map(|c| c.rsplit(['/', '\\']).next().unwrap_or(c));
     if let Some(folder) = folder {
-        return format!("{} · {folder}", spec.name);
+        return format!("{} · {folder}", spec.short_name());
     }
     let program = spec.program.to_string_lossy().to_lowercase();
     let stem = spec.program.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
     match title.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) if t.to_lowercase() == program || t.to_lowercase().trim_end_matches(".exe").ends_with(&stem) => spec.name.clone(),
+        Some(t) if t.to_lowercase() == program || t.to_lowercase().trim_end_matches(".exe").ends_with(&stem) => spec.short_name(),
         Some(t) => t.to_string(),
-        None => spec.name.clone(),
+        None => spec.short_name(),
     }
 }
 
@@ -57,11 +57,11 @@ mod tests {
     #[test]
     fn titles_prefer_cwd_and_drop_program_paths() {
         let s = pwsh();
-        assert_eq!(tab_title(&s, None, None), "PowerShell");
-        assert_eq!(tab_title(&s, Some(r"C:\Program Files\PowerShell\7\pwsh.exe"), None), "PowerShell");
+        assert_eq!(tab_title(&s, None, None), "pwsh 7");
+        assert_eq!(tab_title(&s, Some(r"C:\Program Files\PowerShell\7\pwsh.exe"), None), "pwsh 7");
         assert_eq!(tab_title(&s, Some("vim notes.md"), None), "vim notes.md");
-        assert_eq!(tab_title(&s, Some("ignored"), Some("/home/loki/project/")), "PowerShell · project");
-        assert_eq!(tab_title(&s, None, Some("/")), "PowerShell");
+        assert_eq!(tab_title(&s, Some("ignored"), Some("/home/loki/project/")), "pwsh 7 · project");
+        assert_eq!(tab_title(&s, None, Some("/")), "pwsh 7");
     }
 
     #[test]

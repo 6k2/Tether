@@ -207,12 +207,12 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, hit: &Hit, selected: bool) -> egu
         let bar = Rect::from_center_size(Pos2::new(card.left() + 1.5, card.center().y), Vec2::new(3.0, 18.0));
         p.rect_filled(bar, CornerRadius::same(2), theme::accent());
     }
-    // Category chip.
-    let cat = p.layout_no_wrap(entry.category.to_string(), FontId::proportional(10.5), theme::text_faint());
-    let chip = Rect::from_min_size(Pos2::new(card.left() + 12.0, card.center().y - 9.0), Vec2::new(cat.size().x + 12.0, 18.0));
-    p.rect_filled(chip, CornerRadius::same(5), theme::surface_3().gamma_multiply(if selected { 1.0 } else { 0.6 }));
-    p.galley(chip.center() - cat.size() / 2.0, cat, theme::text_faint());
-    let text_x = card.left() + 92.0f32.max(chip.right() - card.left() + 22.0);
+    // A small icon for the kind; its name goes on the right, before the keys.
+    let tile = Rect::from_center_size(Pos2::new(card.left() + 24.0, card.center().y), Vec2::splat(ICON_COL));
+    p.rect_filled(tile, CornerRadius::same(6), theme::surface_3().gamma_multiply(if selected { 1.0 } else { 0.6 }));
+    let icon_col = if selected { theme::accent() } else { theme::text_dim() };
+    super::settings_widgets::paint_icon(p, tile.shrink(5.0), category_icon(entry.category), icon_col);
+    let text_x = tile.right() + 10.0;
 
     // Keys on the right.
     let mut right = card.right() - 10.0;
@@ -227,6 +227,11 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, hit: &Hit, selected: bool) -> egu
         }
     }
 
+    let cat = p.layout_no_wrap(entry.category.to_string(), FontId::proportional(10.5), theme::text_faint().gamma_multiply(0.8));
+    right -= if entry.keys.is_some() { 8.0 } else { 0.0 };
+    p.galley(Pos2::new(right - cat.size().x, card.center().y - cat.size().y / 2.0), cat.clone(), theme::text_faint());
+    right -= cat.size().x;
+
     let clip = Rect::from_min_max(Pos2::new(text_x, card.top()), Pos2::new(right - 8.0, card.bottom()));
     let tp = p.with_clip_rect(clip);
     let galley = p.layout_job(highlighted(&entry.title, &hit.title_matches, selected));
@@ -236,6 +241,24 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, hit: &Hit, selected: bool) -> egu
         tp.text(Pos2::new(text_x + title_w + 10.0, card.center().y), Align2::LEFT_CENTER, &entry.detail, FontId::proportional(12.0), theme::text_faint());
     }
     resp
+}
+
+/// Side of the kind icon in front of each entry.
+const ICON_COL: f32 = 24.0;
+
+fn category_icon(category: &str) -> super::settings_widgets::Icon {
+    use super::settings_widgets::Icon;
+    match category {
+        "Shell" | "Terminal" => Icon::Terminal,
+        "Host" => Icon::Server,
+        "SFTP" => Icon::Folder,
+        "Tab" => Icon::Rows,
+        "Pane" | "Layout" | "Workspace" => Icon::Layout,
+        "Agent" => Icon::Sparkle,
+        "Theme" => Icon::Appearance,
+        "Keys" => Icon::Keyboard,
+        _ => Icon::Gear,
+    }
 }
 
 /// The title with matched characters in the accent colour.

@@ -20,8 +20,9 @@ impl TabBadges {
         if crate::settings::snapshot().agents.show_usage
             && let Some(u) = crate::procmon::usage_for(tab.uid)
         {
-            let colour = if u.cpu >= 50.0 { theme::warn().gamma_multiply(0.85) } else { theme::text_faint() };
-            let chip = ui.add(egui::Label::new(RichText::new(usage_chip::label(&u)).size(10.5).color(colour)).sense(Sense::hover()));
+            // Dimmer than the title: the numbers are secondary to the tab's name.
+            let colour = if u.cpu >= 50.0 { theme::warn().gamma_multiply(0.85) } else { theme::text_faint().gamma_multiply(0.75) };
+            let chip = ui.add(egui::Label::new(RichText::new(usage_chip::label(&u)).size(10.0).color(colour)).sense(Sense::hover()));
             chip.on_hover_ui(|ui| usage_chip::breakdown(ui, &u));
         }
         if let Some(b) = agent_badge::for_tab(tab.uid) {

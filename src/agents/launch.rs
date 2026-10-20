@@ -29,6 +29,11 @@ pub fn available() -> &'static [Launcher] {
     })
 }
 
+/// The agents found, or `None` while the `PATH` scan is still running. Never blocks.
+pub fn found() -> Option<&'static [Launcher]> {
+    FOUND.get().map(Vec::as_slice)
+}
+
 /// Searches `PATH` on a background thread so the first "+" menu does not wait.
 pub fn warm_up() {
     let _ = std::thread::Builder::new().name("tether-agent-scan".into()).spawn(|| {

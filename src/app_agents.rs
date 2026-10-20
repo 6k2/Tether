@@ -178,6 +178,14 @@ impl TetherApp {
         match action {
             Some(PanelAction::Focus(uid)) => self.focus_tab(uid, ctx),
             Some(PanelAction::Close) => self.toggle_agents(),
+            Some(PanelAction::Launch(pick)) => {
+                let target = self.dock.focused_leaf().or_else(|| self.dock.iter_leaves().next().map(|(p, _)| p));
+                let target = target.unwrap_or(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: egui_dock::NodeIndex::root() });
+                self.open_agents_in(vec![(target, pick)], ctx);
+            }
+            Some(PanelAction::InstallHooks) => {
+                self.settings_view = Some(crate::ui::settings_view::SettingsView::at(crate::ui::settings_view::Section::Agents));
+            }
             None => {}
         }
     }

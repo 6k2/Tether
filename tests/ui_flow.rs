@@ -99,11 +99,33 @@ fn ui_flows() {
     h.get_by_label("Lab");
 
     sidebar_menus(&mut h);
+    local_tabs_and_palette(&mut h);
 
     if std::env::var_os("TETHER_E2E").is_none() {
         return;
     }
     connected_flow(&mut h);
+}
+
+/// Two local shells in vertical tabs (left), then the command palette over them.
+fn local_tabs_and_palette(h: &mut Harness<'_, TetherApp>) {
+    let palette = |h: &mut Harness<'_, TetherApp>| {
+        h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::P);
+        h.run_steps(10);
+    };
+    palette(h);
+    h.get_by_label_contains("Vertical tabs on the left").click();
+    h.run_steps(10);
+    for _ in 0..2 {
+        h.key_press_modifiers(Modifiers::CTRL | Modifiers::SHIFT, Key::T);
+        h.run_steps(5);
+    }
+    settle(h, 4, |_| false);
+    shot(h, "12-vertical-tabs");
+    palette(h);
+    shot(h, "13-palette");
+    h.key_press(Key::Escape);
+    h.run_steps(10);
 }
 
 /// Right-click menus on folders, hosts and workspaces, the "New" dropdown and the
@@ -128,7 +150,7 @@ fn sidebar_menus(h: &mut Harness<'_, TetherApp>) {
     h.run_steps(10);
 
     // Right-click on the empty space below the hosts.
-    let empty = egui::pos2(130.0, 470.0);
+    let empty = egui::pos2(130.0, 440.0);
     h.hover_at(empty);
     h.run_steps(2);
     for pressed in [true, false] {

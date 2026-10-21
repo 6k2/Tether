@@ -83,6 +83,8 @@ pub struct ListState {
     type_ahead: TypeAhead,
     /// Whether the list had keyboard focus last frame.
     has_focus: bool,
+    /// Take keyboard focus on the next frame.
+    want_focus: bool,
 }
 
 impl ListState {
@@ -96,6 +98,10 @@ impl ListState {
     /// True while the list owns keyboard focus (type-to-select and arrow keys go to it).
     pub fn has_focus(&self) -> bool {
         self.has_focus
+    }
+
+    pub fn request_focus(&mut self) {
+        self.want_focus = true;
     }
 
     /// Current type-to-select prefix (empty when none is active).
@@ -154,6 +160,12 @@ pub fn show(ui: &mut Ui, side: Side, rows: &[Row], state: &mut ListState, transf
     // Background widget: owns keyboard focus and the empty-space menu. Registered before the
     // rows so the rows sit on top of it for hit testing.
     let bg = ui.interact(body, list_id, Sense::click());
+    let clicked_inside = ui.rect_contains_pointer(whole)
+        && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary) || i.pointer.button_pressed(egui::PointerButton::Secondary))
+        && !ui.ctx().any_popup_open();
+    if std::mem::take(&mut state.want_focus) || clicked_inside {
+        ui.memory_mut(|m| m.request_focus(list_id));
+    }
     if state.cursor.is_some_and(|c| c >= rows.len()) {
         state.cursor = None;
         state.anchor = None;

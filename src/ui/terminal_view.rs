@@ -72,6 +72,8 @@ pub struct TerminalView {
     pub intercept_nano: bool,
     /// Take keyboard focus on the next frame (the agents panel jumping to this tab).
     pub want_focus: bool,
+    /// The current Ctrl+V press was already handled (text paste or the fallback below).
+    ctrl_v_handled: bool,
     /// Fallback working directory (e.g. from an AI agent hook when OSC 7 hasn't fired).
     pub fallback_cwd: Option<String>,
     /// Boxed to keep `TabBody` small.
@@ -133,6 +135,7 @@ impl TerminalView {
             typed_line: String::new(),
             intercept_nano: true,
             want_focus: false,
+            ctrl_v_handled: false,
             fallback_cwd: None,
             cache: Box::new(ViewCache {
                 grid: GridCache::default(),
@@ -266,6 +269,10 @@ impl TerminalView {
 
         if keys_active {
             self.handle_keys(ui, app_cursor, bracketed, &mut out);
+            self.paste_without_text(ui, bracketed, &mut out);
+        }
+        if self.file_drop(ui, rect, bracketed, &mut out) {
+            response.request_focus();
         }
         if self.scroll != scroll_before {
             self.scrolled_at = now;
@@ -652,6 +659,70 @@ impl TerminalView {
                 _ => {}
             }
         }
+    }
+
+    /// Ctrl+V with no text on the clipboard: egui-winit drops the key press entirely, so
+    /// it is detected from the physical key state / the V release instead. Files copied in
+    /// Explorer paste as their paths; an image (screenshot) sends Alt+V (`ESC v`), which is
+    /// Claude Code's "paste image" key on Windows.
+    fn paste_without_text(&mut self, ui: &Ui, bracketed: bool, out: &mut ViewOutput) {
+        let (had_paste, released_v) = ui.input(|i| {
+            let paste = i.events.iter().any(|e| matches!(e, Event::Paste(_)));
+            let release = i.events.iter().any(|e| {
+                matches!(e, Event::Key { key: egui::Key::V, pressed: false, modifiers, .. } if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt)
+            });
+            (paste, release)
+        });
+        let down = super::os_input::ctrl_v_down();
+        if had_paste {
+            self.ctrl_v_handled = true;
+        }
+        if !self.ctrl_v_handled && (down || released_v) {
+            self.ctrl_v_handled = true;
+            self.paste_clipboard_non_text(bracketed, out);
+        }
+        if !down && !had_paste {
+            self.ctrl_v_handled = false;
+        }
+    }
+
+    fn paste_clipboard_non_text(&mut self, bracketed: bool, out: &mut ViewOutput) {
+        let files = super::os_input::clipboard_files();
+        if !files.is_empty() {
+            self.mark_prompt_start();
+            out.input.extend(keys::encode_paste(&super::os_input::format_paths(&files), bracketed));
+            return;
+        }
+        if super::os_input::clipboard_has_image() && !super::os_input::clipboard_has_text() {
+            out.input.extend_from_slice(b"\x1bv");
+        }
+    }
+
+    /// Files dragged from Explorer onto this terminal: their paths are typed at the prompt
+    /// (bracketed paste, so Claude Code attaches dropped images). True when something landed.
+    fn file_drop(&mut self, ui: &Ui, rect: Rect, bracketed: bool, out: &mut ViewOutput) -> bool {
+        let (hovering, dropped): (bool, Vec<std::path::PathBuf>) = ui.input(|i| {
+            (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect())
+        });
+        if !hovering && dropped.is_empty() {
+            return false;
+        }
+        let visible = rect.intersect(ui.clip_rect());
+        let over = super::os_input::drop_pointer_pos(ui.ctx()).is_some_and(|p| visible.contains(p));
+        let glow = ui.ctx().animate_bool_with_time(ui.id().with("file_drop_glow"), hovering && over, 0.15);
+        if glow > 0.0 {
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::accent().gamma_multiply(0.08 * glow));
+            painter.rect_stroke(rect.shrink(1.0), CornerRadius::same(theme::RADIUS), Stroke::new(1.5, theme::accent().gamma_multiply(glow)), egui::StrokeKind::Inside);
+            painter.text(rect.center(), Align2::CENTER_CENTER, "Drop to insert path", FontId::proportional(14.0), theme::text().gamma_multiply(glow));
+            ui.ctx().request_repaint();
+        }
+        if dropped.is_empty() || !over {
+            return false;
+        }
+        self.mark_prompt_start();
+        out.input.extend(keys::encode_paste(&super::os_input::format_paths(&dropped), bracketed));
+        true
     }
 
     /// Scrolls back `lines` rows (screenshot tests).

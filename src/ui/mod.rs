@@ -22,6 +22,7 @@ pub mod layout_settings;
 pub mod loading;
 pub mod mini_dock;
 pub mod nav_history;
+pub mod os_input;
 pub mod palette;
 pub mod path_complete;
 pub mod path_field;

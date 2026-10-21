@@ -526,6 +526,19 @@ impl egui_dock::TabViewer for Viewer {
                     let mut term_ui = ui.new_child(egui::UiBuilder::new().max_rect(term_rect).id_salt(("linked_term", tab_uid)));
                     term_ui.set_clip_rect(term_rect.intersect(ui.clip_rect()));
                     let term_id = term_ui.id().with("terminal");
+                    let sftp_taking_focus = ui.rect_contains_pointer(sftp_rect)
+                        && ui.input(|i| {
+                            i.pointer.button_pressed(egui::PointerButton::Primary)
+                                || i.pointer.button_pressed(egui::PointerButton::Secondary)
+                                || i.events.iter().any(|e| {
+                                    matches!(e, egui::Event::Paste(_))
+                                        || matches!(e, egui::Event::Key { key: egui::Key::V, modifiers, .. } if modifiers.ctrl || modifiers.command)
+                                })
+                        });
+                    if sftp_taking_focus && ui.memory(|m| m.has_focus(term_id)) {
+                        ui.memory_mut(|m| m.surrender_focus(term_id));
+                        linked.view.want_focus = true;
+                    }
                     self.terminal_ids.push(term_id);
                     let out = view.ui(&mut term_ui, &profile);
                     if !out.input.is_empty() {

@@ -131,6 +131,11 @@ pub struct SftpView {
     /// Tracks whether `Ctrl+V` was already handled on key-down (`Event::Paste` / `Key::V`),
     /// so the `Key::V` release fallback for `CF_HDROP` never double-pastes.
     paste_v_down: bool,
+    /// Tracks whether a non-modified `V` key-down occurred so its release is not mistaken
+    /// for a swallowed `Ctrl+V`.
+    plain_v_down: bool,
+    /// Take keyboard focus on the next frame (when switching to an SFTP tab).
+    pub want_focus: bool,
     /// Terminal of the same host shown next to this pane (set by the app each frame).
     linked_terminal: Option<TerminalHandle>,
     /// Set by `connect`: what reconnects and "go to terminal folder" need.
@@ -203,6 +208,8 @@ impl SftpView {
             next_transfer: 0,
             dialog: None,
             paste_v_down: false,
+            plain_v_down: false,
+            want_focus: false,
             linked_terminal: None,
             session: Arc::default(),
             jump: Arc::default(),
@@ -530,24 +537,37 @@ impl SftpView {
 
     /// Handles `Ctrl+V` / `Event::Paste` when no text input or modal is active.
     /// On Windows, `egui-winit` swallows `Ctrl+V` key-down when `CF_HDROP` (files) is on
-    /// the clipboard without text, but still emits `Key::V` release (`pressed: false`).
+    /// the clipboard without text, so we check `os_ctrl_v_down()` on key-down as well as
+    /// the `Key::V` release (`pressed: false`) fallback.
     fn check_paste(&mut self, ui: &Ui, full: Rect) {
         let path_focused = ui.memory(|m| m.has_focus(self.local_path.id()) || m.has_focus(self.remote_path.id()));
-        let blocked = self.dialog.is_some() || path_focused || ui.ctx().egui_wants_keyboard_input() || ui.ctx().any_popup_open();
-        let active_view = ui.rect_contains_pointer(full)
-            || self.local_list.has_focus()
-            || self.remote_list.has_focus()
-            || ui.ctx().data(|d| d.get_temp::<u64>(last_active_id())).is_none_or(|id| id == self.view_n);
+        let modal_open = ui.memory(|m| m.top_modal_layer().is_some());
+        let blocked = self.dialog.is_some() || modal_open || path_focused || ui.ctx().text_edit_focused() || ui.ctx().any_popup_open();
+        let list_focused = self.local_list.has_focus() || self.remote_list.has_focus();
+        let other_widget_focused = !list_focused && ui.memory(|m| m.focused().is_some());
+        let active_view = list_focused
+            || ui.rect_contains_pointer(full)
+            || (!other_widget_focused && ui.ctx().data(|d| d.get_temp::<u64>(last_active_id())).is_none_or(|id| id == self.view_n));
+        let hw_ctrl_v = os_ctrl_v_down();
+        if !hw_ctrl_v && !ui.input(|i| i.key_down(Key::V)) {
+            self.paste_v_down = false;
+        }
         if blocked || !active_view {
             ui.ctx().input(|i| {
                 for e in &i.events {
                     match e {
                         Event::Paste(_) | Event::Key { key: Key::V, pressed: true, .. } => self.paste_v_down = true,
-                        Event::Key { key: Key::V, pressed: false, .. } => self.paste_v_down = false,
+                        Event::Key { key: Key::V, pressed: false, .. } => {
+                            self.paste_v_down = false;
+                            self.plain_v_down = false;
+                        }
                         _ => {}
                     }
                 }
             });
+            if hw_ctrl_v {
+                self.paste_v_down = true;
+            }
             return;
         }
         let mut paste_trigger: Option<Option<String>> = None;
@@ -558,17 +578,22 @@ impl SftpView {
                     paste_trigger = Some(Some(text.clone()));
                     false
                 }
-                Event::Key { key: Key::V, pressed: true, modifiers, .. }
-                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt =>
-                {
-                    self.paste_v_down = true;
-                    paste_trigger = Some(None);
-                    false
+                Event::Key { key: Key::V, pressed: true, modifiers, .. } => {
+                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt {
+                        self.paste_v_down = true;
+                        paste_trigger = Some(None);
+                        false
+                    } else {
+                        self.plain_v_down = true;
+                        true
+                    }
                 }
-                Event::Key { key: Key::V, pressed: false, modifiers, .. }
-                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt =>
-                {
-                    if !std::mem::replace(&mut self.paste_v_down, false) {
+                Event::Key { key: Key::V, pressed: false, modifiers, .. } => {
+                    if std::mem::replace(&mut self.plain_v_down, false) {
+                        return true;
+                    }
+                    let cmd = (modifiers.ctrl || modifiers.command) && !modifiers.shift && !modifiers.alt;
+                    if (cmd || os_clipboard_has_files()) && !std::mem::replace(&mut self.paste_v_down, false) {
                         paste_trigger = Some(None);
                         return false;
                     }
@@ -577,6 +602,9 @@ impl SftpView {
                 _ => true,
             });
         });
+        if paste_trigger.is_none() && hw_ctrl_v && !std::mem::replace(&mut self.paste_v_down, true) {
+            paste_trigger = Some(None);
+        }
         if let Some(pasted_text) = paste_trigger {
             self.paste_files(pasted_text.as_deref());
         }
@@ -648,7 +676,13 @@ impl SftpView {
         let t = ui.ctx().animate_bool_with_time(base.with("tx_panel"), has_transfers, 0.25);
         let transfers_h = 150.0 * t;
         let full = ui.available_rect_before_wrap().shrink(8.0);
-        if ui.rect_contains_pointer(full) {
+        let clicked_in_view = ui.rect_contains_pointer(full)
+            && ui.input(|i| i.pointer.button_pressed(PointerButton::Primary) || i.pointer.button_pressed(PointerButton::Secondary))
+            && !ui.ctx().any_popup_open();
+        if std::mem::take(&mut self.want_focus) {
+            ui.ctx().data_mut(|d| d.insert_temp(last_active_id(), self.view_n));
+            self.remote_list.request_focus();
+        } else if ui.rect_contains_pointer(full) {
             ui.ctx().data_mut(|d| d.insert_temp(last_active_id(), self.view_n));
         }
 
@@ -665,6 +699,13 @@ impl SftpView {
             self.pane(ui, rect, Side::Remote, fade);
             self.connecting_screen(ui, rect);
             action = self.status_overlay(ui, rect);
+        }
+        if clicked_in_view && !self.local_list.has_focus() && !self.remote_list.has_focus() && !ui.ctx().text_edit_focused() {
+            if self.show_remote {
+                self.remote_list.request_focus();
+            } else {
+                self.local_list.request_focus();
+            }
         }
 
         if t > 0.0 {
@@ -768,11 +809,11 @@ impl SftpView {
     }
 
     /// Whether files dropped from Explorer should land in this view's `rect`. Windows does
-    /// not report the pointer during an OLE drag, so with no pointer the view the user last
-    /// hovered takes the drop (never two SFTP tabs at once).
+    /// not report `hover_pos()` during an OLE drag, so `os_drop_pointer_pos` queries the
+    /// live OS cursor position first.
     fn takes_os_drop(&self, ui: &Ui, rect: Rect) -> bool {
-        match ui.input(|i| i.pointer.hover_pos()) {
-            Some(_) => ui.rect_contains_pointer(rect),
+        match os_drop_pointer_pos(ui) {
+            Some(pos) => rect.contains(pos),
             None => ui.ctx().data(|d| d.get_temp::<u64>(last_active_id())) == Some(self.view_n),
         }
     }
@@ -783,7 +824,7 @@ impl SftpView {
             return;
         }
         // Only a text field blocks these (the file list keeps focus after a click).
-        let typing = ui.ctx().egui_wants_keyboard_input();
+        let typing = ui.ctx().text_edit_focused();
         let (back, forward, up, refresh) = ui.ctx().input(|i| {
             let key = |a: Action| !typing && keybindings::pressed_in(i, a);
             (
@@ -1009,7 +1050,13 @@ fn clipboard_files(pasted_text: Option<&str>) -> Vec<PathBuf> {
     if !files.is_empty() {
         return files;
     }
-    pasted_text.map(parse_clipboard_paths).unwrap_or_default()
+    if let Some(text) = pasted_text {
+        let parsed = parse_clipboard_paths(text);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    os_clipboard_text().map(|t| parse_clipboard_paths(&t)).unwrap_or_default()
 }
 
 fn parse_clipboard_paths(text: &str) -> Vec<PathBuf> {
@@ -1043,6 +1090,51 @@ fn clipboard_seq() -> u32 {
     0
 }
 
+fn os_ctrl_v_down() -> bool {
+    super::os_input::ctrl_v_down()
+}
+
+fn os_drop_pointer_pos(ui: &Ui) -> Option<egui::Pos2> {
+    super::os_input::drop_pointer_pos(ui.ctx())
+}
+
+/// Files copied in Explorer (`CF_HDROP`), shared with the terminal's `Ctrl+V`.
+pub(crate) fn os_clipboard_file_list() -> Vec<PathBuf> {
+    os_clipboard_files()
+}
+
+#[cfg(windows)]
+fn os_clipboard_has_files() -> bool {
+    const CF_HDROP: u32 = 15;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+    }
+    unsafe { IsClipboardFormatAvailable(CF_HDROP) != 0 }
+}
+
+#[cfg(not(windows))]
+fn os_clipboard_has_files() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn open_clipboard_retry() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(new_owner: *mut core::ffi::c_void) -> i32;
+    }
+    for attempt in 0..3 {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            return true;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    false
+}
+
 #[cfg(windows)]
 fn os_clipboard_files() -> Vec<PathBuf> {
     use std::ffi::OsString;
@@ -1052,7 +1144,6 @@ fn os_clipboard_files() -> Vec<PathBuf> {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn OpenClipboard(new_owner: *mut core::ffi::c_void) -> i32;
         fn CloseClipboard() -> i32;
         fn GetClipboardData(format: u32) -> *mut core::ffi::c_void;
     }
@@ -1061,7 +1152,7 @@ fn os_clipboard_files() -> Vec<PathBuf> {
         fn DragQueryFileW(hdrop: *mut core::ffi::c_void, file: u32, buf: *mut u16, cch: u32) -> u32;
     }
     unsafe {
-        if IsClipboardFormatAvailable(CF_HDROP) == 0 || OpenClipboard(std::ptr::null_mut()) == 0 {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 || !open_clipboard_retry() {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -1091,6 +1182,48 @@ fn os_clipboard_files() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 fn os_clipboard_files() -> Vec<PathBuf> {
     Vec::new()
+}
+
+#[cfg(windows)]
+fn os_clipboard_text() -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> *mut core::ffi::c_void;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalLock(hmem: *mut core::ffi::c_void) -> *const u16;
+        fn GlobalUnlock(hmem: *mut core::ffi::c_void) -> i32;
+    }
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 || !open_clipboard_retry() {
+            return None;
+        }
+        let mut text = None;
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        if !handle.is_null() {
+            let ptr = GlobalLock(handle);
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 65_536 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                text = Some(String::from_utf16_lossy(slice));
+                GlobalUnlock(handle);
+            }
+        }
+        CloseClipboard();
+        text
+    }
+}
+
+#[cfg(not(windows))]
+fn os_clipboard_text() -> Option<String> {
+    None
 }
 
 impl Drop for SftpView {

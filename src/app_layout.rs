@@ -272,9 +272,13 @@ impl TetherApp {
     /// pending keyboard-focus request to its terminal (`TerminalView::want_focus`).
     pub(super) fn pane_fx(&mut self, ctx: &egui::Context) -> PaneFx {
         if let Some(uid) = self.focus_request.take()
-            && let Some(TabBody::Terminal(view)) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid).map(|t| &mut t.body)
+            && let Some(body) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.uid == uid).map(|t| &mut t.body)
         {
-            view.want_focus = true;
+            match body {
+                TabBody::Terminal(view) => view.want_focus = true,
+                TabBody::Sftp(view) => view.want_focus = true,
+                TabBody::Editor(_) => {}
+            }
         }
         let l = &settings::snapshot().layout;
         let overlay_open = self.palette.is_some() || self.settings_view.is_some() || ctx.memory(|m| m.top_modal_layer().is_some());

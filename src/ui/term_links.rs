@@ -316,13 +316,12 @@ fn path_header(ui: &mut Ui, text: &str) {
 }
 
 fn menu_btn(ui: &mut Ui, label: &str) -> bool {
-    let resp = ui.add(egui::Button::new(egui::RichText::new(label).size(12.5)).frame(false).min_size(Vec2::new(ui.available_width(), 24.0)));
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        let r = resp.rect;
-        ui.painter().rect_filled(r, CornerRadius::same(5), theme::accent().gamma_multiply(0.14));
-        ui.painter().text(Pos2::new(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.5), theme::text());
+        ui.painter().rect_filled(r, CornerRadius::same(5), theme::accent().gamma_multiply(0.16));
     }
+    ui.painter().text(Pos2::new(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.5), theme::text());
     resp.clicked()
 }
 

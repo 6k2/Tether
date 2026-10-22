@@ -149,6 +149,10 @@ impl LinksState {
     /// Handles a click on the terminal; returns `true` if a link intercepted the click.
     pub fn on_click(&mut self, pos: Pos2, ctrl: bool, ctx: &egui::Context) -> (bool, Option<LinkAction>) {
         if let Some(link) = self.hovered.clone() {
+            if !ctrl && let LinkTarget::RemotePath { path, .. } = &link.target {
+                self.active_menu = None;
+                return (true, Some(LinkAction::OpenSftp(path.clone())));
+            }
             if ctrl {
                 let action = execute_primary(&link.target, ctx);
                 self.active_menu = None;
@@ -161,6 +165,11 @@ impl LinksState {
             self.active_menu = None;
         }
         (false, None)
+    }
+
+    pub fn on_secondary_click(&mut self, pos: Pos2) -> bool {
+        self.active_menu = self.hovered.clone().map(|link| (link, pos));
+        self.active_menu.is_some()
     }
 
     /// Paints the underline for the hovered (or menu-active) link and renders the popup
@@ -179,7 +188,7 @@ impl LinksState {
                         let kind = if *is_dir { "Folder" } else { "File" };
                         format!("{kind}: {}\nClick for options · Ctrl+click to open", resolved.display())
                     }
-                    LinkTarget::RemotePath { path, .. } => format!("Remote: {path}\nClick for options · Ctrl+click to edit"),
+                    LinkTarget::RemotePath { path, .. } => format!("Remote: {path}\nClick to open SFTP · Right-click for options · Ctrl+click to edit"),
                 };
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("term_link_tip"), egui::PopupAnchor::Pointer).gap(10.0).show(|ui| {
                     ui.label(egui::RichText::new(tip).size(11.5).color(theme::text()));
@@ -488,7 +497,29 @@ pub fn find_link_in_str(
     let start = text[..byte_idx].rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8));
     let end = text[byte_idx..].find(char::is_whitespace).map_or(text.len(), |i| byte_idx + i);
     let token = &text[start..end];
+    if !is_local && let Some((path_start, path_end)) = prompt_path(token) {
+        let path_start = start + path_start;
+        let path_end = start + path_end;
+        if (path_start..path_end).contains(&byte_idx) {
+            return classify_candidate(&text[path_start..path_end], path_start, cwd, false, cache);
+        }
+        return None;
+    }
     classify_candidate(token, start, cwd, is_local, cache)
+}
+
+/// The directory in a conventional SSH prompt: `[user@host:~/project]$`.
+/// Only the path is linked; the host and prompt marker remain ordinary text.
+fn prompt_path(token: &str) -> Option<(usize, usize)> {
+    let at = token.find('@')?;
+    let colon = token[at + 1..].find(":/").or_else(|| token[at + 1..].find(":~"))? + at + 1;
+    let host = &token[at + 1..colon];
+    if host.is_empty() || !host.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return None;
+    }
+    let start = colon + 1;
+    let end = token.trim_end_matches(['$', '#', '%', '❯', ']', ')', '}']).len();
+    (end > start).then_some((start, end))
 }
 
 fn enclosing_quotes(text: &str, byte_idx: usize) -> Option<(usize, usize)> {
@@ -520,7 +551,7 @@ fn classify_candidate(
     cache: &mut PathProbeCache,
 ) -> Option<(String, LinkTarget, (usize, usize))> {
     let (trimmed, lead, _) = trim_wrappers(raw_token);
-    if trimmed.len() < 2 {
+    if trimmed.len() < 2 && (is_local || !matches!(trimmed, "/" | "~")) {
         return None;
     }
     let span_start = base_offset + lead;
@@ -541,7 +572,7 @@ fn classify_candidate(
 
     // Strip optional `:line[:col]` or `(line[,col])` suffix.
     let (path_part, line, col) = split_line_col(trimmed);
-    if !looks_like_path_candidate(path_part) {
+    if !looks_like_path_candidate(path_part) && (is_local || !matches!(path_part, "/" | "~")) {
         return None;
     }
 
@@ -651,16 +682,11 @@ fn looks_like_path_candidate(s: &str) -> bool {
 }
 
 fn is_remote_path_syntax(s: &str) -> bool {
-    if s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.starts_with("../") {
+    if s == "~" || s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.starts_with("../") {
         return true;
     }
-    // Relative path with a slash and a file extension (`src/ui/terminal_view.rs`).
-    if let Some((_, file)) = s.rsplit_once('/')
-        && let Some((stem, ext)) = file.rsplit_once('.')
-    {
-        return !stem.is_empty() && !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric());
-    }
-    false
+    // Remote folders do not need an extension or a trailing slash.
+    s.contains('/') && !s.contains(':')
 }
 
 /// Resolves `raw` against `cwd` (or home / root / MSYS / WSL drive mounts) and returns
@@ -736,6 +762,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssh_prompt_links_only_the_directory_and_opens_sftp_on_click() {
+        let mut cache = PathProbeCache::default();
+        for (prompt, expected) in [
+            ("prisma@na-prisma-02:~/servers/practice-servers/na-practice-01$", "~/servers/practice-servers/na-practice-01"),
+            ("root@server:/srv/app#", "/srv/app"),
+            ("[dev@host:~/repo]$", "~/repo"),
+            ("dev@host:~$", "~"),
+            ("root@host:/#", "/"),
+        ] {
+            let start = prompt.find(':').unwrap() + 1;
+            let (raw, target, span) = find_link_in_str(prompt, start, Some("/old/cwd"), false, &mut cache).unwrap();
+            assert_eq!(raw, expected);
+            assert_eq!(&prompt[span.0..span.1], expected);
+            assert_eq!(target, LinkTarget::RemotePath { path: expected.into(), line: None });
+            assert!(find_link_in_str(prompt, 2, None, false, &mut cache).is_none());
+            let link = DetectedLink { raw, target, spans: Vec::new() };
+            let mut links = LinksState { hovered: Some(link), ..Default::default() };
+            assert_eq!(links.on_click(Pos2::ZERO, false, &egui::Context::default()), (true, Some(LinkAction::OpenSftp(expected.into()))));
+            assert!(!links.has_open_menu());
+        }
+        for folder in ["practice-01/", "servers/practice-01", "~/servers", "/", "~"] {
+            assert!(find_link_in_str(folder, 0, None, false, &mut cache).is_some(), "{folder}");
+        }
+    }
+
+    #[test]
     fn remote_path_menu_returns_an_sftp_action() {
         use egui_kittest::kittest::Queryable;
         let link = DetectedLink {
@@ -744,9 +796,7 @@ mod tests {
             spans: vec![RowSpan { row: 0, start_col: 0, end_col: 12 }],
         };
         let mut links = LinksState { hovered: Some(link), ..Default::default() };
-        let (intercepted, action) = links.on_click(egui::pos2(30.0, 12.0), false, &egui::Context::default());
-        assert!(intercepted);
-        assert!(action.is_none());
+        assert!(links.on_secondary_click(egui::pos2(30.0, 12.0)));
         let result = std::sync::Arc::new(std::sync::Mutex::new(None));
         let output = result.clone();
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_ui(move |ui| {

@@ -310,10 +310,9 @@ impl SftpView {
     }
 
     /// Resolve a terminal link using the remote cwd and metadata, never the PC's filesystem.
-    pub(super) fn resolve_location(&self, path: String) {
+    pub(super) fn resolve_location(&self, path: String, terminal: Option<crate::ssh::terminal::TerminalHandle>) {
         let (Some(sftp), Some(session)) = (self.sftp(), self.session()) else { return };
-        let (term, profile, jump, jumping, ctx) =
-            (self.linked_terminal.clone(), self.profile.clone(), self.jump.clone(), self.jumping.clone(), self.ctx.clone());
+        let (term, profile, jump, jumping, ctx) = (terminal, self.profile.clone(), self.jump.clone(), self.jumping.clone(), self.ctx.clone());
         let epoch = self.location_epoch.clone();
         let request = epoch.load(Ordering::Relaxed);
         jumping.store(true, Ordering::Relaxed);

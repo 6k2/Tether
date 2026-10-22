@@ -89,6 +89,7 @@ pub struct TetherApp {
     import: Option<ImportDialog>,
     custom_boot: Option<crate::ui::agents_panel::CustomBoot>,
     project_cwds: std::collections::HashMap<u64, String>,
+    terminal_sftp_windows: std::collections::HashMap<u64, u64>,
     settings_view: Option<SettingsView>,
     key_manager: Option<KeyManager>,
     prompt: Option<Prompt>,
@@ -180,6 +181,7 @@ impl TetherApp {
             agents,
             custom_boot: None,
             project_cwds: Default::default(),
+            terminal_sftp_windows: Default::default(),
         })
     }
 
@@ -706,7 +708,7 @@ impl TetherApp {
         }
     }
 
-    /// Reuse or open the source terminal's SFTP pane, then resolve the clicked path remotely.
+    /// Open a dedicated SFTP window at a terminal link's location.
     fn open_terminal_folder(&mut self, uid: u64, path: String, ctx: &egui::Context) {
         let Some((profile, terminal)) = self.all_tabs().find_map(|t| match &t.body {
             TabBody::Terminal(term) if t.uid == uid && !t.is_local() => Some((t.profile.clone(), term.handle.clone())),
@@ -714,24 +716,28 @@ impl TetherApp {
         }) else {
             return;
         };
-        let already_open = self.all_tabs().any(|t| t.uid == uid && t.linked_sftp.is_some());
-        let new_view = if already_open {
-            None
-        } else {
-            let profile = self.store.get(profile.id).cloned().unwrap_or(profile);
-            Some(self.spawn_sftp(&profile, secret::get(profile.secret_id()), ctx))
-        };
-        if let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).chain(self.mini_dock.tabs_mut()).find(|t| t.uid == uid)
-        {
-            if let Some(view) = new_view {
-                tab.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(view));
+        let live: HashSet<_> = self.all_tabs().map(|t| t.uid).collect();
+        self.terminal_sftp_windows.retain(|_, sftp_uid| live.contains(sftp_uid));
+        if let Some(sftp_uid) = self.terminal_sftp_windows.get(&uid).copied() {
+            if let Some(Tab { body: TabBody::Sftp(view), .. }) =
+                self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).chain(self.mini_dock.tabs_mut()).find(|t| t.uid == sftp_uid)
+            {
+                view.set_linked_terminal(Some(terminal));
+                view.browse_path(path);
             }
-            if let Some(linked) = &mut tab.linked_sftp {
-                linked.view.set_linked_terminal(Some(terminal));
-                linked.view.browse_path(path);
-            }
+            self.apply_tab_actions(vec![crate::ui::vertical_tabs::TabAction::Focus(sftp_uid)], ctx);
+            return;
         }
-        self.focus_tab(uid, ctx);
+        let profile = self.store.get(profile.id).cloned().unwrap_or(profile);
+        let mut view = self.spawn_sftp(&profile, secret::get(profile.secret_id()), ctx);
+        view.set_linked_terminal(Some(terminal));
+        view.browse_path(path);
+        let tab = Tab::new(profile, TabBody::Sftp(Box::new(view)));
+        let sftp_uid = tab.uid;
+        let screen_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min + egui::vec2(70.0, 70.0))).unwrap_or(egui::pos2(120.0, 120.0));
+        self.detached.pop_out(tab, screen_pos);
+        self.terminal_sftp_windows.insert(uid, sftp_uid);
+        ctx.request_repaint();
     }
 
     /// Opens files requested from a terminal (`nano <file>`) in the built-in editor.

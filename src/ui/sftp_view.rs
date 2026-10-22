@@ -143,7 +143,7 @@ pub struct SftpView {
     /// Result of a pending terminal-folder lookup, consumed on the UI thread.
     jump: Arc<Mutex<Option<String>>>,
     /// A terminal link picked before the SFTP channel has finished connecting.
-    pending_location: Option<String>,
+    pending_location: Option<(String, Option<TerminalHandle>)>,
     location_epoch: Arc<std::sync::atomic::AtomicU64>,
     jumping: Arc<AtomicBool>,
     /// Files opened with the PC's default app, uploaded on every save.
@@ -276,7 +276,7 @@ impl SftpView {
         if let Ok(mut jump) = self.jump.lock() {
             *jump = None;
         }
-        self.pending_location = Some(path);
+        self.pending_location = Some((path, self.linked_terminal.clone()));
         self.show_remote = true;
         self.ctx.request_repaint();
     }
@@ -664,9 +664,9 @@ impl SftpView {
     /// Draws the view; the returned action asks the app to reconnect or close the tab.
     pub fn ui(&mut self, ui: &mut Ui) -> StatusAction {
         if self.is_ready()
-            && let Some(path) = self.pending_location.take()
+            && let Some((path, terminal)) = self.pending_location.take()
         {
-            self.resolve_location(path);
+            self.resolve_location(path, terminal);
         }
         self.poll_open();
         self.poll_local();

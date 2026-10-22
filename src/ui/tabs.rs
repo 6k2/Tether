@@ -498,10 +498,12 @@ impl egui_dock::TabViewer for Viewer {
             ui.add_space((1.0 - eased) * 10.0);
         }
         let is_local = tab.is_local();
+        let images_enabled = tab.agent().is_some_and(|a| matches!(a.kind, AgentKind::Claude | AgentKind::Codex));
         let tab_uid = tab.uid;
         let profile = tab.profile.clone();
         match &mut tab.body {
             TabBody::Terminal(view) => {
+                view.images_enabled = images_enabled;
                 if is_local {
                     if let Some(cwd) = crate::agents::hub::agent_cwd(tab_uid).or_else(|| crate::procmon::usage_for(tab_uid).and_then(|u| u.cwd.clone())) {
                         view.fallback_cwd = Some(cwd);

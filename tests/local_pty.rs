@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-use tether::pty::shells::{ShellIcon, ShellSpec};
 use tether::pty::run_local_pty;
+use tether::pty::shells::{ShellIcon, ShellSpec};
 use tether::ssh::terminal::{LinkState, TerminalHandle};
 
 const TIMEOUT: Duration = Duration::from_secs(20);

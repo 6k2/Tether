@@ -31,17 +31,9 @@ pub enum LinkTarget {
     /// `http://` or `https://` URL.
     Url(String),
     /// A local file or folder (resolved absolute path, and whether it is a directory).
-    LocalPath {
-        resolved: PathBuf,
-        is_dir: bool,
-        line: Option<u32>,
-        col: Option<u32>,
-    },
+    LocalPath { resolved: PathBuf, is_dir: bool, line: Option<u32>, col: Option<u32> },
     /// A file path in a remote SSH session (resolved against remote cwd when relative).
-    RemotePath {
-        path: String,
-        line: Option<u32>,
-    },
+    RemotePath { path: String, line: Option<u32> },
 }
 
 /// A detected clickable link covering one or more row spans (when wrapped across lines).
@@ -77,15 +69,10 @@ pub enum LinkAction {
 }
 
 /// Cached existence lookup for `(cwd, raw_path)`.
+#[derive(Default)]
 pub struct PathProbeCache {
     cwd: String,
     entries: HashMap<String, (Option<(PathBuf, bool)>, Instant)>,
-}
-
-impl Default for PathProbeCache {
-    fn default() -> Self {
-        Self { cwd: String::new(), entries: HashMap::new() }
-    }
 }
 
 impl PathProbeCache {
@@ -131,15 +118,7 @@ impl LinksState {
     }
 
     /// Updates the hovered link for `(hover_cell)` under the terminal lock.
-    pub fn sync(
-        &mut self,
-        screen: &vt100::Screen,
-        generation: u64,
-        scroll: usize,
-        hover_cell: Option<(u16, u16)>,
-        cwd: Option<&str>,
-        is_local: bool,
-    ) {
+    pub fn sync(&mut self, screen: &vt100::Screen, generation: u64, scroll: usize, hover_cell: Option<(u16, u16)>, cwd: Option<&str>, is_local: bool) {
         let Some((row, col)) = hover_cell else {
             self.hover_key = None;
             self.hovered = None;
@@ -200,11 +179,9 @@ impl LinksState {
                     }
                     LinkTarget::RemotePath { path, .. } => format!("Remote: {path}\nClick for options · Ctrl+click to edit"),
                 };
-                egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("term_link_tip"), egui::PopupAnchor::Pointer)
-                    .gap(10.0)
-                    .show(|ui| {
-                        ui.label(egui::RichText::new(tip).size(11.5).color(theme::text()));
-                    });
+                egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("term_link_tip"), egui::PopupAnchor::Pointer).gap(10.0).show(|ui| {
+                    ui.label(egui::RichText::new(tip).size(11.5).color(theme::text()));
+                });
             }
         }
         self.show_menu(ui, inner, m)
@@ -451,10 +428,7 @@ impl LogicalLine {
     }
 
     fn byte_index_at(&self, row: u16, col: u16) -> Option<usize> {
-        self.cells
-            .iter()
-            .find(|c| c.row == row && col >= c.col && col < c.col + c.width)
-            .map(|c| c.byte_start)
+        self.cells.iter().find(|c| c.row == row && col >= c.col && col < c.col + c.width).map(|c| c.byte_start)
     }
 
     fn spans_for_bytes(&self, start_byte: usize, end_byte: usize) -> Vec<RowSpan> {
@@ -474,14 +448,7 @@ impl LogicalLine {
     }
 }
 
-fn detect_at(
-    screen: &vt100::Screen,
-    row: u16,
-    col: u16,
-    cwd: Option<&str>,
-    is_local: bool,
-    cache: &mut PathProbeCache,
-) -> Option<DetectedLink> {
+fn detect_at(screen: &vt100::Screen, row: u16, col: u16, cwd: Option<&str>, is_local: bool, cache: &mut PathProbeCache) -> Option<DetectedLink> {
     let (line, _) = LogicalLine::extract(screen, row)?;
     let byte_idx = line.byte_index_at(row, col)?;
     let (raw, target, (start_b, end_b)) = find_link_in_str(&line.text, byte_idx, cwd, is_local, cache)?;
@@ -573,11 +540,7 @@ fn classify_candidate(
 
     if is_local {
         if let Some((resolved, is_dir)) = cache.resolve(cwd, path_part) {
-            return Some((
-                path_part.to_string(),
-                LinkTarget::LocalPath { resolved, is_dir, line, col },
-                (span_start, span_end),
-            ));
+            return Some((path_part.to_string(), LinkTarget::LocalPath { resolved, is_dir, line, col }, (span_start, span_end)));
         }
     } else if is_remote_path_syntax(path_part) {
         let resolved = match cwd {
@@ -646,7 +609,10 @@ pub fn split_line_col(s: &str) -> (&str, Option<u32>, Option<u32>) {
             break;
         }
         let tail = &rest[colon + 1..];
-        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && let Ok(n) = tail.parse::<u32>() {
+        if !tail.is_empty()
+            && tail.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = tail.parse::<u32>()
+        {
             nums.push(n);
             rest = &rest[..colon];
             if nums.len() == 2 {
@@ -698,11 +664,7 @@ pub fn resolve_local_path(cwd: Option<&str>, raw: &str) -> Option<(PathBuf, bool
         return None;
     }
     // Strip git diff `a/` or `b/` prefix when the rest exists in `cwd`.
-    let candidates: &[&str] = if let Some(stripped) = raw.strip_prefix("a/").or_else(|| raw.strip_prefix("b/")) {
-        &[raw, stripped]
-    } else {
-        &[raw]
-    };
+    let candidates: &[&str] = if let Some(stripped) = raw.strip_prefix("a/").or_else(|| raw.strip_prefix("b/")) { &[raw, stripped] } else { &[raw] };
     for &item in candidates {
         if let Some(hit) = try_resolve_one(cwd, item) {
             return Some(hit);
@@ -756,11 +718,7 @@ fn clean_path(path: &Path) -> PathBuf {
         Ok(canon) => {
             let s = canon.display().to_string();
             // Strip Windows `\\?\` extended-length prefix for clean display & clipboard.
-            if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                PathBuf::from(stripped)
-            } else {
-                canon
-            }
+            if let Some(stripped) = s.strip_prefix(r"\\?\") { PathBuf::from(stripped) } else { canon }
         }
         Err(_) => path.to_path_buf(),
     }

@@ -165,15 +165,7 @@ impl SftpView {
         let local_history = sftp_history::load_local(&local_history_file, profile.id);
         let local_known = sftp_history::load_known(&local_known_file, profile.id);
         let sftp_cfg = settings::get().sftp.clone();
-        let initial_local = if sftp_cfg.resume_last_dir {
-            local_history
-                .iter()
-                .map(PathBuf::from)
-                .find(|p| p.is_dir())
-                .unwrap_or(home)
-        } else {
-            home
-        };
+        let initial_local = if sftp_cfg.resume_last_dir { local_history.iter().map(PathBuf::from).find(|p| p.is_dir()).unwrap_or(home) } else { home };
         Self {
             remote: Arc::new(Mutex::new(RemoteState::default())),
             cache: dir_cache::host_cache(profile.id),
@@ -494,13 +486,7 @@ impl SftpView {
             return;
         }
         set(&SFTP_CLIPBOARD, |slot| {
-            *slot = Some(SftpClipboard {
-                from: side,
-                local_dir: self.local_cwd.clone(),
-                remote_dir: self.remote_cwd(),
-                names,
-                os_seq: clipboard_seq(),
-            });
+            *slot = Some(SftpClipboard { from: side, local_dir: self.local_cwd.clone(), remote_dir: self.remote_cwd(), names, os_seq: clipboard_seq() });
         });
     }
 

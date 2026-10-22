@@ -4968,6 +4968,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2",
+ "shell-words",
  "ssh-key",
  "sysinfo",
  "tempfile",

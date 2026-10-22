@@ -18,40 +18,84 @@ pub fn default_command(kind: AgentKind) -> &'static str {
 pub struct CustomBoot {
     pub kind: AgentKind,
     command: String,
+    prompt: String,
     focus: bool,
 }
 
 impl CustomBoot {
     pub fn new(kind: AgentKind) -> Self {
-        Self { kind, command: default_command(kind).into(), focus: true }
+        Self { kind, command: default_command(kind).into(), prompt: String::new(), focus: true }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> (Option<String>, bool) {
         let mut command = None;
         let mut close = false;
-        let modal = egui::Modal::new(egui::Id::new("custom_agent_boot")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.horizontal(|ui| {
-                super::agent_icons::icon(ui, self.kind, 24.0);
-                ui.heading(format!("{} · Custom Boot", self.kind.name()));
-            });
-            ui.label("Enter the command to run in a new terminal.");
-            ui.add_space(8.0);
-            let response = ui.add(egui::TextEdit::singleline(&mut self.command).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-            if std::mem::take(&mut self.focus) {
-                response.request_focus();
-            }
-            let valid = !self.command.trim().is_empty() && !self.command.contains(['\r', '\n', '\0']);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(valid, egui::Button::new("Start terminal").fill(theme::accent_soft())).clicked() || (valid && enter) {
-                    command = Some(self.command.trim().to_owned());
-                    close = true;
+        use super::form::{self, Kind};
+        let modal = egui::Modal::new(egui::Id::new("custom_agent_boot")).frame(form::modal_frame()).show(ctx, |ui| {
+            egui::Frame::new().inner_margin(24).show(ui, |ui| {
+                ui.set_width(500.0);
+                ui.horizontal(|ui| {
+                    super::agent_icons::icon(ui, self.kind, 36.0);
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("{} · Custom Boot", self.kind.name())).size(19.0).strong());
+                        ui.label(RichText::new("Your command, in a new terminal session.").size(12.0).color(theme::text_dim()));
+                    });
+                });
+                ui.add_space(20.0);
+                let response = form::section(
+                    ui,
+                    Some(super::settings_widgets::Icon::Terminal),
+                    "Launch command",
+                    "Runs with your installed CLI and its existing sign-in.",
+                    |ui| {
+                        let width = ui.available_width();
+                        form::framed(ui, false, |ui| {
+                            ui.add(form::style_edit(egui::TextEdit::singleline(&mut self.command), width).font(egui::TextStyle::Monospace))
+                        })
+                    },
+                );
+                if std::mem::take(&mut self.focus) {
+                    response.request_focus();
                 }
-                if ui.button("Cancel").clicked() {
-                    close = true;
+                let needs_prompt = launch::needs_initial_prompt(&self.command);
+                if needs_prompt {
+                    ui.add_space(12.0);
+                    form::section(
+                        ui,
+                        Some(super::settings_widgets::Icon::Editor),
+                        "Initial prompt",
+                        "Print / exec mode needs a prompt and exits when finished.",
+                        |ui| {
+                            let width = ui.available_width();
+                            form::text(ui, &mut self.prompt, "What should the agent do?", width, false);
+                            ui.add_space(6.0);
+                            if form::button(ui, "Use interactive command", Kind::Ghost, true).clicked() {
+                                self.command = default_command(self.kind).into();
+                            }
+                        },
+                    );
+                } else {
+                    ui.add_space(10.0);
+                    form::note(ui, "Right-click the agent icon to open Custom Boot again.", false);
                 }
+                let valid = !self.command.trim().is_empty()
+                    && !self.command.contains(['\r', '\n', '\0'])
+                    && (!needs_prompt || !self.prompt.trim().is_empty() && !self.prompt.contains(['\r', '\n', '\0']));
+                ui.add_space(20.0);
+                form::rule(ui);
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if form::button(ui, "Start terminal", Kind::Primary, valid).clicked() || (valid && enter) {
+                        let powershell = crate::pty::shells::default_shell().is_some_and(|s| s.icon_kind == crate::pty::shells::ShellIcon::PowerShell);
+                        command = Some(launch::append_initial_prompt(&self.command, if needs_prompt { self.prompt.trim() } else { "" }, powershell));
+                        close = true;
+                    }
+                    if form::button(ui, "Cancel", Kind::Secondary, true).clicked() {
+                        close = true;
+                    }
+                });
             });
         });
         (command, close || modal.should_close())
@@ -127,12 +171,17 @@ const EMPTY_H: f32 = 172.0;
 
 /// The sessions without a header (the sidebar's "Agents" section draws its own).
 pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option<PanelAction> {
+    list_for(ui, sessions, crate::views::View::Agents, now)
+}
+
+pub fn list_for(ui: &mut egui::Ui, sessions: &[SessionInfo], view: crate::views::View, now: Instant) -> Option<PanelAction> {
     let mut action = None;
-    if sessions.is_empty() {
-        return empty_state(ui);
+    let mut sessions = sessions.iter().filter(|s| view.includes_agent(s.kind)).peekable();
+    if sessions.peek().is_none() {
+        return empty_state(ui, view.agent().unwrap_or(AgentKind::Claude));
     }
     let time = ui.input(|i| i.time);
-    egui::ScrollArea::vertical().id_salt("agents_list").auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt(("agents_list", view)).auto_shrink([false, false]).show(ui, |ui| {
         for s in sessions {
             if row(ui, s, now, time) {
                 action = Some(PanelAction::Focus(s.uid));
@@ -143,66 +192,33 @@ pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option
     action
 }
 
-/// A card instead of the list: what shows up here, and the two ways to get started.
-fn empty_state(ui: &mut egui::Ui) -> Option<PanelAction> {
-    use super::settings_widgets::{Icon, paint_icon};
+fn empty_state(ui: &mut egui::Ui, kind: AgentKind) -> Option<PanelAction> {
+    use super::form::{self, Kind};
     let mut action = None;
     ui.add_space(4.0);
     egui::Frame::new()
         .fill(theme::surface_2().gamma_multiply(0.7))
         .stroke(egui::Stroke::new(1.0, theme::border().gamma_multiply(0.6)))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(12))
+        .corner_radius(10)
+        .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (tile, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                ui.painter().rect_filled(tile, CornerRadius::same(8), theme::accent_soft());
-                paint_icon(ui.painter(), tile.shrink(7.0), Icon::Sparkle, theme::accent());
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("No agent sessions").size(13.0).color(theme::text()));
-                    ui.label(RichText::new("Agents in local terminals show up here").size(11.0).color(theme::text_faint()));
-                });
-            });
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                let width = ui.available_width();
-                let wide = |text: RichText, fill| egui::Button::new(text).fill(fill).corner_radius(CornerRadius::same(7)).min_size(Vec2::new(width, 26.0));
-                for kind in [AgentKind::Claude, AgentKind::Codex] {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
-                    ui.painter().rect_filled(rect, CornerRadius::same(7), if resp.hovered() { theme::accent_soft() } else { theme::surface_3() });
-                    super::agent_icons::paint(
-                        ui.painter(),
-                        Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0)),
-                        kind,
-                        1.0,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 32.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        format!("Launch {}", kind.name()),
-                        FontId::proportional(12.0),
-                        theme::text(),
-                    );
-                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Launch {}", kind.name())));
-                    if resp.clicked() {
-                        action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false }));
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Custom Boot…").clicked() {
-                            action = Some(PanelAction::CustomBoot(kind));
-                            ui.close();
-                        }
-                    });
-                }
-                let hooks = RichText::new("Install hooks…").size(12.0).color(theme::text_dim());
-                let tip = "Settings › AI agents: exact states (working, waiting, done) from the agents' hooks";
-                if ui.add(wide(hooks, theme::surface_3())).on_hover_text(tip).clicked() {
-                    action = Some(PanelAction::InstallHooks);
-                }
-            });
+            super::agent_icons::icon(ui, kind, 30.0);
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("{} sessions", kind.name())).size(14.0).strong());
+            ui.label(RichText::new("Follow activity, approvals and resource use across your local terminals.").size(12.0).color(theme::text_dim()));
+            ui.add_space(12.0);
+            if form::button(ui, &format!("Launch {}", kind.name()), Kind::Primary, true).clicked() {
+                action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false }));
+            }
+            ui.add_space(4.0);
+            if form::button(ui, "Custom Boot…", Kind::Secondary, true).clicked() {
+                action = Some(PanelAction::CustomBoot(kind));
+            }
+            ui.add_space(4.0);
+            if form::button(ui, "Install hooks…", Kind::Ghost, true).clicked() {
+                action = Some(PanelAction::InstallHooks);
+            }
         });
     action
 }
@@ -259,7 +275,11 @@ fn hover_text(s: &SessionInfo) -> String {
     if let Some(m) = &s.message {
         t.push_str(&format!("\n\n{}", snippet(m, 400)));
     }
-    t.push_str(if s.hooked { "\n\nState from hooks" } else { "\n\nState guessed from the terminal (install hooks in Settings → AI agents)" });
+    t.push_str(match (s.kind, s.hooked) {
+        (AgentKind::Codex, true) => "\n\nCompletion from Codex notify; activity from the terminal",
+        (_, true) => "\n\nState from hooks",
+        _ => "\n\nState from terminal activity (configure agent signals in Settings)",
+    });
     t.push_str("\nClick to focus the tab");
     t
 }

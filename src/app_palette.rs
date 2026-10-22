@@ -227,6 +227,9 @@ impl TetherApp {
             }
             Action::NextAttention => self.focus_next_attention(ctx),
             Action::ToggleAgents => self.toggle_agents(),
+            Action::ToggleCodex => {
+                let _ = crate::settings::update(|s| s.layout.views.click(View::Codex));
+            }
             // Handled by the focused terminal / hovered SFTP pane themselves.
             Action::PrevPrompt | Action::NextPrompt => {
                 let up = a == Action::PrevPrompt;

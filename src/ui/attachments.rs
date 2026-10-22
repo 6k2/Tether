@@ -18,15 +18,12 @@ pub struct RemoteTarget {
 struct Attachment {
     number: usize,
     texture: egui::TextureHandle,
-    name: String,
-    path: String,
 }
 
 struct Prepared {
     pixels: image::RgbaImage,
     local: PathBuf,
     path: String,
-    name: String,
 }
 
 #[derive(Default)]
@@ -99,7 +96,7 @@ impl Attachments {
                     } else {
                         local.display().to_string()
                     };
-                    Ok(Prepared { pixels, local, path: inserted, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned() })
+                    Ok(Prepared { pixels, local, path: inserted })
                 });
                 let _ = tx.send(result);
                 ctx.request_repaint();
@@ -146,12 +143,12 @@ impl Attachments {
             };
             self.pending.remove(i);
             match result {
-                Ok(Prepared { pixels, local, path, name }) => {
+                Ok(Prepared { pixels, local, path }) => {
                     self.next += 1;
                     let size = [pixels.width() as usize, pixels.height() as usize];
                     let image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw());
                     let texture = ctx.load_texture(format!("attachment-{}", local.display()), image, egui::TextureOptions::LINEAR);
-                    self.items.push(Attachment { number: self.next, texture, name, path: path.clone() });
+                    self.items.push(Attachment { number: self.next, texture });
                     paths.push(PathBuf::from(path));
                 }
                 Err(e) => self.notice = Some(format!("Image attachment failed: {e:#}")),
@@ -181,10 +178,8 @@ impl Attachments {
                     for item in &self.items {
                         let text = RichText::new(format!("[Image {}]", item.number)).color(theme::accent()).strong();
                         ui.add(egui::Button::new(text).fill(theme::accent_soft())).on_hover_ui(|ui| {
-                            ui.set_max_width(260.0);
+                            ui.set_max_width(240.0);
                             ui.image((item.texture.id(), item.texture.size_vec2()));
-                            ui.label(&item.name);
-                            ui.add(egui::Label::new(RichText::new(&item.path).small().color(theme::text_dim())).wrap());
                         });
                     }
                     if !self.items.is_empty()
@@ -260,7 +255,6 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(std::fs::read(&source).unwrap(), std::fs::read(&ready[0]).unwrap());
         assert_eq!(images.items[0].texture.size(), [240, 160]);
-        assert_eq!(images.items[0].name, "reference.png");
         drop(images);
         assert!(!ready[0].exists());
     }

@@ -211,7 +211,8 @@ fn action_keywords(a: Action) -> &'static str {
         Action::NewLocalTerminal => "shell console",
         Action::ToggleBroadcast => "all terminals sync",
         Action::NextAttention => "agent waiting jump",
-        Action::ToggleAgents => "ai claude codex",
+        Action::ToggleAgents => "ai claude",
+        Action::ToggleCodex => "ai codex openai",
         _ => "",
     }
 }

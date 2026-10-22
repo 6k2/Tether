@@ -42,7 +42,7 @@ impl Host<'_, '_> {
             View::Hosts => Some(Sidebar::host_count(self.data)),
             View::Sessions => Some(self.dock.iter_all_tabs().count() + self.vtabs.extra_rows.len()),
             View::Workspaces => Some(self.data.workspaces.len()),
-            View::Agents => Some(self.agents.len()),
+            View::Agents | View::Codex => Some(self.agents.iter().filter(|s| v.includes_agent(s.kind)).count()),
         }
     }
 
@@ -58,7 +58,19 @@ impl Host<'_, '_> {
                 self.tab_actions.extend(a);
             }
             View::Workspaces => self.sidebar.workspaces_header(ui, self.data),
-            View::Agents => {}
+            View::Agents | View::Codex => {
+                if crate::ui::settings_widgets::icon_button(ui, crate::ui::settings_widgets::Icon::Plus, 24.0).on_hover_text("Launch agent").clicked() {
+                    let kind = v.agent().unwrap();
+                    self.agent_action =
+                        Some(PanelAction::Launch(agents_panel::LaunchPick { kind, command: agents_panel::default_command(kind).into(), pick_folder: false }));
+                }
+                if crate::ui::settings_widgets::icon_button(ui, crate::ui::settings_widgets::Icon::Gear, 24.0)
+                    .on_hover_text("Agent settings and hooks")
+                    .clicked()
+                {
+                    self.agent_action = Some(PanelAction::InstallHooks);
+                }
+            }
         }
     }
 
@@ -78,9 +90,11 @@ impl Host<'_, '_> {
                     self.actions.extend(a);
                 });
             }
-            View::Agents => {
-                egui::ScrollArea::vertical().id_salt(("view_agents", in_panel)).auto_shrink([false, false]).show(ui, |ui| {
-                    self.agent_action = agents_panel::list(ui, self.agents, std::time::Instant::now());
+            View::Agents | View::Codex => {
+                egui::ScrollArea::vertical().id_salt(("view_agents", v, in_panel)).auto_shrink([false, false]).show(ui, |ui| {
+                    if let Some(action) = agents_panel::list_for(ui, self.agents, v, std::time::Instant::now()) {
+                        self.agent_action = Some(action);
+                    }
                 });
                 // Elapsed times tick while sessions are listed.
                 if !self.agents.is_empty() {
@@ -160,13 +174,17 @@ impl TetherApp {
             });
         }
         let tabs = self.dock.iter_all_tabs().count() + self.vtabs.extra_rows.len();
-        let waiting = self.agents.attention_count();
-        // The badge takes the status colour of the most urgent session.
-        let urgent = self.agents.sessions().iter().map(|s| s.state).filter(|s| s.needs_attention()).min_by_key(|s| s.urgency());
-        let attention_tone = Some(urgent.map_or(theme::warn(), |s| crate::ui::agent_status::tone_color(crate::ui::agent_status::spec(s).tone)));
+        let agent_badge = |view: View| {
+            let sessions = self.agents.sessions().iter().filter(|s| view.includes_agent(s.kind));
+            let count = sessions.clone().filter(|s| s.state.needs_attention()).count();
+            let urgent = sessions.map(|s| s.state).filter(|s| s.needs_attention()).min_by_key(|s| s.urgency());
+            Badge { count, tone: Some(urgent.map_or(theme::warn(), |s| crate::ui::agent_status::tone_color(crate::ui::agent_status::spec(s).tone))) }
+        };
+        let badges = [agent_badge(View::Agents), agent_badge(View::Codex)];
         let badge = move |v: View| match v {
             View::Sessions => Some(Badge { count: tabs, tone: None }),
-            View::Agents => Some(Badge { count: waiting, tone: attention_tone }),
+            View::Agents => Some(badges[0]),
+            View::Codex => Some(badges[1]),
             View::Hosts | View::Workspaces => None,
         };
         let mut host = Host {

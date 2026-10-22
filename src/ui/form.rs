@@ -15,6 +15,15 @@ pub const INPUT_H: f32 = 36.0;
 pub const GAP: f32 = 12.0;
 const RADIUS: u8 = 8;
 
+pub fn modal_frame() -> egui::Frame {
+    egui::Frame::new().fill(theme::surface()).stroke(Stroke::new(1.0, theme::border())).corner_radius(16).shadow(egui::Shadow {
+        offset: [0, 18],
+        blur: 48,
+        spread: 0,
+        color: theme::shadow(),
+    })
+}
+
 fn hand(ui: &Ui, resp: &Response) {
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

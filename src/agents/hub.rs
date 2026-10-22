@@ -559,6 +559,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_notify_updates_its_session_and_alert_without_touching_claude() {
+        let now = Instant::now();
+        let mut codex = Session::new("codex-tag".into(), 0, 0, now);
+        let mut claude = Session::new("claude-tag".into(), 0, 0, now);
+        apply_hook(&mut claude, &msg("UserPromptSubmit", |_| {}), now);
+        let payload = serde_json::json!({"type":"agent-turn-complete", "thread-id":"thread-1", "cwd":"D:/work/api-server", "last-assistant-message":"Completed the refactor"});
+        let message = super::super::hook::build_message("codex", None, &payload, "codex-tag").unwrap();
+        let to = apply_hook(&mut codex, &message, now).unwrap();
+        assert_eq!(codex.kind, Some(AgentKind::Codex));
+        assert_eq!(codex.project(), "api-server");
+        assert_eq!(codex.tracker.message.as_deref(), Some("Completed the refactor"));
+        assert_eq!(claude.tracker.state, AgentState::Working);
+        let mut alerts = Vec::new();
+        push_alert(&mut alerts, 42, &mut codex, to, now);
+        assert_eq!((alerts[0].uid, alerts[0].kind, alerts[0].state), (42, AgentKind::Codex, AgentState::Done));
+    }
+
+    #[test]
     fn agent_kind_follows_the_process_tree() {
         let t0 = Instant::now();
         let mut s = Session::new("tag".into(), 0, 0, t0);

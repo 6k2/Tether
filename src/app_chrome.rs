@@ -139,6 +139,7 @@ impl TetherApp {
             ui.separator();
             if item(ui, "Import / export setup…", None) {
                 self.import = Some(ImportDialog::new(&self.store));
+                ui.close();
             }
             if item(ui, "Key manager…", Some(Action::KeyManager)) {
                 self.run_action(Action::KeyManager, &ctx);
@@ -147,6 +148,9 @@ impl TetherApp {
             ui.menu_button(RichText::new("Layout").size(12.5), |ui| self.layout_menu(ui));
             if item(ui, "Agent sessions", Some(Action::ToggleAgents)) {
                 self.toggle_agents();
+            }
+            if item(ui, "Codex sessions", Some(Action::ToggleCodex)) {
+                self.run_action(Action::ToggleCodex, &ctx);
             }
             if item(ui, "Settings…", Some(Action::OpenSettings)) {
                 self.run_action(Action::OpenSettings, &ctx);

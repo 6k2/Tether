@@ -83,17 +83,17 @@ pub fn view_icon(v: View) -> Icon {
         View::Hosts => Icon::Server,
         View::Sessions => Icon::Rows,
         View::Workspaces => Icon::Layout,
-        View::Agents => Icon::Sparkle,
+        View::Agents | View::Codex => Icon::Sparkle,
     }
 }
 
 /// Paints `v`'s icon in `rect` with `col`. Agents uses the agent mark of the tab rows
 /// (in its own colour, faded the way `col` is relative to full text).
 pub fn paint_view_icon(p: &egui::Painter, rect: Rect, v: View, col: Color32) {
-    if v == View::Agents {
+    if let Some(kind) = v.agent() {
         let alpha = (f32::from(col.a()) / 255.0).clamp(0.35, 1.0);
         let strength = if col == theme::text() { 1.0 } else { 0.7 };
-        super::agent_icons::paint(p, rect.shrink(rect.width() * 0.05), crate::agents::AgentKind::Claude, alpha * strength);
+        super::agent_icons::paint(p, rect.shrink(rect.width() * 0.05), kind, alpha * strength);
     } else {
         paint_icon(p, rect, view_icon(v), col);
     }
@@ -106,6 +106,7 @@ pub fn view_action(v: View) -> Action {
         View::Hosts => Action::SearchHosts,
         View::Workspaces => Action::FocusWorkspacesView,
         View::Agents => Action::ToggleAgents,
+        View::Codex => Action::ToggleCodex,
     }
 }
 
@@ -138,25 +139,6 @@ impl Strip<'_> {
             cursor += if vertical { r.height() } else { r.width() } + GAP;
             self.item(ui, v, r, rect, events);
             items.push(r);
-        }
-        if self.container == Container::Primary {
-            let r = if vertical {
-                Rect::from_min_size(Pos2::new(rect.center().x - ITEM / 2.0, cursor), Vec2::splat(ITEM))
-            } else {
-                Rect::from_min_size(Pos2::new(cursor, rect.center().y - ROW_ITEM / 2.0), Vec2::splat(ROW_ITEM))
-            };
-            let kind = crate::agents::AgentKind::Codex;
-            let resp = ui.interact(r, Id::new("codex_launcher"), Sense::click());
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Launch Codex"));
-            if resp.hovered() {
-                ui.painter().rect_filled(r, CornerRadius::same(8), theme::surface_2());
-            }
-            super::agent_icons::paint(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(GLYPH)), kind, 1.0);
-            if resp.clicked() {
-                events.push(ViewEvent::LaunchAgent(kind));
-            }
-            resp.context_menu(|ui| agent_boot_menu(ui, kind, events));
-            resp.on_hover_text("Launch Codex · Right-click for Custom Boot");
         }
         targets.strips.push(StripTarget { container: self.container, rect, vertical, items, views: self.state.views.clone() });
     }
@@ -239,8 +221,8 @@ impl Strip<'_> {
     fn strip_menu(&self, ui: &mut Ui, view: Option<View>, events: &mut Vec<ViewEvent>) {
         ui.set_min_width(200.0);
         if let Some(v) = view {
-            if v == View::Agents {
-                agent_boot_menu(ui, crate::agents::AgentKind::Claude, events);
+            if let Some(kind) = v.agent() {
+                agent_boot_menu(ui, kind, events);
                 ui.separator();
             }
             ui.menu_button("Move to", |ui| {

@@ -4947,6 +4947,7 @@ name = "tether"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "arboard",
  "directories",
  "eframe",
  "egui_dock",
@@ -4976,6 +4977,7 @@ dependencies = [
  "ureq",
  "uuid",
  "vt100",
+ "vte",
  "windows-sys 0.61.2",
  "winreg 0.56.0",
  "zeroize",

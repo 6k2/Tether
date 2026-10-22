@@ -1,5 +1,5 @@
 //! Painted marks for AI agents (no bitmap or trademark assets): Claude Code's orange
-//! starburst, Codex' hexagon knot and a sparkle for the rest. Drawn with the painter,
+//! starburst, Codex's terminal mark and a sparkle for the rest. Drawn with the painter,
 //! so they stay crisp at 14–16 px and in every theme.
 
 use std::f32::consts::{PI, TAU};
@@ -31,7 +31,7 @@ pub fn paint(p: &Painter, rect: Rect, kind: AgentKind, alpha: f32) {
     let center = rect.center();
     match kind {
         AgentKind::Claude => starburst(p, center, size * 0.5, c),
-        AgentKind::Codex => hex_knot(p, center, size * 0.46, c),
+        AgentKind::Codex => codex_mark(p, center, size * 0.46, c),
         _ => sparkle(p, center, size * 0.5, c),
     }
 }
@@ -52,12 +52,12 @@ fn starburst(p: &Painter, center: Pos2, radius: f32, c: Color32) {
     p.circle_filled(center, radius * 0.2, c);
 }
 
-/// A hexagon with an inner ring: a knot-like "⌬".
-fn hex_knot(p: &Painter, center: Pos2, radius: f32, c: Color32) {
-    let w = (radius * 0.2).clamp(1.1, 1.8);
-    let hex = |r: f32, turn: f32| -> Vec<Pos2> { (0..6).map(|i| center + Vec2::angled(TAU * i as f32 / 6.0 + turn) * r).collect() };
-    p.add(Shape::closed_line(hex(radius, PI / 6.0), Stroke::new(w, c)));
-    p.add(Shape::closed_line(hex(radius * 0.5, 0.0), Stroke::new(w * 0.9, c)));
+/// Codex's familiar >_ terminal mark, readable even in the activity strip.
+fn codex_mark(p: &Painter, center: Pos2, radius: f32, c: Color32) {
+    let stroke = Stroke::new((radius * 0.2).clamp(1.2, 2.0), c);
+    let at = |x, y| center + Vec2::new(x * radius, y * radius);
+    p.add(Shape::line(vec![at(-0.85, -0.6), at(-0.15, 0.0), at(-0.85, 0.6)], stroke));
+    p.line_segment([at(0.15, 0.6), at(0.9, 0.6)], stroke);
 }
 
 /// A four-point star with a small companion.

@@ -45,6 +45,9 @@ fn ctrl_byte(key: Key) -> Option<u8> {
 /// Bytes for a key press, or `None` when the key is handled as text / clipboard.
 pub fn encode(key: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let bytes = match key {
+        // Meta+Enter is understood as an inserted newline by agent TUIs. Shell
+        // integration binds the same sequence to each shell's multiline editor.
+        Key::Enter if m.shift && !m.ctrl && !m.alt => b"\x1b\r".to_vec(),
         Key::Enter => b"\r".to_vec(),
         Key::Backspace if m.ctrl => vec![0x08],
         Key::Backspace => vec![0x7f],
@@ -116,6 +119,12 @@ mod tests {
         assert_eq!(encode(Key::Backspace, NONE, false).unwrap(), [0x7f]);
         assert_eq!(encode(Key::Delete, NONE, false).unwrap(), b"\x1b[3~");
         assert_eq!(encode(Key::F5, NONE, false).unwrap(), b"\x1b[15~");
+    }
+
+    #[test]
+    fn shift_enter_does_not_submit() {
+        assert_eq!(encode(Key::Enter, Modifiers::SHIFT, false).unwrap(), b"\x1b\r");
+        assert_eq!(encode(Key::Enter, NONE, false).unwrap(), b"\r");
     }
 
     #[test]

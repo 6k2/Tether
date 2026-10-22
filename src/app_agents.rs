@@ -23,7 +23,13 @@ fn local_terms<'a>(dock: &'a DockState<Tab>, out: &mut Vec<TermInfo<'a>>) {
     for (_, leaf) in dock.iter_leaves() {
         for (i, tab) in leaf.tabs.iter().enumerate() {
             if let (TabBody::Terminal(view), true) = (&tab.body, tab.is_local()) {
-                out.push(TermInfo { uid: tab.uid, handle: &view.handle, visible: i == leaf.active.0, label: tab.profile.display_name(), custom: tab.custom_title.as_deref() });
+                out.push(TermInfo {
+                    uid: tab.uid,
+                    handle: &view.handle,
+                    visible: i == leaf.active.0,
+                    label: tab.profile.display_name(),
+                    custom: tab.custom_title.as_deref(),
+                });
             }
         }
     }
@@ -163,7 +169,10 @@ impl TetherApp {
             return;
         }
         let text = RichText::new(format!("{waiting}")).size(12.0).strong().color(theme::warn());
-        let tip = keybindings::hint(&format!("{waiting} agent session{} need{} you: jump to the next", if waiting == 1 { "" } else { "s" }, if waiting == 1 { "s" } else { "" }), Action::NextAttention);
+        let tip = keybindings::hint(
+            &format!("{waiting} agent session{} need{} you: jump to the next", if waiting == 1 { "" } else { "s" }, if waiting == 1 { "s" } else { "" }),
+            Action::NextAttention,
+        );
         let resp = super::chrome::chrome_button(ui, Some(crate::ui::settings_widgets::Icon::Sparkle), Some(text), super::chrome::ButtonTone::Warn, &tip);
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Agents · {waiting} need attention")));
         if resp.clicked() {
@@ -195,6 +204,7 @@ impl TetherApp {
         match action {
             Some(PanelAction::Focus(uid)) => self.focus_tab(uid, ctx),
             Some(PanelAction::Close) => self.toggle_agents(),
+            Some(PanelAction::CustomBoot(kind)) => self.custom_boot = Some(crate::ui::agents_panel::CustomBoot::new(kind)),
             Some(PanelAction::Launch(pick)) => {
                 let target = self.dock.focused_leaf().or_else(|| self.dock.iter_leaves().next().map(|(p, _)| p));
                 let target = target.unwrap_or(egui_dock::NodePath { surface: egui_dock::SurfaceIndex::main(), node: egui_dock::NodeIndex::root() });
@@ -204,6 +214,22 @@ impl TetherApp {
                 self.settings_view = Some(crate::ui::settings_view::SettingsView::at(crate::ui::settings_view::Section::Agents));
             }
             None => {}
+        }
+    }
+
+    pub(super) fn launch_agent_command(&mut self, kind: AgentKind, command: String, ctx: &egui::Context) {
+        self.apply_agents_panel(Some(PanelAction::Launch(LaunchPick { kind, command, pick_folder: false })), ctx);
+    }
+
+    pub(super) fn custom_boot_modal(&mut self, ctx: &egui::Context) {
+        let Some(boot) = &mut self.custom_boot else { return };
+        let kind = boot.kind;
+        let (command, close) = boot.show(ctx);
+        if close {
+            self.custom_boot = None;
+        }
+        if let Some(command) = command {
+            self.launch_agent_command(kind, command, ctx);
         }
     }
 

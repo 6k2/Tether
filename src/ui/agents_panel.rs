@@ -11,6 +11,52 @@ use crate::procmon::human_mem;
 use crate::theme;
 
 pub const WIDTH: f32 = 300.0;
+pub fn default_command(kind: AgentKind) -> &'static str {
+    kind.id()
+}
+
+pub struct CustomBoot {
+    pub kind: AgentKind,
+    command: String,
+    focus: bool,
+}
+
+impl CustomBoot {
+    pub fn new(kind: AgentKind) -> Self {
+        Self { kind, command: default_command(kind).into(), focus: true }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context) -> (Option<String>, bool) {
+        let mut command = None;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("custom_agent_boot")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.horizontal(|ui| {
+                super::agent_icons::icon(ui, self.kind, 24.0);
+                ui.heading(format!("{} · Custom Boot", self.kind.name()));
+            });
+            ui.label("Enter the command to run in a new terminal.");
+            ui.add_space(8.0);
+            let response = ui.add(egui::TextEdit::singleline(&mut self.command).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+            if std::mem::take(&mut self.focus) {
+                response.request_focus();
+            }
+            let valid = !self.command.trim().is_empty() && !self.command.contains(['\r', '\n', '\0']);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(valid, egui::Button::new("Start terminal").fill(theme::accent_soft())).clicked() || (valid && enter) {
+                    command = Some(self.command.trim().to_owned());
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        (command, close || modal.should_close())
+    }
+}
 const ROW_H: f32 = 64.0;
 
 pub enum PanelAction {
@@ -20,13 +66,14 @@ pub enum PanelAction {
     Launch(LaunchPick),
     /// Settings › AI agents (hook installer).
     InstallHooks,
+    CustomBoot(AgentKind),
 }
 
 /// An agent picked from a "+" menu.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LaunchPick {
     pub kind: AgentKind,
-    pub command: &'static str,
+    pub command: String,
     /// Ask for the folder to start in first.
     pub pick_folder: bool,
 }
@@ -43,10 +90,10 @@ pub fn launch_menu(ui: &mut egui::Ui) -> Option<LaunchPick> {
         ui.horizontal(|ui| {
             let text = RichText::new(format!("{}  {}", l.kind.glyph(), l.kind.name())).color(theme::hue_color(l.kind.hue()));
             if ui.button(text).on_hover_text(format!("Run {} in a new default shell\n{}", l.command, l.path.display())).clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command, pick_folder: false });
+                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: false });
             }
             if ui.small_button("in folder…").on_hover_text("Choose the folder to start in").clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command, pick_folder: true });
+                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: true });
             }
         });
     }
@@ -76,7 +123,7 @@ pub fn list_height(sessions: &[SessionInfo]) -> f32 {
     if sessions.is_empty() { EMPTY_H } else { sessions.len() as f32 * (ROW_H + 4.0) }
 }
 
-const EMPTY_H: f32 = 136.0;
+const EMPTY_H: f32 = 172.0;
 
 /// The sessions without a header (the sidebar's "Agents" section draws its own).
 pub fn list(ui: &mut egui::Ui, sessions: &[SessionInfo], now: Instant) -> Option<PanelAction> {
@@ -123,15 +170,32 @@ fn empty_state(ui: &mut egui::Ui) -> Option<PanelAction> {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 let width = ui.available_width();
                 let wide = |text: RichText, fill| egui::Button::new(text).fill(fill).corner_radius(CornerRadius::same(7)).min_size(Vec2::new(width, 26.0));
-                // Claude Code first when several agents are installed. Never waits on the PATH scan.
-                let found = launch::found().unwrap_or_default();
-                let first = found.iter().find(|l| l.kind == AgentKind::Claude).or_else(|| found.first());
-                if let Some(l) = first {
-                    let text = RichText::new(format!("{}  Launch {}", l.kind.glyph(), l.kind.name())).size(12.0).color(theme::text());
-                    let tip = format!("Run {} in a new default shell", l.command);
-                    if ui.add(wide(text, theme::accent_soft())).on_hover_text(tip).clicked() {
-                        action = Some(PanelAction::Launch(LaunchPick { kind: l.kind, command: l.command, pick_folder: false }));
+                for kind in [AgentKind::Claude, AgentKind::Codex] {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+                    ui.painter().rect_filled(rect, CornerRadius::same(7), if resp.hovered() { theme::accent_soft() } else { theme::surface_3() });
+                    super::agent_icons::paint(
+                        ui.painter(),
+                        Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0)),
+                        kind,
+                        1.0,
+                    );
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 32.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("Launch {}", kind.name()),
+                        FontId::proportional(12.0),
+                        theme::text(),
+                    );
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Launch {}", kind.name())));
+                    if resp.clicked() {
+                        action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false }));
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("Custom Boot…").clicked() {
+                            action = Some(PanelAction::CustomBoot(kind));
+                            ui.close();
+                        }
+                    });
                 }
                 let hooks = RichText::new("Install hooks…").size(12.0).color(theme::text_dim());
                 let tip = "Settings › AI agents: exact states (working, waiting, done) from the agents' hooks";

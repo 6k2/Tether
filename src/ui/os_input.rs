@@ -81,7 +81,7 @@ pub fn clipboard_has_image() -> bool {
 
 #[cfg(not(windows))]
 pub fn clipboard_has_image() -> bool {
-    false
+    arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image()).is_ok()
 }
 
 /// The clipboard holds plain text (egui-winit already turns it into `Event::Paste`).
@@ -94,7 +94,7 @@ pub fn clipboard_has_text() -> bool {
 
 #[cfg(not(windows))]
 pub fn clipboard_has_text() -> bool {
-    true
+    arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()).is_ok()
 }
 
 /// Paths of files copied in Explorer (`CF_HDROP`).

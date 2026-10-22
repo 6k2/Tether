@@ -1192,7 +1192,7 @@ mod tests {
             h.event(Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
             h.run_steps(2);
         }
-        assert_eq!(&*actions.lock().unwrap(), &["~/servers/practice-servers/na-practice-01"]);
+        assert_eq!(&*actions.lock().unwrap(), &["~prisma/servers/practice-servers/na-practice-01"]);
         for pressed in [true, false] {
             h.event(Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
             h.run_steps(2);

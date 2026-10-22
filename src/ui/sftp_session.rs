@@ -318,6 +318,7 @@ impl SftpView {
         jumping.store(true, Ordering::Relaxed);
         self.rt.spawn(async move {
             let found: Result<String> = async {
+                let conn = session.pool.get(&profile, secret::get(profile.secret_id())).await?;
                 let home = sftp.canonicalize(".").await?;
                 let cwd = if path.starts_with('/') || path.starts_with('~') {
                     home.clone()
@@ -326,14 +327,13 @@ impl SftpView {
                     if let Some(cwd) = reported {
                         cwd
                     } else {
-                        let conn = session.pool.get(&profile, secret::get(profile.secret_id())).await?;
                         let (age_secs, rows, cols) = term.probe_facts();
                         crate::ssh::cwd::terminal_cwd(&conn, crate::ssh::cwd::Probe { tag: &term.tag, age_secs, rows, cols }).await?
                     }
                 } else {
                     home.clone()
                 };
-                let resolved = location_path(&path, &cwd, &home);
+                let resolved = crate::ssh::cwd::resolve_path(&conn, &sftp, &path, &cwd).await?;
                 let attrs = sftp.stat(&resolved).await?;
                 let directory = if attrs.is_dir() { resolved } else { crate::ssh::sftp::parent(&resolved) };
                 sftp.canonicalize(&directory).await
@@ -395,19 +395,6 @@ impl SftpView {
     }
 }
 
-fn location_path(path: &str, cwd: &str, home: &str) -> String {
-    let path = if path == "~" {
-        home.into()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        crate::ssh::sftp::join(home, rest)
-    } else if path.starts_with('/') {
-        path.into()
-    } else {
-        crate::ssh::sftp::join(cwd, path)
-    };
-    super::path_complete::normalize_remote(&path)
-}
-
 /// The delay before automatic reconnect attempt `attempt` (1-based); `None` once they
 /// are used up.
 pub(super) fn retry_delay(attempt: u32) -> Option<Duration> {
@@ -465,13 +452,6 @@ pub(super) fn humanize(err: &anyhow::Error) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn terminal_locations_resolve_on_the_remote_host() {
-        assert_eq!(location_path("../other project", "/srv/project", "/home/dev"), "/srv/other project");
-        assert_eq!(location_path("~/src", "/srv/project", "/home/dev"), "/home/dev/src");
-        assert_eq!(location_path("~", "/srv/project", "/home/dev"), "/home/dev");
-        assert_eq!(location_path("/etc/nginx", "/srv/project", "/home/dev"), "/etc/nginx");
-    }
     use russh_sftp::protocol::Status;
 
     fn status(code: StatusCode) -> anyhow::Error {

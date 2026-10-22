@@ -501,7 +501,19 @@ pub fn find_link_in_str(
         let path_start = start + path_start;
         let path_end = start + path_end;
         if (path_start..path_end).contains(&byte_idx) {
-            return classify_candidate(&text[path_start..path_end], path_start, cwd, false, cache);
+            let (raw, mut target, span) = classify_candidate(&text[path_start..path_end], path_start, cwd, false, cache)?;
+            // A shell can switch users with su/sudo while SFTP keeps the original
+            // authenticated account. Preserve whose home the prompt's ~ denotes.
+            if let LinkTarget::RemotePath { path, .. } = &mut target
+                && (path == "~" || path.starts_with("~/"))
+            {
+                let at = token.find('@')?;
+                let user = token[..at].trim_start_matches(['[', '(', '{']);
+                if crate::ssh::cwd::valid_home_user(user) {
+                    path.insert_str(1, user);
+                }
+            }
+            return Some((raw, target, span));
         }
         return None;
     }
@@ -582,7 +594,7 @@ fn classify_candidate(
         }
     } else if is_remote_path_syntax(path_part) {
         let resolved = match cwd {
-            Some(c) if !path_part.starts_with('/') && !path_part.starts_with("~/") && path_part != "~" => {
+            Some(c) if !path_part.starts_with('/') && !path_part.starts_with('~') => {
                 crate::ui::path_complete::normalize_remote(&crate::ssh::sftp::join(c, path_part))
             }
             _ => path_part.to_string(),
@@ -682,7 +694,7 @@ fn looks_like_path_candidate(s: &str) -> bool {
 }
 
 fn is_remote_path_syntax(s: &str) -> bool {
-    if s == "~" || s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.starts_with("../") {
+    if s.starts_with('~') || s.starts_with('/') || s.starts_with("./") || s.starts_with("../") {
         return true;
     }
     // Remote folders do not need an extension or a trailing slash.
@@ -764,25 +776,29 @@ mod tests {
     #[test]
     fn ssh_prompt_links_only_the_directory_and_opens_sftp_on_click() {
         let mut cache = PathProbeCache::default();
-        for (prompt, expected) in [
-            ("prisma@na-prisma-02:~/servers/practice-servers/na-practice-01$", "~/servers/practice-servers/na-practice-01"),
-            ("root@server:/srv/app#", "/srv/app"),
-            ("[dev@host:~/repo]$", "~/repo"),
-            ("dev@host:~$", "~"),
-            ("root@host:/#", "/"),
+        for (prompt, expected, resolved) in [
+            (
+                "prisma@na-prisma-02:~/servers/practice-servers/na-practice-01$",
+                "~/servers/practice-servers/na-practice-01",
+                "~prisma/servers/practice-servers/na-practice-01",
+            ),
+            ("root@server:/srv/app#", "/srv/app", "/srv/app"),
+            ("[dev@host:~/repo]$", "~/repo", "~dev/repo"),
+            ("dev@host:~$", "~", "~dev"),
+            ("root@host:/#", "/", "/"),
         ] {
             let start = prompt.find(':').unwrap() + 1;
             let (raw, target, span) = find_link_in_str(prompt, start, Some("/old/cwd"), false, &mut cache).unwrap();
             assert_eq!(raw, expected);
             assert_eq!(&prompt[span.0..span.1], expected);
-            assert_eq!(target, LinkTarget::RemotePath { path: expected.into(), line: None });
+            assert_eq!(target, LinkTarget::RemotePath { path: resolved.into(), line: None });
             assert!(find_link_in_str(prompt, 2, None, false, &mut cache).is_none());
             let link = DetectedLink { raw, target, spans: Vec::new() };
             let mut links = LinksState { hovered: Some(link), ..Default::default() };
-            assert_eq!(links.on_click(Pos2::ZERO, false, &egui::Context::default()), (true, Some(LinkAction::OpenSftp(expected.into()))));
+            assert_eq!(links.on_click(Pos2::ZERO, false, &egui::Context::default()), (true, Some(LinkAction::OpenSftp(resolved.into()))));
             assert!(!links.has_open_menu());
         }
-        for folder in ["practice-01/", "servers/practice-01", "~/servers", "/", "~"] {
+        for folder in ["practice-01/", "servers/practice-01", "~/servers", "/", "~", "~prisma/servers"] {
             assert!(find_link_in_str(folder, 0, None, false, &mut cache).is_some(), "{folder}");
         }
     }

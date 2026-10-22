@@ -278,6 +278,7 @@ pub struct Viewer {
     pub inputs: Vec<(u64, Vec<u8>)>,
     pub reconnect: Vec<u64>,
     pub open_files: Vec<(u64, Vec<String>)>,
+    pub open_folders: Vec<(u64, String)>,
     pub focused_uid: Option<u64>,
     /// Shells picked from a pane's "+" menu, opened in that pane.
     pub new_local: Vec<(egui_dock::NodePath, &'static ShellSpec)>,
@@ -319,6 +320,13 @@ const PILL_GAP: f32 = 7.0;
 const DOCK_CLOSE_W: f32 = 24.0;
 /// The tab button under the pointer last frame (0: none): its usage chip shows.
 static HOVERED_TAB: AtomicU64 = AtomicU64::new(0);
+
+/// A close guard extends slightly into the label. Freeze the existing expansion
+/// while crossing it, so both a compact and an expanded tab keep their X in place.
+fn usage_hover(rect: egui::Rect, pointer: Option<egui::Pos2>, expanded: bool) -> bool {
+    let Some(pos) = pointer.filter(|p| rect.contains(*p)) else { return false };
+    if pos.x >= rect.right() - DOCK_CLOSE_W - 12.0 { expanded } else { true }
+}
 
 /// Per-frame inputs for pane dimming, outlines and focus handling.
 #[derive(Default, Clone)]
@@ -531,6 +539,9 @@ impl egui_dock::TabViewer for Viewer {
                     if !out.input.is_empty() {
                         self.inputs.push((tab_uid, out.input));
                     }
+                    for folder in out.open_folders {
+                        self.open_folders.push((tab_uid, folder));
+                    }
                     if !out.open_files.is_empty() {
                         self.open_files.push((tab_uid, out.open_files));
                     }
@@ -588,6 +599,9 @@ impl egui_dock::TabViewer for Viewer {
                     if !out.input.is_empty() {
                         self.inputs.push((tab_uid, out.input));
                     }
+                    for folder in out.open_folders {
+                        self.open_folders.push((tab_uid, folder));
+                    }
                     if !out.open_files.is_empty() {
                         self.open_files.push((tab_uid, out.open_files));
                     }
@@ -634,10 +648,11 @@ impl egui_dock::TabViewer for Viewer {
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
         let hovered = HOVERED_TAB.load(Ordering::Relaxed);
-        if response.hovered() && hovered != tab.uid {
+        let over = usage_hover(response.rect, response.ctx.pointer_hover_pos(), hovered == tab.uid);
+        if over && hovered != tab.uid {
             HOVERED_TAB.store(tab.uid, Ordering::Relaxed);
             response.ctx.request_repaint();
-        } else if !response.hovered() && hovered == tab.uid {
+        } else if !over && hovered == tab.uid {
             HOVERED_TAB.store(0, Ordering::Relaxed);
             response.ctx.request_repaint();
         }
@@ -833,6 +848,18 @@ fn shorten_path(path: &str, home: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_zone_freezes_both_compact_and_expanded_tabs() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160.0, 28.0));
+        for x in [125.0, 140.0, 158.0] {
+            assert!(!usage_hover(rect, Some(egui::pos2(x, 14.0)), false));
+            assert!(usage_hover(rect, Some(egui::pos2(x, 14.0)), true));
+        }
+        assert!(usage_hover(rect, Some(egui::pos2(50.0, 14.0)), false));
+        assert!(!usage_hover(rect, Some(egui::pos2(50.0, 40.0)), true));
+        assert!(!usage_hover(rect, None, true));
+    }
 
     #[test]
     fn context_lines_add_the_branch() {

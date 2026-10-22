@@ -267,6 +267,7 @@ impl Default for EditorSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
+    pub projects: crate::local_projects::Projects,
     pub appearance: Appearance,
     pub terminal: TerminalSettings,
     pub sftp: SftpSettings,

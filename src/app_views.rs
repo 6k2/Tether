@@ -64,8 +64,8 @@ impl Host<'_, '_> {
                     self.agent_action = Some(PanelAction::Launch(agents_panel::LaunchPick {
                         kind,
                         command: agents_panel::default_command(kind).into(),
-                        pick_folder: false,
                         shell_id: None,
+                        cwd: None,
                     }));
                 }
                 if crate::ui::settings_widgets::icon_button(ui, crate::ui::settings_widgets::Icon::Gear, 24.0)

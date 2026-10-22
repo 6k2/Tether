@@ -88,6 +88,7 @@ pub struct TetherApp {
     editor: Option<ProfileEditor>,
     import: Option<ImportDialog>,
     custom_boot: Option<crate::ui::agents_panel::CustomBoot>,
+    project_cwds: std::collections::HashMap<u64, String>,
     settings_view: Option<SettingsView>,
     key_manager: Option<KeyManager>,
     prompt: Option<Prompt>,
@@ -178,6 +179,7 @@ impl TetherApp {
             mini_dock: Default::default(),
             agents,
             custom_boot: None,
+            project_cwds: Default::default(),
         })
     }
 
@@ -428,6 +430,9 @@ impl TetherApp {
         for uid in viewer.reconnect {
             self.reconnect(uid, None, ctx);
         }
+        for (uid, path) in viewer.open_folders {
+            self.open_terminal_folder(uid, path, ctx);
+        }
         for (uid, files) in viewer.open_files {
             self.open_terminal_files(uid, files, ctx);
         }
@@ -609,6 +614,9 @@ impl TetherApp {
             for uid in viewer.reconnect {
                 self.reconnect(uid, None, ui.ctx());
             }
+            for (uid, path) in viewer.open_folders {
+                self.open_terminal_folder(uid, path, ui.ctx());
+            }
             for (uid, files) in viewer.open_files {
                 self.open_terminal_files(uid, files, ui.ctx());
             }
@@ -696,6 +704,34 @@ impl TetherApp {
                 }
             }
         }
+    }
+
+    /// Reuse or open the source terminal's SFTP pane, then resolve the clicked path remotely.
+    fn open_terminal_folder(&mut self, uid: u64, path: String, ctx: &egui::Context) {
+        let Some((profile, terminal)) = self.all_tabs().find_map(|t| match &t.body {
+            TabBody::Terminal(term) if t.uid == uid && !t.is_local() => Some((t.profile.clone(), term.handle.clone())),
+            _ => None,
+        }) else {
+            return;
+        };
+        let already_open = self.all_tabs().any(|t| t.uid == uid && t.linked_sftp.is_some());
+        let new_view = if already_open {
+            None
+        } else {
+            let profile = self.store.get(profile.id).cloned().unwrap_or(profile);
+            Some(self.spawn_sftp(&profile, secret::get(profile.secret_id()), ctx))
+        };
+        if let Some(tab) = self.dock.iter_all_tabs_mut().map(|(_, t)| t).chain(self.detached.tabs_mut()).chain(self.mini_dock.tabs_mut()).find(|t| t.uid == uid)
+        {
+            if let Some(view) = new_view {
+                tab.linked_sftp = Some(crate::ui::tabs::LinkedSftp::new(view));
+            }
+            if let Some(linked) = &mut tab.linked_sftp {
+                linked.view.set_linked_terminal(Some(terminal));
+                linked.view.browse_path(path);
+            }
+        }
+        self.focus_tab(uid, ctx);
     }
 
     /// Opens files requested from a terminal (`nano <file>`) in the built-in editor.

@@ -66,6 +66,8 @@ impl DetectedLink {
 pub enum LinkAction {
     /// Open this remote path in Tether's built-in editor.
     OpenRemote(String),
+    /// Browse the remote directory (or the containing folder for a file).
+    OpenSftp(String),
 }
 
 /// Cached existence lookup for `(cwd, raw_path)`.
@@ -240,6 +242,10 @@ impl LinksState {
                         LinkTarget::RemotePath { path, .. } => {
                             path_header(ui, path);
                             ui.separator();
+                            if menu_btn(ui, "📁  Open in SFTP") {
+                                action = Some(LinkAction::OpenSftp(path.clone()));
+                                close = true;
+                            }
                             if menu_btn(ui, "📝  Open in editor") {
                                 action = Some(LinkAction::OpenRemote(path.clone()));
                                 close = true;
@@ -294,6 +300,7 @@ fn path_header(ui: &mut Ui, text: &str) {
 
 fn menu_btn(ui: &mut Ui, label: &str) -> bool {
     let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(r, CornerRadius::same(5), theme::accent().gamma_multiply(0.16));
@@ -727,6 +734,33 @@ fn clean_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_path_menu_returns_an_sftp_action() {
+        use egui_kittest::kittest::Queryable;
+        let link = DetectedLink {
+            raw: "/srv/project".into(),
+            target: LinkTarget::RemotePath { path: "/srv/project".into(), line: None },
+            spans: vec![RowSpan { row: 0, start_col: 0, end_col: 12 }],
+        };
+        let mut links = LinksState { hovered: Some(link), ..Default::default() };
+        let (intercepted, action) = links.on_click(egui::pos2(30.0, 12.0), false, &egui::Context::default());
+        assert!(intercepted);
+        assert!(action.is_none());
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let output = result.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_ui(move |ui| {
+            let painter = ui.painter().clone();
+            let m = Metrics { cell_w: 8.0, cell_h: 18.0, text_dy: 0.0 };
+            if let Some(action) = links.paint_and_menu(ui, &painter, ui.max_rect(), m, theme::accent()) {
+                *output.lock().unwrap() = Some(action);
+            }
+        });
+        h.run_steps(5);
+        h.get_by_label("📁  Open in SFTP").click();
+        h.run_steps(3);
+        assert_eq!(result.lock().unwrap().take(), Some(LinkAction::OpenSftp("/srv/project".into())));
+    }
 
     #[test]
     fn splits_line_and_column_suffixes() {

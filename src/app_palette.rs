@@ -85,8 +85,9 @@ impl TetherApp {
         r.add(Entry::new("Hosts", "Import hosts…", Command::ImportHosts).detail("Bitvise profiles, SSH config"));
         for l in crate::agents::launch::available() {
             let (kind, command) = (l.kind, l.command);
-            r.add(Entry::new("Agent", format!("Launch {}", kind.name()), Command::LaunchAgent { kind, command, pick_folder: false }).detail(command));
-            r.add(Entry::new("Agent", format!("Launch {} in folder…", kind.name()), Command::LaunchAgent { kind, command, pick_folder: true }));
+            r.add(
+                Entry::new("Agent", format!("Launch {}…", kind.name()), Command::LaunchAgent { kind, command }).detail("Choose a project directory and shell"),
+            );
         }
         for name in self.workspaces.names() {
             r.add(Entry::new("Workspace", format!("Restore {name}"), Command::RestoreWorkspace(name)));
@@ -154,8 +155,8 @@ impl TetherApp {
             Command::RestoreWorkspace(name) => self.restore_workspace(&name, ctx),
             Command::OpenLayoutSettings => self.open_layout_settings(),
             Command::ImportHosts => self.import = Some(crate::ui::import_view::ImportDialog::new(&self.store)),
-            Command::LaunchAgent { kind, command, pick_folder } => {
-                let pick = crate::ui::agents_panel::LaunchPick { kind, command: command.into(), pick_folder, shell_id: None };
+            Command::LaunchAgent { kind, command } => {
+                let pick = crate::ui::agents_panel::LaunchPick { kind, command: command.into(), shell_id: None, cwd: None };
                 let target = self
                     .dock
                     .focused_leaf()

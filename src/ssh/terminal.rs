@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use super::connection::{Connection, Stage};
 use crate::repaint::RepaintThrottle;
 
-pub const TERM_NAME: &str = "xterm-256color";
+pub const TERM_NAME: &str = crate::terminal_capabilities::TERM;
 /// Fallback scrollback; the live value comes from `settings.terminal.scrollback`.
 pub const SCROLLBACK_LINES: usize = 10_000;
 
@@ -336,6 +336,13 @@ pub async fn run_shell(
     repaint();
     let channel = conn.handle.channel_open_session().await?;
     channel.request_pty(false, TERM_NAME, cols.into(), rows.into(), 0, 0, &[]).await?;
+    // Optional SSH env requests: servers may restrict AcceptEnv; PTY TERM still
+    // advertises 256 colors when those extra hints are rejected.
+    for &(key, value) in crate::terminal_capabilities::ENV {
+        if key != "TERM" {
+            let _ = channel.set_env(false, key, value).await;
+        }
+    }
     // Most servers accept LC_* (Debian/Ubuntu `AcceptEnv LANG LC_*`); harmless if refused.
     let _ = channel.set_env(false, "LC_TETHER_ID", term.tag.clone()).await;
     channel.request_shell(false).await?;

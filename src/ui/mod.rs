@@ -28,6 +28,7 @@ pub mod os_input;
 pub mod palette;
 pub mod path_complete;
 pub mod path_field;
+pub mod project_picker;
 pub mod settings_agents;
 pub mod settings_keyboard;
 pub mod settings_sections;

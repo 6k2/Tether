@@ -39,11 +39,10 @@ pub enum Command {
     OpenLayoutSettings,
     /// The "Import hosts" dialog (Bitvise, SSH config).
     ImportHosts,
-    /// Start an AI agent CLI in a new default shell.
+    /// Choose a local project and shell, then start an AI agent CLI.
     LaunchAgent {
         kind: crate::agents::AgentKind,
         command: &'static str,
-        pick_folder: bool,
     },
     /// Anything else: runs on the UI thread when chosen.
     Run(Arc<dyn Fn(&egui::Context) + Send + Sync>),

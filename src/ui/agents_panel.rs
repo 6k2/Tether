@@ -20,13 +20,35 @@ pub struct CustomBoot {
     command: String,
     shell_id: String,
     focus: bool,
+    custom: bool,
+    project: super::project_picker::ProjectPicker,
+    pub target: Option<egui_dock::NodePath>,
 }
 
 impl CustomBoot {
     pub fn new(kind: AgentKind) -> Self {
         let settings = crate::settings::snapshot();
         let shell = settings.agents.launch_shells.get(kind.id()).and_then(|id| crate::pty::shells::find(id)).or_else(crate::pty::shells::default_shell);
-        Self { kind, command: default_command(kind).into(), shell_id: shell.map(|s| s.id.clone()).unwrap_or_default(), focus: true }
+        Self {
+            kind,
+            command: default_command(kind).into(),
+            shell_id: shell.map(|s| s.id.clone()).unwrap_or_default(),
+            focus: true,
+            custom: true,
+            project: Default::default(),
+            target: None,
+        }
+    }
+
+    pub fn launch(pick: LaunchPick, target: egui_dock::NodePath) -> Self {
+        let mut boot = Self::new(pick.kind);
+        boot.command = pick.command;
+        boot.custom = false;
+        boot.target = Some(target);
+        if let Some(shell) = pick.shell_id {
+            boot.shell_id = shell;
+        }
+        boot
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> (Option<LaunchPick>, bool) {
@@ -35,12 +57,12 @@ impl CustomBoot {
         use super::form::{self, Kind};
         let modal = egui::Modal::new(egui::Id::new("custom_agent_boot")).frame(form::modal_frame()).show(ctx, |ui| {
             egui::Frame::new().inner_margin(24).show(ui, |ui| {
-                ui.set_width(500.0);
+                ui.set_width(540.0);
                 ui.horizontal(|ui| {
                     super::agent_icons::icon(ui, self.kind, 36.0);
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(format!("{} · Custom Boot", self.kind.name())).size(19.0).strong());
+                        ui.label(RichText::new(format!("{} · {}", self.kind.name(), if self.custom { "Custom Boot" } else { "Launch" })).size(19.0).strong());
                         ui.label(RichText::new("Your command, in a new terminal session.").size(12.0).color(theme::text_dim()));
                     });
                 });
@@ -53,13 +75,19 @@ impl CustomBoot {
                     |ui| {
                         let width = ui.available_width();
                         form::framed(ui, false, |ui| {
-                            ui.add(form::style_edit(egui::TextEdit::singleline(&mut self.command), width).font(egui::TextStyle::Monospace))
+                            ui.add_enabled(self.custom, form::style_edit(egui::TextEdit::singleline(&mut self.command), width).font(egui::TextStyle::Monospace))
                         })
                     },
                 );
                 if std::mem::take(&mut self.focus) {
-                    response.request_focus();
+                    if self.custom {
+                        response.request_focus();
+                    } else {
+                        self.project.focus(ctx);
+                    }
                 }
+                ui.add_space(12.0);
+                self.project.show(ui);
                 ui.add_space(12.0);
                 form::label(ui, "Shell", false);
                 let shells = crate::pty::shells::detected().unwrap_or_default();
@@ -82,13 +110,15 @@ impl CustomBoot {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if form::button(ui, "Start terminal", Kind::Primary, valid).clicked() || (valid && enter) {
-                        command = Some(LaunchPick {
-                            kind: self.kind,
-                            command: self.command.trim().to_owned(),
-                            pick_folder: false,
-                            shell_id: Some(self.shell_id.clone()),
-                        });
-                        close = true;
+                        if let Some(cwd) = self.project.directory() {
+                            command = Some(LaunchPick {
+                                kind: self.kind,
+                                command: self.command.trim().to_owned(),
+                                shell_id: Some(self.shell_id.clone()),
+                                cwd: Some(cwd),
+                            });
+                            close = true;
+                        }
                     }
                     if form::button(ui, "Cancel", Kind::Secondary, true).clicked() {
                         close = true;
@@ -116,10 +146,10 @@ pub enum PanelAction {
 pub struct LaunchPick {
     pub kind: AgentKind,
     pub command: String,
-    /// Ask for the folder to start in first.
-    pub pick_folder: bool,
     /// A chosen local shell, including its normal startup profiles.
     pub shell_id: Option<String>,
+    /// A confirmed directory; absent means show the shared launch form first.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// "Claude Code" / "Codex" entries for a "+" menu: only agents found on PATH.
@@ -133,11 +163,8 @@ pub fn launch_menu(ui: &mut egui::Ui) -> Option<LaunchPick> {
     for l in found {
         ui.horizontal(|ui| {
             let text = RichText::new(format!("{}  {}", l.kind.glyph(), l.kind.name())).color(theme::hue_color(l.kind.hue()));
-            if ui.button(text).on_hover_text(format!("Run {} in a new default shell\n{}", l.command, l.path.display())).clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: false, shell_id: None });
-            }
-            if ui.small_button("in folder…").on_hover_text("Choose the folder to start in").clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: true, shell_id: None });
+            if ui.button(text).on_hover_text(format!("Choose a project and shell for {}\n{}", l.command, l.path.display())).clicked() {
+                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), shell_id: None, cwd: None });
             }
         });
     }
@@ -209,7 +236,7 @@ fn empty_state(ui: &mut egui::Ui, kind: AgentKind) -> Option<PanelAction> {
             ui.label(RichText::new("Follow activity, approvals and resource use across your local terminals.").size(12.0).color(theme::text_dim()));
             ui.add_space(12.0);
             if form::button(ui, &format!("Launch {}", kind.name()), Kind::Primary, true).clicked() {
-                action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false, shell_id: None }));
+                action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), shell_id: None, cwd: None }));
             }
             ui.add_space(4.0);
             if form::button(ui, "Custom Boot…", Kind::Secondary, true).clicked() {
@@ -299,8 +326,16 @@ mod custom_boot_tests {
     fn local_account_flags_pass_through_the_form_without_a_prompt() {
         let result = std::sync::Arc::new(std::sync::Mutex::new(None));
         let output = result.clone();
-        let mut boot = CustomBoot { kind: AgentKind::Claude, command: "claude -p".into(), shell_id: "powershell".into(), focus: false };
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(move |ui| {
+        let mut boot = CustomBoot {
+            kind: AgentKind::Claude,
+            command: "claude -p".into(),
+            shell_id: "powershell".into(),
+            focus: false,
+            custom: true,
+            project: Default::default(),
+            target: None,
+        };
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 950.0)).build_ui(move |ui| {
             if output.lock().unwrap().is_none() {
                 let (pick, _) = boot.show(ui.ctx());
                 if let Some(pick) = pick {

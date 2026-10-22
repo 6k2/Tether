@@ -78,6 +78,24 @@ impl TetherApp {
         for dock in self.detached.docks_mut() {
             local_terms(dock, &mut terms);
         }
+        let mut visited = Vec::new();
+        self.project_cwds.retain(|uid, _| terms.iter().any(|t| t.uid == *uid));
+        for term in &terms {
+            let cwd = term.handle.shared.lock().ok().and_then(|s| s.parser.callbacks().cwd.clone());
+            if let Some(cwd) = cwd.filter(|s| !s.is_empty() && s.len() <= 4096)
+                && self.project_cwds.get(&term.uid) != Some(&cwd)
+            {
+                self.project_cwds.insert(term.uid, cwd.clone());
+                visited.push(cwd);
+            }
+        }
+        if !visited.is_empty() {
+            let _ = crate::settings::update(|s| {
+                for path in visited {
+                    s.projects.record(&path, crate::local_projects::now());
+                }
+            });
+        }
         Self::command_notices(&toasts, ctx, &terms, window_focused);
         let alerts = self.agents.frame(ctx, terms, Instant::now());
         for alert in alerts {
@@ -218,37 +236,46 @@ impl TetherApp {
     }
 
     pub(super) fn launch_agent_command(&mut self, kind: AgentKind, command: String, ctx: &egui::Context) {
-        self.apply_agents_panel(Some(PanelAction::Launch(LaunchPick { kind, command, pick_folder: false, shell_id: None })), ctx);
+        self.apply_agents_panel(Some(PanelAction::Launch(LaunchPick { kind, command, shell_id: None, cwd: None })), ctx);
     }
 
     pub(super) fn custom_boot_modal(&mut self, ctx: &egui::Context) {
         let Some(boot) = &mut self.custom_boot else { return };
         let (command, close) = boot.show(ctx);
+        let target = boot.target;
         if close {
             self.custom_boot = None;
         }
         if let Some(command) = command {
-            self.apply_agents_panel(Some(PanelAction::Launch(command)), ctx);
+            if let Some(target) = target {
+                self.open_agents_in(vec![(target, command)], ctx);
+            } else {
+                self.apply_agents_panel(Some(PanelAction::Launch(command)), ctx);
+            }
         }
     }
 
     /// Opens agents picked from panes' "+" menus: the default shell, then the command.
     pub(super) fn open_agents_in(&mut self, picks: Vec<(egui_dock::NodePath, LaunchPick)>, ctx: &egui::Context) {
         for (path, pick) in picks {
+            if pick.cwd.is_none() {
+                self.custom_boot = Some(crate::ui::agents_panel::CustomBoot::launch(pick, path));
+                continue;
+            }
             let prefs = crate::settings::snapshot();
             let shell_id = pick.shell_id.as_deref().or_else(|| prefs.agents.launch_shells.get(pick.kind.id()).map(String::as_str));
             let Some(shell) = shell_id.and_then(crate::pty::shells::find).or_else(crate::pty::shells::default_shell) else {
                 self.toasts.error("No local shell was found on this machine");
                 return;
             };
-            let cwd = if pick.pick_folder {
-                match rfd::FileDialog::new().set_title(format!("Start {} in", pick.kind.name())).pick_folder() {
-                    Some(dir) => Some(dir),
-                    None => continue,
+            let cwd = pick.cwd;
+            if let Some(dir) = &cwd {
+                if !dir.is_dir() {
+                    self.toasts.error("The project folder no longer exists");
+                    continue;
                 }
-            } else {
-                None
-            };
+                let _ = crate::settings::update(|s| s.projects.record(&dir.display().to_string(), crate::local_projects::now()));
+            }
             if pick.shell_id.is_some() {
                 let _ = crate::settings::update(|s| {
                     s.agents.launch_shells.insert(pick.kind.id().into(), shell.id.clone());

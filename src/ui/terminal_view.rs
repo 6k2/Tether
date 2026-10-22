@@ -116,6 +116,17 @@ pub struct ViewOutput {
     pub reconnect: bool,
     /// Remote files the user asked to edit from the shell (e.g. `nano <file>`).
     pub open_files: Vec<String>,
+    pub open_folders: Vec<String>,
+}
+
+impl ViewOutput {
+    fn link_action(&mut self, action: Option<super::term_links::LinkAction>) {
+        match action {
+            Some(super::term_links::LinkAction::OpenRemote(path)) => self.open_files.push(path),
+            Some(super::term_links::LinkAction::OpenSftp(path)) => self.open_folders.push(path),
+            None => {}
+        }
+    }
 }
 
 impl TerminalView {
@@ -254,9 +265,7 @@ impl TerminalView {
         let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         self.cache.grid.paint(&painter, inner.min, m, |row| selection_cols(sel, row, cols));
         if !alt_screen {
-            if let Some(super::term_links::LinkAction::OpenRemote(path)) = self.cache.links.paint_and_menu(ui, &painter, inner, m, accent) {
-                out.open_files.push(path);
-            }
+            out.link_action(self.cache.links.paint_and_menu(ui, &painter, inner, m, accent));
             let geom = super::blocks::Geom { rect, inner, cell_h: m.cell_h, rows };
             if let Some(req) = self.cache.blocks.paint(ui, geom, &settings.shell_integration, accent) {
                 self.block_request(req, ui.ctx(), &mut out);
@@ -536,6 +545,16 @@ impl TerminalView {
         (alt_screen, app_cursor): (bool, bool),
         out: &mut ViewOutput,
     ) {
+        if !alt_screen
+            && response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let (intercepted, action) = self.cache.links.on_click(pos, false, ui.ctx());
+            out.link_action(action);
+            if intercepted {
+                return;
+            }
+        }
         if response.drag_started() {
             if let Some(p) = response.interact_pointer_pos() {
                 self.selection = Some((to_cell(p), to_cell(p)));
@@ -550,9 +569,7 @@ impl TerminalView {
                 let (intercepted, action) = self.cache.links.on_click(p, ctrl, ui.ctx());
                 if intercepted {
                     self.selection = None;
-                    if let Some(super::term_links::LinkAction::OpenRemote(path)) = action {
-                        out.open_files.push(path);
-                    }
+                    out.link_action(action);
                     return;
                 }
             }

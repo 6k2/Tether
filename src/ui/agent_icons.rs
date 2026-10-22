@@ -1,6 +1,6 @@
-//! Painted marks for AI agents (no bitmap or trademark assets): Claude Code's orange
-//! starburst, Codex's terminal mark and a sparkle for the rest. Drawn with the painter,
-//! so they stay crisp at 14–16 px and in every theme.
+//! Agent marks shared by the activity strip, launch cards and session rows. Claude's
+//! starburst is painted; Codex uses the OpenAI blossom from its official desktop app.
+//! The bundled SVG is rendered at the display's pixel scale and tinted for the theme.
 
 use std::f32::consts::{PI, TAU};
 
@@ -52,12 +52,24 @@ fn starburst(p: &Painter, center: Pos2, radius: f32, c: Color32) {
     p.circle_filled(center, radius * 0.2, c);
 }
 
-/// Codex's familiar >_ terminal mark, readable even in the activity strip.
+/// The actual brand mark, shared by the activity strip, session rows and launch cards.
 fn codex_mark(p: &Painter, center: Pos2, radius: f32, c: Color32) {
-    let stroke = Stroke::new((radius * 0.2).clamp(1.2, 2.0), c);
-    let at = |x, y| center + Vec2::new(x * radius, y * radius);
-    p.add(Shape::line(vec![at(-0.85, -0.6), at(-0.15, 0.0), at(-0.85, 0.6)], stroke));
-    p.line_segment([at(0.15, 0.6), at(0.9, 0.6)], stroke);
+    let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+    let pixels = (rect.width() * p.ctx().pixels_per_point()).ceil().max(24.0) as u32;
+    let key = egui::Id::new(("codex_brand_mark", pixels));
+    let cached = p.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
+    let texture = cached.unwrap_or_else(|| {
+        let image = egui_extras::image::load_svg_bytes_with_size(
+            include_bytes!("../../assets/agents/codex.svg"),
+            egui::load::SizeHint::Height(pixels),
+            &Default::default(),
+        )
+        .expect("bundled Codex brand SVG");
+        let texture = p.ctx().load_texture(format!("codex-brand-{pixels}"), image, egui::TextureOptions::LINEAR);
+        p.ctx().data_mut(|d| d.insert_temp(key, texture.clone()));
+        texture
+    });
+    p.image(texture.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), c);
 }
 
 /// A four-point star with a small companion.

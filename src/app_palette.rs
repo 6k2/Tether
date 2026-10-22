@@ -155,7 +155,7 @@ impl TetherApp {
             Command::OpenLayoutSettings => self.open_layout_settings(),
             Command::ImportHosts => self.import = Some(crate::ui::import_view::ImportDialog::new(&self.store)),
             Command::LaunchAgent { kind, command, pick_folder } => {
-                let pick = crate::ui::agents_panel::LaunchPick { kind, command: command.into(), pick_folder };
+                let pick = crate::ui::agents_panel::LaunchPick { kind, command: command.into(), pick_folder, shell_id: None };
                 let target = self
                     .dock
                     .focused_leaf()

@@ -6,71 +6,6 @@ use std::sync::OnceLock;
 
 use super::AgentKind;
 
-/// Definite missing-input cases, without rewriting the command the user entered.
-pub fn needs_initial_prompt(command: &str) -> bool {
-    let Ok(words) = shell_words::split(command) else { return false };
-    let Some(program) = words.first() else { return false };
-    let program = program.rsplit(['/', '\\']).next().unwrap_or(program).trim_end_matches(['.', ' ']).to_ascii_lowercase();
-    let claude = ["claude", "claude.exe", "claude.cmd"].contains(&program.as_str());
-    let codex = ["codex", "codex.exe", "codex.cmd"].contains(&program.as_str());
-    if words.iter().any(|s| s == "--help" || s == "-h" || s == "--version") {
-        return false;
-    }
-    if !(claude && words.iter().any(|s| s == "-p" || s == "--print") || codex && words.get(1).is_some_and(|s| s == "exec")) {
-        return false;
-    }
-    let mut skip = false;
-    for word in words.iter().skip(if codex { 2 } else { 1 }) {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if [
-            "--model",
-            "-m",
-            "--output-format",
-            "--input-format",
-            "--permission-mode",
-            "--allowedTools",
-            "--disallowedTools",
-            "--add-dir",
-            "--system-prompt",
-            "--append-system-prompt",
-            "--max-turns",
-            "--max-budget-usd",
-            "--resume",
-            "-r",
-            "--cwd",
-            "-C",
-            "--config",
-            "-c",
-            "--profile",
-            "--sandbox",
-            "--output-last-message",
-            "-o",
-        ]
-        .contains(&word.as_str())
-        {
-            skip = true;
-            continue;
-        }
-        if !word.starts_with('-') && !word.is_empty() {
-            return false;
-        }
-    }
-    true
-}
-
-/// Literal shell argument for the optional initial prompt. Custom commands themselves
-/// intentionally remain user-authored shell syntax.
-pub fn append_initial_prompt(command: &str, prompt: &str, powershell: bool) -> String {
-    if prompt.is_empty() {
-        return command.trim().into();
-    }
-    let quoted = if powershell { format!("'{}'", prompt.replace('\'', "''")) } else { shell_words::quote(prompt).into_owned() };
-    format!("{} {quoted}", command.trim())
-}
-
 #[derive(Debug, Clone)]
 pub struct Launcher {
     pub kind: AgentKind,
@@ -125,21 +60,6 @@ fn is_file(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn print_modes_require_real_input_but_interactive_commands_do_not() {
-        for command in ["claude -p", "claude --print --model sonnet", "claude -p --dangerously-skip-permissions", "codex exec"] {
-            assert!(needs_initial_prompt(command), "{command}");
-        }
-        for command in
-            ["claude", "claude --dangerously-skip-permissions", "claude -p 'hello'", "claude -p --model sonnet 'hello'", "codex", "codex exec --help"]
-        {
-            assert!(!needs_initial_prompt(command), "{command}");
-        }
-        assert_eq!(append_initial_prompt("claude -p", "Don't run $(anything)", true), "claude -p 'Don''t run $(anything)'");
-        let command = append_initial_prompt("claude -p", "hello 'quoted' world", false);
-        assert_eq!(shell_words::split(&command).unwrap().last().unwrap(), "hello 'quoted' world");
-    }
 
     #[test]
     fn finds_commands_with_extensions_in_path_order() {

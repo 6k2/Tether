@@ -218,25 +218,26 @@ impl TetherApp {
     }
 
     pub(super) fn launch_agent_command(&mut self, kind: AgentKind, command: String, ctx: &egui::Context) {
-        self.apply_agents_panel(Some(PanelAction::Launch(LaunchPick { kind, command, pick_folder: false })), ctx);
+        self.apply_agents_panel(Some(PanelAction::Launch(LaunchPick { kind, command, pick_folder: false, shell_id: None })), ctx);
     }
 
     pub(super) fn custom_boot_modal(&mut self, ctx: &egui::Context) {
         let Some(boot) = &mut self.custom_boot else { return };
-        let kind = boot.kind;
         let (command, close) = boot.show(ctx);
         if close {
             self.custom_boot = None;
         }
         if let Some(command) = command {
-            self.launch_agent_command(kind, command, ctx);
+            self.apply_agents_panel(Some(PanelAction::Launch(command)), ctx);
         }
     }
 
     /// Opens agents picked from panes' "+" menus: the default shell, then the command.
     pub(super) fn open_agents_in(&mut self, picks: Vec<(egui_dock::NodePath, LaunchPick)>, ctx: &egui::Context) {
         for (path, pick) in picks {
-            let Some(shell) = crate::pty::shells::default_shell() else {
+            let prefs = crate::settings::snapshot();
+            let shell_id = pick.shell_id.as_deref().or_else(|| prefs.agents.launch_shells.get(pick.kind.id()).map(String::as_str));
+            let Some(shell) = shell_id.and_then(crate::pty::shells::find).or_else(crate::pty::shells::default_shell) else {
                 self.toasts.error("No local shell was found on this machine");
                 return;
             };
@@ -248,6 +249,11 @@ impl TetherApp {
             } else {
                 None
             };
+            if pick.shell_id.is_some() {
+                let _ = crate::settings::update(|s| {
+                    s.agents.launch_shells.insert(pick.kind.id().into(), shell.id.clone());
+                });
+            }
             let tab = self.local_tab(shell, cwd, ctx);
             if let TabBody::Terminal(view) = &tab.body {
                 // The pty buffers this until the shell reads its first line.

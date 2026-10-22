@@ -11,7 +11,8 @@ fn custom_boot_and_export_flow() {
     unsafe {
         std::env::set_var("TETHER_CONFIG_DIR", config.path());
     }
-    std::fs::write(config.path().join("settings.json"), r#"{"updates":{"check_on_startup":false}}"#).unwrap();
+    std::fs::write(config.path().join("settings.json"), r#"{"updates":{"check_on_startup":false},"agents":{"launch_shells":{"claude":"powershell"}}}"#)
+        .unwrap();
     let mut p = tether::profile::Profile::parse_quick("deploy@192.0.2.10:2222").unwrap();
     p.name = "Example machine".into();
     std::fs::write(config.path().join("profiles.json"), serde_json::to_string(&[p]).unwrap()).unwrap();
@@ -34,14 +35,9 @@ fn custom_boot_and_export_flow() {
         h.get_by_label(title);
         if launcher == "Agents view" {
             replace_command(&mut h, "claude -p");
-            h.get_by_label("Initial prompt");
-            h.get_by_label("Start terminal").click();
-            h.run_steps(5);
-            h.get_by_label(title);
-            shot(&mut h, "general-print-prompt");
-            h.get_by_label("Use interactive command").click();
-            h.run_steps(5);
             assert!(h.query_by_label("Initial prompt").is_none());
+            h.get_by_label("Terminal shell");
+            shot(&mut h, "general-account-flag");
         }
         h.get_by_role(egui::accesskit::Role::TextInput).focus();
         h.key_press_modifiers(Modifiers { ctrl: true, command: true, ..Modifiers::NONE }, Key::A);
@@ -62,6 +58,9 @@ fn custom_boot_and_export_flow() {
     h.get_by_label_contains("Anyone with this file");
     h.get_by_label("I understand the file contains connection details");
     shot(&mut h, "general-export");
+    h.get_by_label("I understand the file contains connection details").click();
+    h.run_steps(5);
+    shot(&mut h, "general-export-acknowledged");
     h.get_by_label("Close").click();
     h.run_steps(5);
     h.get_by_label("App menu").click();

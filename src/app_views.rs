@@ -61,8 +61,12 @@ impl Host<'_, '_> {
             View::Agents | View::Codex => {
                 if crate::ui::settings_widgets::icon_button(ui, crate::ui::settings_widgets::Icon::Plus, 24.0).on_hover_text("Launch agent").clicked() {
                     let kind = v.agent().unwrap();
-                    self.agent_action =
-                        Some(PanelAction::Launch(agents_panel::LaunchPick { kind, command: agents_panel::default_command(kind).into(), pick_folder: false }));
+                    self.agent_action = Some(PanelAction::Launch(agents_panel::LaunchPick {
+                        kind,
+                        command: agents_panel::default_command(kind).into(),
+                        pick_folder: false,
+                        shell_id: None,
+                    }));
                 }
                 if crate::ui::settings_widgets::icon_button(ui, crate::ui::settings_widgets::Icon::Gear, 24.0)
                     .on_hover_text("Agent settings and hooks")

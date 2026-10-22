@@ -15,7 +15,7 @@ publish = false
 anyhow = "1.0.104"
 directories = "6.0.0"
 eframe = "0.36"
-egui_extras = { version = "0.36", default-features = false, features = ["syntect"] }
+egui_extras = { version = "0.36", default-features = false, features = ["syntect", "svg"] }
 egui_dock = { version = "0.21.1", features = ["serde"] }
 futures = "0.3"
 keyring = { version = "3", features = ["windows-native"] }
@@ -34,7 +34,6 @@ vt100 = "0.16.2"
 vte = "0.15"
 arboard = "3.7"
 tempfile = "3"
-shell-words = "1.1"
 zeroize = "1"
 portable-pty = "0.9"
 serde_norway = "0.9.42"

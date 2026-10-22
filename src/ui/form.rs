@@ -313,7 +313,7 @@ pub fn button(ui: &mut Ui, label: &str, kind: Kind, enabled: bool) -> Response {
         p.rect_filled(rect.translate(Vec2::new(0.0, 1.0)), CornerRadius::same(RADIUS), theme::shadow().gamma_multiply(0.35));
     }
     p.rect(rect, CornerRadius::same(RADIUS), fill.gamma_multiply(alpha), stroke, StrokeKind::Inside);
-    p.galley(rect.center() - galley.size() / 2.0, galley, text.gamma_multiply(alpha));
+    p.galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, text.gamma_multiply(alpha));
     resp
 }
 

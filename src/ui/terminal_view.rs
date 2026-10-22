@@ -70,8 +70,6 @@ pub struct TerminalView {
     pub intercept_nano: bool,
     /// Take keyboard focus on the next frame (the agents panel jumping to this tab).
     pub want_focus: bool,
-    /// The current Ctrl+V press was already handled (text paste or the fallback below).
-    ctrl_v_handled: bool,
     /// Fallback working directory (e.g. from an AI agent hook when OSC 7 hasn't fired).
     pub fallback_cwd: Option<String>,
     /// Boxed to keep `TabBody` small.
@@ -80,6 +78,9 @@ pub struct TerminalView {
 
 /// Painted rows and the last header info seen.
 struct ViewCache {
+    /// Clipboard and file-drop input must only be handled once per gesture/frame.
+    paste_guard: super::os_input::PasteGuard,
+    last_drop_frame: Option<u64>,
     /// Characters typed since the last submitted/cancelled line (fallback before echo).
     typed_line: String,
     attachments: super::attachments::Attachments,
@@ -139,9 +140,10 @@ impl TerminalView {
             prompt_col: None,
             intercept_nano: true,
             want_focus: false,
-            ctrl_v_handled: false,
             fallback_cwd: None,
             cache: Box::new(ViewCache {
+                paste_guard: Default::default(),
+                last_drop_frame: None,
                 grid: GridCache::default(),
                 typed_line: String::new(),
                 attachments: Default::default(),
@@ -604,7 +606,9 @@ impl TerminalView {
                     out.input.extend(keys::encode_text(&t, mods.alt && !mods.ctrl));
                 }
                 Event::Paste(t) => {
-                    self.ctrl_v_handled = true;
+                    if !self.cache.paste_guard.explicit(ui.ctx().cumulative_frame_nr()) {
+                        continue;
+                    }
                     let files = super::os_input::clipboard_files();
                     if files.iter().any(|p| super::attachments::is_image(p)) {
                         let (images, other): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| super::attachments::is_image(p));
@@ -698,15 +702,8 @@ impl TerminalView {
             (paste, release)
         });
         let down = super::os_input::ctrl_v_down();
-        if had_paste {
-            self.ctrl_v_handled = true;
-        }
-        if !self.ctrl_v_handled && (down || released_v) {
-            self.ctrl_v_handled = true;
+        if self.cache.paste_guard.fallback(ui.ctx().cumulative_frame_nr(), down, released_v, had_paste) {
             self.paste_clipboard_non_text(ui.ctx(), bracketed, out);
-        }
-        if !down && !had_paste {
-            self.ctrl_v_handled = false;
         }
     }
 
@@ -755,6 +752,11 @@ impl TerminalView {
         if dropped.is_empty() || !over {
             return false;
         }
+        let frame = ui.ctx().cumulative_frame_nr();
+        if self.cache.last_drop_frame == Some(frame) {
+            return false;
+        }
+        self.cache.last_drop_frame = Some(frame);
         self.mark_prompt_start();
         let (images, files): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| super::attachments::is_image(p));
         self.cache.attachments.add(images, ui.ctx());
@@ -1110,6 +1112,69 @@ mod bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_image_drop_is_sent_once_even_when_layout_repeats() {
+        use crate::ssh::terminal::TermCmd;
+        #[derive(Debug)]
+        struct FileDrop(std::path::PathBuf);
+        impl egui::DroppedFile for FileDrop {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|e| e.to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        image::RgbaImage::new(8, 8).save(&path).unwrap();
+        let (handle, mut rx) = TerminalHandle::new(24, 80);
+        {
+            let mut s = handle.shared.lock().unwrap();
+            s.state = LinkState::Connected;
+            s.parser.process(b"\x1b[?2004h");
+        }
+        let mut view = TerminalView::new(handle);
+        let ctx = egui::Context::default();
+        let mut sent = Vec::new();
+        for gesture in 0..2 {
+            let mut repeat_layout = true;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
+                events: vec![Event::PointerMoved(Pos2::new(100.0, 100.0))],
+                dropped_files: vec![std::sync::Arc::new(FileDrop(path.clone()))],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let out = view.ui(ui, &Profile::new());
+                assert!(out.input.is_empty(), "image-only drops must not send an empty bracketed paste");
+                if std::mem::take(&mut repeat_layout) {
+                    ctx.request_discard("exercise repeated input during attachment layout");
+                }
+            });
+            output.textures_delta.clear();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while view.cache.attachments.is_pending() {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))), ..Default::default() };
+                let mut output = ctx.run_ui(input, |ui| {
+                    view.ui(ui, &Profile::new());
+                });
+                output.textures_delta.clear();
+                assert!(std::time::Instant::now() < deadline, "attachment worker did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            while let Ok(cmd) = rx.try_recv() {
+                if let TermCmd::Input(bytes) = cmd {
+                    sent.push(bytes);
+                }
+            }
+            assert_eq!(sent.len(), gesture + 1, "each intentional drop must send exactly one path");
+            let text = String::from_utf8_lossy(sent.last().unwrap());
+            assert_eq!(text.matches(".png").count(), 1);
+            assert!(text.starts_with("\x1b[200~") && text.ends_with("\x1b[201~"));
+        }
+    }
 
     #[test]
     fn selection_spans_rows() {

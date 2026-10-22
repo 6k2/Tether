@@ -261,7 +261,19 @@ and passphrases",
                     .color(theme::text_dim()),
             );
             ui.add_space(8.0);
-            ui.checkbox(&mut self.acknowledged, "I understand the file contains connection details");
+            ui.scope(|ui| {
+                let red = theme::danger();
+                let fill = form::input_fill().lerp_to_gamma(red, 0.2);
+                let w = &mut ui.visuals_mut().widgets;
+                for state in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                    state.bg_fill = fill;
+                    state.weak_bg_fill = fill;
+                    state.bg_stroke = egui::Stroke::new(1.0, red.gamma_multiply(0.75));
+                    state.fg_stroke = egui::Stroke::new(2.0, red);
+                    state.corner_radius = egui::CornerRadius::same(3);
+                }
+                ui.checkbox(&mut self.acknowledged, "I understand the file contains connection details");
+            });
         });
     }
 

@@ -18,16 +18,18 @@ pub fn default_command(kind: AgentKind) -> &'static str {
 pub struct CustomBoot {
     pub kind: AgentKind,
     command: String,
-    prompt: String,
+    shell_id: String,
     focus: bool,
 }
 
 impl CustomBoot {
     pub fn new(kind: AgentKind) -> Self {
-        Self { kind, command: default_command(kind).into(), prompt: String::new(), focus: true }
+        let settings = crate::settings::snapshot();
+        let shell = settings.agents.launch_shells.get(kind.id()).and_then(|id| crate::pty::shells::find(id)).or_else(crate::pty::shells::default_shell);
+        Self { kind, command: default_command(kind).into(), shell_id: shell.map(|s| s.id.clone()).unwrap_or_default(), focus: true }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) -> (Option<String>, bool) {
+    pub fn show(&mut self, ctx: &egui::Context) -> (Option<LaunchPick>, bool) {
         let mut command = None;
         let mut close = false;
         use super::form::{self, Kind};
@@ -47,7 +49,7 @@ impl CustomBoot {
                     ui,
                     Some(super::settings_widgets::Icon::Terminal),
                     "Launch command",
-                    "Runs with your installed CLI and its existing sign-in.",
+                    "Run your local command with its own flags and account setup.",
                     |ui| {
                         let width = ui.available_width();
                         form::framed(ui, false, |ui| {
@@ -58,38 +60,34 @@ impl CustomBoot {
                 if std::mem::take(&mut self.focus) {
                     response.request_focus();
                 }
-                let needs_prompt = launch::needs_initial_prompt(&self.command);
-                if needs_prompt {
-                    ui.add_space(12.0);
-                    form::section(
-                        ui,
-                        Some(super::settings_widgets::Icon::Editor),
-                        "Initial prompt",
-                        "Print / exec mode needs a prompt and exits when finished.",
-                        |ui| {
-                            let width = ui.available_width();
-                            form::text(ui, &mut self.prompt, "What should the agent do?", width, false);
-                            ui.add_space(6.0);
-                            if form::button(ui, "Use interactive command", Kind::Ghost, true).clicked() {
-                                self.command = default_command(self.kind).into();
-                            }
-                        },
-                    );
-                } else {
-                    ui.add_space(10.0);
-                    form::note(ui, "Right-click the agent icon to open Custom Boot again.", false);
-                }
-                let valid = !self.command.trim().is_empty()
-                    && !self.command.contains(['\r', '\n', '\0'])
-                    && (!needs_prompt || !self.prompt.trim().is_empty() && !self.prompt.contains(['\r', '\n', '\0']));
+                ui.add_space(12.0);
+                form::label(ui, "Shell", false);
+                let shells = crate::pty::shells::detected().unwrap_or_default();
+                let shown = shells.iter().find(|s| s.id == self.shell_id).map_or("Default shell", |s| s.name.as_str());
+                let shell_response = form::select(ui, ui.id().with("boot_shell"), ui.available_width(), shown, |ui| {
+                    for shell in shells {
+                        if form::option(ui, &shell.name, None, shell.id == self.shell_id).clicked() {
+                            self.shell_id.clone_from(&shell.id);
+                            ui.close();
+                        }
+                    }
+                });
+                shell_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Terminal shell"));
+                ui.add_space(6.0);
+                form::note(ui, "Uses this shell's profiles, functions and aliases. Your command and flags are passed through unchanged.", false);
+                let valid = !self.command.trim().is_empty() && !self.command.contains(['\r', '\n', '\0']);
                 ui.add_space(20.0);
                 form::rule(ui);
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if form::button(ui, "Start terminal", Kind::Primary, valid).clicked() || (valid && enter) {
-                        let powershell = crate::pty::shells::default_shell().is_some_and(|s| s.icon_kind == crate::pty::shells::ShellIcon::PowerShell);
-                        command = Some(launch::append_initial_prompt(&self.command, if needs_prompt { self.prompt.trim() } else { "" }, powershell));
+                        command = Some(LaunchPick {
+                            kind: self.kind,
+                            command: self.command.trim().to_owned(),
+                            pick_folder: false,
+                            shell_id: Some(self.shell_id.clone()),
+                        });
                         close = true;
                     }
                     if form::button(ui, "Cancel", Kind::Secondary, true).clicked() {
@@ -120,6 +118,8 @@ pub struct LaunchPick {
     pub command: String,
     /// Ask for the folder to start in first.
     pub pick_folder: bool,
+    /// A chosen local shell, including its normal startup profiles.
+    pub shell_id: Option<String>,
 }
 
 /// "Claude Code" / "Codex" entries for a "+" menu: only agents found on PATH.
@@ -134,10 +134,10 @@ pub fn launch_menu(ui: &mut egui::Ui) -> Option<LaunchPick> {
         ui.horizontal(|ui| {
             let text = RichText::new(format!("{}  {}", l.kind.glyph(), l.kind.name())).color(theme::hue_color(l.kind.hue()));
             if ui.button(text).on_hover_text(format!("Run {} in a new default shell\n{}", l.command, l.path.display())).clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: false });
+                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: false, shell_id: None });
             }
             if ui.small_button("in folder…").on_hover_text("Choose the folder to start in").clicked() {
-                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: true });
+                pick = Some(LaunchPick { kind: l.kind, command: l.command.into(), pick_folder: true, shell_id: None });
             }
         });
     }
@@ -209,7 +209,7 @@ fn empty_state(ui: &mut egui::Ui, kind: AgentKind) -> Option<PanelAction> {
             ui.label(RichText::new("Follow activity, approvals and resource use across your local terminals.").size(12.0).color(theme::text_dim()));
             ui.add_space(12.0);
             if form::button(ui, &format!("Launch {}", kind.name()), Kind::Primary, true).clicked() {
-                action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false }));
+                action = Some(PanelAction::Launch(LaunchPick { kind, command: default_command(kind).into(), pick_folder: false, shell_id: None }));
             }
             ui.add_space(4.0);
             if form::button(ui, "Custom Boot…", Kind::Secondary, true).clicked() {
@@ -288,6 +288,34 @@ fn hover_text(s: &SessionInfo) -> String {
 fn clip(text: &str, width: f32, size: f32) -> String {
     let max = ((width / (size * 0.55)).floor() as usize).max(4);
     snippet(text, max)
+}
+
+#[cfg(test)]
+mod custom_boot_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn local_account_flags_pass_through_the_form_without_a_prompt() {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let output = result.clone();
+        let mut boot = CustomBoot { kind: AgentKind::Claude, command: "claude -p".into(), shell_id: "powershell".into(), focus: false };
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(move |ui| {
+            if output.lock().unwrap().is_none() {
+                let (pick, _) = boot.show(ui.ctx());
+                if let Some(pick) = pick {
+                    *output.lock().unwrap() = Some(pick);
+                }
+            }
+        });
+        h.run_steps(5);
+        assert!(h.query_by_label("Initial prompt").is_none());
+        h.get_by_label("Start terminal").click();
+        h.run_steps(5);
+        let pick = result.lock().unwrap().take().expect("custom command was accepted");
+        assert_eq!(pick.command, "claude -p");
+        assert_eq!(pick.shell_id.as_deref(), Some("powershell"));
+    }
 }
 
 #[cfg(test)]

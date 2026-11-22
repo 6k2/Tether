@@ -28,7 +28,15 @@ the command. This failure was also recorded in the October 29 build; it has not
 been disabled or weakened here.
 
 Packaging uses `scripts/package-macos.sh aarch64-apple-darwin` with the locked
-dependencies. The bundle has an ad-hoc signature, not Developer ID notarization.
+dependencies and completed successfully. The DMG passed checksum and disk image
+verification, was mounted read-only, and its extracted bundle passed strict code
+signature verification. The executable is arm64 and links only macOS libraries.
+The packaged application opened, and a native zsh tab was created during manual
+QA. The new build was installed in `/Applications/Tether.app`, and its welcome
+window was verified after launch. The previous application bundle was preserved
+as a local backup outside Applications.
+
+The bundle has an ad-hoc signature, not Developer ID notarization.
 Intel hardware, macOS 11, external SSH/SFTP servers and the complete manual release
 matrix were not tested in this run. This local verification does not certify a
 successful remote CI run or a publicly notarized release.

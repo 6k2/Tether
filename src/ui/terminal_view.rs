@@ -689,13 +689,17 @@ impl TerminalView {
                     } else if modifiers.ctrl && matches!(key, egui::Key::C | egui::Key::U) {
                         self.prompt_col = None;
                         self.cache.typed_line.clear();
-                    } else if key == egui::Key::Enter && !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command {
-                        if let Some(files) = self.take_nano_command().filter(|_| self.intercept_nano) {
-                            // Cancel the typed command line in the remote shell and open the file(s) in Tether's editor.
-                            out.input.push(0x03);
-                            out.open_files.extend(files);
-                            continue;
-                        }
+                    } else if key == egui::Key::Enter
+                        && !modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && let Some(files) = self.take_nano_command().filter(|_| self.intercept_nano)
+                    {
+                        // Cancel the typed command line in the remote shell and open the file(s) in Tether's editor.
+                        out.input.push(0x03);
+                        out.open_files.extend(files);
+                        continue;
                     }
                     let font = settings::snapshot().terminal.font_size();
                     let is = |a: Action| !keybindings::is_recording() && keybindings::binding(a).is_some_and(|b| b.matches(key, modifiers));
@@ -1142,7 +1146,7 @@ mod tests {
     fn macos_copy_never_interrupts_and_option_text_is_utf8() {
         let (handle, _) = TerminalHandle::new(24, 80);
         let mut view = TerminalView::new(handle);
-        view.typed_line = "keep this command".into();
+        view.cache.typed_line = "keep this command".into();
         let ctx = egui::Context::default();
         let mut output = ViewOutput::default();
         let mut frame = ctx.run_ui(egui::RawInput { events: vec![Event::Copy, Event::Cut], ..Default::default() }, |ui| {
@@ -1150,14 +1154,14 @@ mod tests {
         });
         frame.textures_delta.clear();
         assert!(output.input.is_empty(), "clipboard gestures must not send SIGINT or Ctrl+X");
-        assert_eq!(view.typed_line, "keep this command");
+        assert_eq!(view.cache.typed_line, "keep this command");
         let mut frame =
             ctx.run_ui(egui::RawInput { events: vec![Event::ModifiersChanged(egui::Modifiers::ALT), Event::Text("é@".into())], ..Default::default() }, |ui| {
                 view.handle_keys(ui, false, false, &mut output);
             });
         frame.textures_delta.clear();
         assert_eq!(output.input, "é@".as_bytes(), "Option produces text without a Meta ESC prefix");
-        assert!(view.typed_line.ends_with("é@"));
+        assert!(view.cache.typed_line.ends_with("é@"));
         output.input.clear();
         let ctrl = egui::Modifiers::CTRL;
         let mut frame = ctx.run_ui(
@@ -1174,7 +1178,7 @@ mod tests {
         );
         frame.textures_delta.clear();
         assert_eq!(output.input, [3]);
-        assert!(view.typed_line.is_empty());
+        assert!(view.cache.typed_line.is_empty());
     }
 
     #[test]

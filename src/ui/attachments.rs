@@ -165,10 +165,10 @@ impl Attachments {
     pub fn bar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
             ui.painter().rect_filled(rect, egui::CornerRadius::same(6), theme::surface());
-            if ui.button("+ Image").on_hover_text("Attach PNG or JPEG · You can also paste or drop an image").clicked() {
-                if let Some(paths) = rfd::FileDialog::new().set_title("Attach images").add_filter("Images", &["png", "jpg", "jpeg"]).pick_files() {
-                    self.add(paths, ui.ctx());
-                }
+            if ui.button("+ Image").on_hover_text("Attach PNG or JPEG · You can also paste or drop an image").clicked()
+                && let Some(paths) = rfd::FileDialog::new().set_title("Attach images").add_filter("Images", &["png", "jpg", "jpeg"]).pick_files()
+            {
+                self.add(paths, ui.ctx());
             }
             if !self.pending.is_empty() {
                 ui.spinner();

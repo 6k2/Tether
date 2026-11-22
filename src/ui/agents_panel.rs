@@ -109,16 +109,16 @@ impl CustomBoot {
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if form::button(ui, "Start terminal", Kind::Primary, valid).clicked() || (valid && enter) {
-                        if let Some(cwd) = self.project.directory() {
-                            command = Some(LaunchPick {
-                                kind: self.kind,
-                                command: self.command.trim().to_owned(),
-                                shell_id: Some(self.shell_id.clone()),
-                                cwd: Some(cwd),
-                            });
-                            close = true;
-                        }
+                    if (form::button(ui, "Start terminal", Kind::Primary, valid).clicked() || (valid && enter))
+                        && let Some(cwd) = self.project.directory()
+                    {
+                        command = Some(LaunchPick {
+                            kind: self.kind,
+                            command: self.command.trim().to_owned(),
+                            shell_id: Some(self.shell_id.clone()),
+                            cwd: Some(cwd),
+                        });
+                        close = true;
                     }
                     if form::button(ui, "Cancel", Kind::Secondary, true).clicked() {
                         close = true;

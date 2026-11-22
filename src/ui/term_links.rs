@@ -188,7 +188,9 @@ impl LinksState {
                         let kind = if *is_dir { "Folder" } else { "File" };
                         format!("{kind}: {}\nClick for options · {}+click to open", resolved.display(), crate::platform::primary_label())
                     }
-                    LinkTarget::RemotePath { path, .. } => format!("Remote: {path}\nClick to open SFTP · Right-click for options · {}+click to edit", crate::platform::primary_label()),
+                    LinkTarget::RemotePath { path, .. } => {
+                        format!("Remote: {path}\nClick to open SFTP · Right-click for options · {}+click to edit", crate::platform::primary_label())
+                    }
                 };
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("term_link_tip"), egui::PopupAnchor::Pointer).gap(10.0).show(|ui| {
                     ui.label(egui::RichText::new(tip).size(11.5).color(theme::text()));

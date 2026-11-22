@@ -363,7 +363,8 @@ mod tests {
     fn action_entries_carry_their_shortcut() {
         let e = Entry::action("Pane", Action::SplitRight);
         assert_eq!(e.title, Action::SplitRight.title());
-        assert_eq!(e.keys.as_deref(), Some("Ctrl+Shift+D"));
+        let split_shortcut = if cfg!(target_os = "macos") { "⌘+D" } else { "Ctrl+Shift+D" };
+        assert_eq!(e.keys.as_deref(), Some(split_shortcut));
         assert!(Entry::action("Pane", Action::MoveSidebar).keys.is_none());
         let mut r = Registry::default();
         r.add(Entry::action("Pane", Action::ZoomPane));

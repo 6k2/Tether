@@ -80,11 +80,11 @@ impl KeySearch {
                 });
             }
             ui.horizontal(|ui| {
-                if ui.button("Browse…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().set_title("Choose an OpenSSH private key").pick_file() {
-                        picked = Some(path);
-                        close = true;
-                    }
+                if ui.button("Browse…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().set_title("Choose an OpenSSH private key").pick_file()
+                {
+                    picked = Some(path);
+                    close = true;
                 }
                 if ui.button("Cancel").clicked() {
                     close = true;

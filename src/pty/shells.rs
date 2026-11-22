@@ -65,7 +65,8 @@ impl ShellSpec {
             "pwsh" => {
                 // `…\PowerShell\7\pwsh.exe` -> "pwsh 7".
                 let program = self.program.to_string_lossy();
-                let version = program.rsplit(['/', '\\']).nth(1).filter(|v| v.starts_with(|c: char| c.is_ascii_digit()));                version.map_or_else(|| "pwsh".into(), |v| format!("pwsh {v}"))
+                let version = program.rsplit(['/', '\\']).nth(1).filter(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+                version.map_or_else(|| "pwsh".into(), |v| format!("pwsh {v}"))
             }
             id => id.strip_prefix("wsl:").map_or_else(|| self.name.clone(), str::to_string),
         }
